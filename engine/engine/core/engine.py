@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 
 from .blotter import Blotter
-from .events import Bar, BookFlow, DepthUpdate, Fill, PositionUpdate, Quote, Trade
+from .dispatch import dispatch_broker, dispatch_market
 from .orders import Order
 
 log = logging.getLogger("engine.loop")
@@ -53,28 +53,12 @@ class ReplayEngine:
 
     # ── dispatch helpers ─────────────────────────────────────────────────
     def _dispatch(self, e) -> list[Order]:
-        out: list[Order] = []
-        for s in self.strategies:
-            if isinstance(e, Trade):
-                out += s.on_trade(e) or []
-            elif isinstance(e, BookFlow):
-                out += s.on_bookflow(e) or []
-            elif isinstance(e, Bar):
-                out += s.on_bar(e) or []
-            elif isinstance(e, Quote):
-                out += s.on_quote(e) or []
-            elif isinstance(e, DepthUpdate):
-                out += s.on_depth(e) or []
-        return out
+        return dispatch_market(self.strategies, e)
 
     def _drain(self) -> None:
         for be in self.broker.drain():
             self.blotter.on_broker_event(be)
-            for s in self.strategies:
-                if isinstance(be, Fill):
-                    s.on_fill(be)
-                elif isinstance(be, PositionUpdate):
-                    s.on_position(be)
+            dispatch_broker(self.strategies, be)
 
 
 __all__ = ["ReplayEngine"]

@@ -51,15 +51,22 @@ it in the adapter so the strategy sees identical `BookFlow` events live and in r
 QuestDB (tables mirroring `claude_sec_feat` / `claude_bars_1m`). Use the project's proven fire-and-forget
 INSERT + per-day count verification to dodge the WAL-commit race. Forward-only: stop re-buying history.
 
-## Live engine driver (to add)
-`ReplayEngine` is single-task and deterministic (event-time). Phase 2 adds a `LiveEngine` that concurrently
-consumes `feed.stream()` and `broker.events()` with `asyncio` (e.g. merge via a queue), using `WallClock`,
-with reconnection/backoff on both sockets and a heartbeat. The dispatch/among-strategies logic is identical
-to `ReplayEngine._dispatch` / `_drain`; only the sourcing of events becomes concurrent.
+## Live engine driver — IMPLEMENTED (`engine/core/live_engine.py`)
+`LiveEngine` concurrently consumes `feed.stream()` and `broker.events()` via a merge queue (single
+consumer → no locks on strategy state), using `WallClock`, with per-adapter reconnect/backoff. It shares
+`dispatch_market` / `dispatch_broker` with `ReplayEngine` (`engine/core/dispatch.py`) — identical routing,
+identical Strategy objects; only the event source becomes concurrent.
+
+Python bridge — IMPLEMENTED: `adapters/protocol.py` (JSON), `adapters/feeds/ninjatrader.py`
+(`NinjaTraderFeed`, aggregates per-second `BookFlow` from depth via `features/bookflow.py`),
+`adapters/brokers/{socket_broker,ninjatrader,quantower}.py`. The C# relay is `bridges/ninjatrader/`
+(`EngineRelay.cs` + `MiniJson.cs` + README). Validated end-to-end by `tests/test_live_loopback.py`
+(fake sockets, no NT8).
 
 ## Test / evaluation plan
-1. Loopback test the relay (a fake socket server emitting canned market JSON) — no platform needed; assert
-   the adapter yields the right normalized events and `BookFlow` aggregation matches.
+1. **Loopback (done):** `tests/test_live_loopback.py` runs `LiveEngine` + `NinjaTraderFeed` +
+   `NinjaTraderBroker` against fake in-process sockets — validates market→event→order→fill round-trip and
+   per-second `BookFlow` aggregation, no platform needed.
 2. Paper session on NT8 delayed feed → `NinjaTraderBroker` (Sim101): run ignition+flow+zones, watch the
    blotter vs the NT8 UI.
 3. Repeat routing to Quantower SIM; compare the two UIs (fills, DOM, position, latency-of-display).
