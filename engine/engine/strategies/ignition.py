@@ -19,7 +19,7 @@ from ..core.events import Bar, BookFlow, Trade
 from ..core.orders import Order, OrderType
 from ..core.timeutil import et_session_date, utc_hour
 from ..features.bars import BarAggregator
-from ..features.efficiency import OnlineKaufmanER
+from ..features.efficiency import OnlineKaufmanER, RollingEfficiency
 from ..features.hmm import GaussianHMM2
 from ..features.online import IgnitionFeatures
 from ..features.pivots import SessionLevels
@@ -34,7 +34,10 @@ class IgnitionStrategy(BaseStrategy):
                  pivot_min_dist: float = 2.0, horizon_s: float = 600.0,
                  chop_stop: float = 4.0, trend_cap: float = 12.0,
                  round_step: float = 50.0, book_min_hold: float = 8.0,
-                 regime_states: dict | None = None) -> None:
+                 regime_states: dict | None = None, regime_mode: str = "states",
+                 er_window_s: int = 7200, er_threshold: float = 0.70,
+                 exit_mode: str = "fixed", trail_init: float = 6.0,
+                 trail_width: float = 10.0) -> None:
         self.symbol = symbol
         self.feats = IgnitionFeatures(trend_lag=trend_lag)
         self.agg = BarAggregator(("30m", "1h"))
@@ -43,10 +46,22 @@ class IgnitionStrategy(BaseStrategy):
         self.levels = SessionLevels(round_step)
         self.er = OnlineKaufmanER(3)
         self.hmm = GaussianHMM2.load(hmm_path)
-        # regime: replay-parity uses the frozen per-hour states (research applies
-        # the state by entry hour); live uses the online causal filter.
+        # regime source:
+        #   "rolling_er" — CAUSAL trailing-window efficiency threshold (live-safe, recommended)
+        #   "states"     — frozen per-hour states (replay parity; has intra-hour look-ahead)
+        #   "hmm"        — online 1h-HMM forward-filter (causal but bar-close-lagged)
+        self.regime_mode = regime_mode
         self.regime_states = regime_states
+        self.er_threshold = er_threshold
+        self.reff = RollingEfficiency(er_window_s, 3) if regime_mode == "rolling_er" else None
+        self._er: float | None = None
         self._day = None
+        # exit_mode="trailing" replaces the regime-gated fixed exits with a single
+        # uniform trailing stop (initial hard stop trail_init, trail_width behind
+        # the peak) — no regime, no target, no look-ahead. Beats the regime gate.
+        self.exit_mode = exit_mode
+        self.trail_init = trail_init
+        self.trail_width = trail_width
         # params
         self.str_min, self.avol_min = str_min, avol_min
         self.book_act, self.book_net, self.book_giveback = book_act, book_net, book_giveback
@@ -102,6 +117,8 @@ class IgnitionStrategy(BaseStrategy):
         if px is None:
             return []
         self.zbook.on_price(px, bf.ts)
+        if self.reff is not None:
+            self._er = self.reff.update(bf.ts, px, et_session_date(bf.ts))
         if self.pos != 0:
             return self._manage(px, bf.ts)
         return self._maybe_enter(px, bf.ts)
@@ -128,18 +145,24 @@ class IgnitionStrategy(BaseStrategy):
         self.entry_px = px
         self.entry_ts = ts
         self.peak_fe = 0.0
-        if self.regime_states is not None:
-            is_trend = self.regime_states.get(utc_hour(ts), 0) == 1
-        else:
-            is_trend = self.hmm.is_trend()
-        self.regime = "trend" if is_trend else "chop"
-        if self.regime == "trend":
-            z = self.zbook.nearest_opposing(px, d, self.pivot_min_dist)
-            self.target_px = z.proximal() if z is not None else \
-                self.levels.target(px, d, self.pivot_min_dist)
-            self.stop_px = self.levels.stop(px, d)
-        else:
+        if self.exit_mode == "trailing":
+            self.regime = "trailing"
             self.target_px = self.stop_px = None
+        else:
+            if self.regime_mode == "rolling_er":
+                is_trend = self._er is not None and self._er >= self.er_threshold
+            elif self.regime_states is not None:
+                is_trend = self.regime_states.get(utc_hour(ts), 0) == 1
+            else:
+                is_trend = self.hmm.is_trend()
+            self.regime = "trend" if is_trend else "chop"
+            if self.regime == "trend":
+                z = self.zbook.nearest_opposing(px, d, self.pivot_min_dist)
+                self.target_px = z.proximal() if z is not None else \
+                    self.levels.target(px, d, self.pivot_min_dist)
+                self.stop_px = self.levels.stop(px, d)
+            else:
+                self.target_px = self.stop_px = None
         return [Order(self.symbol, d, 1, OrderType.MARKET, tag=f"entry-{self.regime}")]
 
     def _manage(self, px: float, ts: int) -> list[Order]:
@@ -150,6 +173,10 @@ class IgnitionStrategy(BaseStrategy):
         tag = None
         if held >= self.horizon_s:
             tag = "horizon"
+        elif self.exit_mode == "trailing":
+            stop_fe = max(-self.trail_init, self.peak_fe - self.trail_width)
+            if fe <= stop_fe:
+                tag = "trail"
         elif self.regime == "trend":
             if fe <= -self.trend_cap:
                 tag = "cap"

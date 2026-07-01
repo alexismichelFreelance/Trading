@@ -53,7 +53,16 @@ P&L, look-ahead-corrected). Each strategy therefore has two forms:
   deployable number (ignition ~+584 pts; zones ~+$4.4k ESM5; flow position-sized).
 
 The oracle proves logic-faithfulness; the Strategy is the object that runs live (only the Feed/Broker
-adapter changes). Run the engine forms via `tools/run_replay.py --strategy ignition|flow|zones`.
+adapter changes). Run the engine forms via `tools/run_replay.py --strategy ignition|flow|zones|opendrive`.
+
+## Fourth sleeve: open-drive continuation (2026-07 research)
+`strategies/open_drive.py` — at 10:00 ET enter in the direction of the 9:30→10:00 move; stop = 1.0×
+morning-range (floor 5), trail = 1.5× morning-range (floor 8), flat at 16:00. Price-only (no book/flow
+data), one decision/day. Evidence on the 1-second path (64 sec-covered days): **+815 pts, all 4 months
+positive, both contracts positive, daily ρ = −0.01 vs the ignition sleeve**; ESM5 Mar 20–31 holdout
++154 pts. Known limits (be honest): t≈1.6, April-heavy convexity profile, fixed-point stops fail on
+the 1s path (hence range-scaled), strict $-risk budgeting deletes the edge (it lives on wide-range days).
+Parity gate: `tests/parity/test_parity_opendrive.py`.
 
 ## Live path (Phase 2)
 `LiveEngine` (`core/live_engine.py`) drives the same strategies async off `NinjaTraderFeed` +

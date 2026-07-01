@@ -207,4 +207,51 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
     }
+
+    // ── minimal flat-object JSON reader (NT8 ships no JSON); same file, same
+    //    namespace as EngineRelay so it compiles as part of the one strategy. ──
+    public class MiniJson
+    {
+        private readonly Dictionary<string, string> kv = new Dictionary<string, string>();
+
+        public static MiniJson Parse(string s)
+        {
+            var j = new MiniJson();
+            s = s.Trim();
+            if (s.StartsWith("{")) s = s.Substring(1);
+            if (s.EndsWith("}")) s = s.Substring(0, s.Length - 1);
+            int i = 0, n = s.Length;
+            while (i < n)
+            {
+                while (i < n && s[i] != '"') i++;
+                if (i >= n) break;
+                i++; int ks = i; while (i < n && s[i] != '"') i++;
+                string key = s.Substring(ks, i - ks); i++;
+                while (i < n && s[i] != ':') i++; i++;
+                while (i < n && char.IsWhiteSpace(s[i])) i++;
+                string val;
+                if (i < n && s[i] == '"')
+                {
+                    i++; int vs = i; while (i < n && s[i] != '"') i++;
+                    val = s.Substring(vs, i - vs); i++;
+                }
+                else
+                {
+                    int vs = i; while (i < n && s[i] != ',') i++;
+                    val = s.Substring(vs, i - vs).Trim();
+                }
+                kv[key] = val;
+                while (i < n && s[i] != ',') i++; i++;
+            }
+            return j;
+        }
+
+        public string Get(string k) { return kv.TryGetValue(k, out var v) ? v : ""; }
+
+        public double Num(string k)
+        {
+            return kv.TryGetValue(k, out var v) &&
+                   double.TryParse(v, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d : 0.0;
+        }
+    }
 }

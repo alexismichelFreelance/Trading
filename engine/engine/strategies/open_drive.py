@@ -1,0 +1,107 @@
+"""OpenDriveStrategy — first-30-minute drive continuation (one decision/day).
+
+At 10:00 ET, enter in the direction of the 9:30->10:00 move; risk is scaled to
+the morning's own range: hard stop = 1.0 x R30 (floor 5pt), trailing stop =
+1.5 x R30 (floor 8pt) behind the peak, flat at 16:00 ET (MOC). No book data,
+no flow, no regime model — price only, so it runs identically on any feed.
+
+Evidence (see tools/open_drive_oracle CLI / tests/parity/test_parity_opendrive.py):
+1-second path, 64 sec-covered days: +815 pts, mean +12.7/day, all 4 months
+positive, both contracts positive, rho=-0.01 daily vs the ignition sleeve;
+ESM5 Mar20-31 holdout +154 pts (7 days). Known limits: convexity profile
+(April-heavy), t~1.6, fixed-point stops DIE on the 1s path (hence range-scaled).
+"""
+from __future__ import annotations
+
+from ..core.events import Bar, BookFlow, Trade
+from ..core.orders import Order
+from ..core.timeutil import et, et_session_date
+from .base import BaseStrategy
+
+ENTRY_MIN = 10 * 60          # 10:00 ET, minutes-of-day
+CLOSE_MIN = 16 * 60          # 16:00 ET
+
+
+class OpenDriveStrategy(BaseStrategy):
+    def __init__(self, symbol: str, *, stop_mult: float = 1.0, trail_mult: float = 1.5,
+                 stop_floor: float = 5.0, trail_floor: float = 8.0) -> None:
+        self.symbol = symbol
+        self.stop_mult, self.trail_mult = stop_mult, trail_mult
+        self.stop_floor, self.trail_floor = stop_floor, trail_floor
+        self._day: str | None = None
+        self._reset_day()
+        self.pos = 0
+
+    def _reset_day(self) -> None:
+        self.open_px: float | None = None
+        self.hi = -float("inf")
+        self.lo = float("inf")
+        self.entered = False
+        self.side = 0
+        self.entry_px = 0.0
+        self.stop = 0.0
+        self.trail = 0.0
+        self.peak_fe = 0.0
+
+    # price ticks arrive as per-second trades (replay/live) — drive on pxc
+    def on_trade(self, t: Trade) -> list[Order]:
+        return self._step(t.ts, t.price)
+
+    def on_bar(self, b: Bar) -> list[Order]:
+        # bars-only feeds (no per-second stream) still work, on closes
+        return self._step(b.ts, b.c) if b.tf == "1m" else []
+
+    def on_position(self, p) -> None:
+        self.pos = p.qty
+
+    # ── core logic ───────────────────────────────────────────────────────
+    def _step(self, ts: int, px: float) -> list[Order]:
+        t = et(ts)
+        mod = t.hour * 60 + t.minute
+        day = et_session_date(ts)
+        if day != self._day:
+            self._day = day
+            self._reset_day()
+        if mod < 9 * 60 + 30 or mod >= CLOSE_MIN + 5:
+            return []
+        # session-open tracking (9:30 onward)
+        if mod < ENTRY_MIN:
+            if self.open_px is None:
+                self.open_px = px
+            self.hi = max(self.hi, px)
+            self.lo = min(self.lo, px)
+            return []
+        # 16:00 flat
+        if mod >= CLOSE_MIN:
+            if self.pos != 0:
+                side = 1 if self.pos > 0 else -1
+                self.entered = True
+                return [Order(self.symbol, -side, abs(self.pos), tag="moc", reduce_only=True)]
+            return []
+        # entry at the first tick >= 10:00
+        if not self.entered:
+            self.entered = True
+            if self.open_px is None:
+                return []
+            r30 = px - self.open_px
+            if r30 == 0:
+                return []
+            self.side = 1 if r30 > 0 else -1
+            self.entry_px = px
+            rng30 = max(self.hi, px) - min(self.lo, px)
+            self.stop = max(self.stop_floor, self.stop_mult * rng30)
+            self.trail = max(self.trail_floor, self.trail_mult * rng30)
+            self.peak_fe = 0.0
+            return [Order(self.symbol, self.side, 1, tag="entry-opendrive")]
+        # manage
+        if self.pos != 0 and self.side != 0:
+            fe = (px - self.entry_px) * self.side
+            self.peak_fe = max(self.peak_fe, fe)
+            if fe <= max(-self.stop, self.peak_fe - self.trail):
+                side = self.side
+                self.side = 0
+                return [Order(self.symbol, -side, abs(self.pos), tag="trail", reduce_only=True)]
+        return []
+
+
+__all__ = ["OpenDriveStrategy"]

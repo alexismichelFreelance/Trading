@@ -5,8 +5,10 @@ Reference NinjaScript that bridges NT8 ↔ the Python engine over two local sock
 the Python core is untouched.
 
 ## Install
-1. NT8 → **New → NinjaScript Editor**. Add `MiniJson.cs` and `EngineRelay.cs` as new
-   Strategy files (or paste into the editor) and **Compile** (F5).
+1. NT8 → **New → NinjaScript Editor → New → Strategy** (name it `EngineRelay`). Replace the
+   generated template with the entire contents of `EngineRelay.cs` and **Compile** (F5). It's
+   ONE file with two classes in the same namespace (`EngineRelay` strategy + its `MiniJson`
+   helper) — NinjaScript compiles both; you don't need a second file.
 2. Open an **ES** chart on your **SIM** account. Add the **EngineRelay** strategy;
    set **Calculate = On each tick**. Enable it. It logs `market:36001 broker:36002`.
 3. (For L2 `BookFlow`) ensure the data series provides market depth.
