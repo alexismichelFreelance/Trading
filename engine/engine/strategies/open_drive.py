@@ -19,7 +19,9 @@ from ..core.timeutil import et, et_session_date
 from .base import BaseStrategy
 
 ENTRY_MIN = 10 * 60          # 10:00 ET, minutes-of-day
-CLOSE_MIN = 16 * 60          # 16:00 ET
+FLAT_MIN = 15 * 60 + 59      # flatten on the first tick in the 15:59 ET minute
+                             # (NOT 16:00 — the ESH5/EST data window ends 15:59:59 ET,
+                             # so a 16:00 trigger would never fire and carry overnight)
 
 
 class OpenDriveStrategy(BaseStrategy):
@@ -62,7 +64,11 @@ class OpenDriveStrategy(BaseStrategy):
         if day != self._day:
             self._day = day
             self._reset_day()
-        if mod < 9 * 60 + 30 or mod >= CLOSE_MIN + 5:
+            if self.pos != 0:            # safety: never carry overnight
+                side = 1 if self.pos > 0 else -1
+                return [Order(self.symbol, -side, abs(self.pos), tag="safety-flat",
+                              reduce_only=True)]
+        if mod < 9 * 60 + 30 or mod > FLAT_MIN:
             return []
         # session-open tracking (9:30 onward)
         if mod < ENTRY_MIN:
@@ -71,11 +77,11 @@ class OpenDriveStrategy(BaseStrategy):
             self.hi = max(self.hi, px)
             self.lo = min(self.lo, px)
             return []
-        # 16:00 flat
-        if mod >= CLOSE_MIN:
+        # end-of-day flat (15:59 ET)
+        if mod >= FLAT_MIN:
             if self.pos != 0:
                 side = 1 if self.pos > 0 else -1
-                self.entered = True
+                self.side = 0
                 return [Order(self.symbol, -side, abs(self.pos), tag="moc", reduce_only=True)]
             return []
         # entry at the first tick >= 10:00
