@@ -1,0 +1,13 @@
+{
+  "_comment": "FROZEN 1h regime HMM (from engine_reference/hmm_1h_params.json). 2-state Gaussian HMM, Baum-Welch 30 iters on ESM5 1h Kaufman-efficiency, applied causally to both contracts. LOADED, never refit. means==mu, vars==var, trend_state==trend_state_index.",
+  "means": [0.44273515372787464, 0.9997414258690069],
+  "vars": [0.07889091371680196, 0.0001],
+  "pi": [1.0, 7.185930695427104e-256],
+  "A": [[0.8072481507771027, 0.19275184922289731],
+        [0.5642575108754346, 0.43574248912456526]],
+  "trend_state": 1,
+  "lookback": 3,
+  "iterations": 30,
+  "fit_on": "ESM5",
+  "timeframe": "1h"
+}

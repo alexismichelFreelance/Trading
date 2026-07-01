@@ -1,0 +1,12 @@
+# Per-instrument contract specs. Root symbols; contract months (ESM5/ESH5)
+# resolve to their root via engine.core.config.root_symbol().
+instruments:
+  ES:
+    point_usd: 50.0
+    tick: 0.25
+  NQ:
+    point_usd: 20.0
+    tick: 0.25
+  GC:
+    point_usd: 100.0
+    tick: 0.10

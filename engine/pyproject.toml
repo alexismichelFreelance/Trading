@@ -1,0 +1,24 @@
+[project]
+name = "es-engine"
+version = "0.1.0"
+description = "Event-driven, broker/feed-agnostic ES futures trading engine"
+requires-python = ">=3.11"
+dependencies = ["numpy", "pandas", "httpx", "pyyaml"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = ["parity: full QuestDB replay parity gate (opt-in via --run-parity)"]

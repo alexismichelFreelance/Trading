@@ -1,0 +1,14 @@
+{
+  "_comment": "FROZEN 1-hour regime HMM for the ignition strategy. 2-state Gaussian HMM fit by Baum-Welch (30 iterations) on the Kaufman efficiency ratio of 1-hour bars of ESM5 (claude_sec_feat), then FROZEN and applied causally to BOTH contracts. DO NOT refit in the engine - LOAD these params. Deterministic: same data -> same params. Regenerated from QuestDB; mu matches the spec's documented learned means (chop 0.44 / trend 1.0).",
+  "feature": "kaufman_efficiency_ratio",
+  "bar_timeframe": "1h",
+  "lookback_L": 3,
+  "fit_contract": "ESM5",
+  "iterations": 30,
+  "trend_state_index": 1,
+  "mu": [0.44273515372787464, 0.9997414258690069],
+  "var": [0.07889091371680196, 0.0001],
+  "pi": [1.0, 7.185930695427104e-256],
+  "A": [[0.8072481507771027, 0.19275184922289731],
+        [0.5642575108754346, 0.43574248912456526]]
+}
