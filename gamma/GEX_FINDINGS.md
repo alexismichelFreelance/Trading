@@ -4,9 +4,22 @@
 EOD, 2011→present). Fetched + loaded to QuestDB `claude_gex` by `engine/tools/fetch_gex.py`;
 served causally by `engine/engine/features/gamma.py` (`GammaRegime`). Trading day D uses the
 PRIOR session's `gexp` = trailing-252-session percentile of GEX (no in-sample normalization).
-Strike-LEVEL data (zero-gamma flip, call/put walls) is NOT available free programmatically —
-DoltHub chains lack OI/volume weights; OptionsDX remains the manual-download path
-(`gamma/README.md`), pipeline ready in `build_gex.py`.
+
+## Strike-level (flip/walls) source verification — 2026-07-02
+Historical per-strike chains with OI for Feb–May 2025 are **not freely available anywhere**:
+- **OptionsDX**: VERIFIED — SPX EOD chains offered are **2010–2023 only** (no 2024/2025, no OI
+  field). This is why it was dropped; `build_gex.py` stays as the consumer if that ever changes.
+- **DoltHub `post-no-preference/options`**: greeks but **no OI and no volume** — unweightable.
+- **CBOE free downloads**: aggregate volume / put-call ratios only; per-strike EOD = paid DataShop.
+- **Wayback Machine** on the CBOE chain JSON: ~7 snapshots ever, nearest to our window is 2023.
+
+**Forward-only alternative (LIVE, working):** CBOE's free delayed-quotes JSON
+(`cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json`) carries the FULL chain with **true
+open interest, volume, and greeks**. `engine/tools/fetch_cboe_gex.py` runs daily: computes the
+dealer-gamma profile (true-OI-weighted, near-dated ≤7 DTE incl. SPXW), extracts zero-gamma flip /
+call wall / put wall / net regime into QuestDB `claude_gex_levels`, and archives the raw JSON to
+`gamma/raw_cboe/` — the RecorderTee philosophy: collect forward, never re-buy. First live row:
+2026-07-02 spot 7483, flip 7545.7, walls 7500/7500, long-gamma (1,350 options).
 
 ## A. GEX predicts next-day RANGE — and adds beyond vol persistence
 70 joined sessions (2025-02-19 → 05-30):
