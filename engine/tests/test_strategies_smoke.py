@@ -41,6 +41,32 @@ def test_zone_strategy_protocol_and_run():
         assert isinstance(out, list)
 
 
+def test_ibs_swing_buys_weak_close_sells_strong_close():
+    from engine.strategies.ibs_swing import IBSSwingStrategy
+    s = IBSSwingStrategy("ES")
+    assert isinstance(s, Strategy)
+    day1 = pd.Timestamp("2025-04-01T13:30:00Z").value      # 9:30 ET (EDT)
+    # weak close: session range 5000-5020, close at 5001 -> IBS ~0.05
+    orders = []
+    for m in range(390):
+        ts = day1 + m * 60 * NS
+        px = 5020.0 - m * 0.049                             # drifts to ~5001
+        orders += s.on_bar(Bar(ts, "1m", px, max(px, 5020.0) if m == 0 else px + 0.2,
+                               px - 0.2 if m else 5000.0, px, 50))
+    entry = [o for o in orders if o.tag == "ibs-entry"]
+    assert len(entry) == 1 and entry[0].side == 1
+    s.pos = 1
+    # next day strong close: range 5000-5020, close 5019 -> IBS ~0.95 -> exit
+    day2 = pd.Timestamp("2025-04-02T13:30:00Z").value
+    orders = []
+    for m in range(390):
+        ts = day2 + m * 60 * NS
+        px = 5000.0 + m * 0.049
+        orders += s.on_bar(Bar(ts, "1m", px, px + 0.2, px - 0.2, px, 50))
+    exits = [o for o in orders if o.tag == "ibs-exit"]
+    assert len(exits) == 1 and exits[0].reduce_only
+
+
 def test_open_drive_enters_at_10_et_and_flattens():
     from engine.strategies.open_drive import OpenDriveStrategy
     s = OpenDriveStrategy("ESM5")

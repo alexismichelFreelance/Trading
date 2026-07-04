@@ -64,6 +64,16 @@ positive, both contracts positive, daily ρ = −0.01 vs the ignition sleeve**; 
 the 1s path (hence range-scaled), strict $-risk budgeting deletes the edge (it lives on wide-range days).
 Parity gate: `tests/parity/test_parity_opendrive.py`.
 
+## Fifth sleeve: IBS daily mean-reversion (SWING — holds overnight)
+`strategies/ibs_swing.py` — at 15:59 ET: buy MOC when the day closes in the bottom 20% of its
+range (IBS<0.2) while flat; sell MOC when it closes in the top 20% (IBS>0.8). No intraday stop
+(classic spec) — tail risk is handled by SIZING (worst trade −347pt, 1-lot maxDD −$24.5k over
+16y; see `strategies/ibs_oracle.py`). Evidence: ES=F 2010→2026 n=435, +4644pt net, t=+4.2,
+win 70%, H2>H1 (no decay); whole 3×3 parameter plateau t≥4.1; SPY confirms t=4.4. Optional
+GEX sizing (`gamma=GammaRegime()`): 2 lots in long-gamma regimes (win 78%, worst −160) vs 1 in
+short-gamma (worst −347) → +72% total at slightly better return/DD. Parity:
+`tests/parity/test_parity_ibs.py` (needs `tools/fetch_daily.py` first).
+
 ## Live path (Phase 2)
 `LiveEngine` (`core/live_engine.py`) drives the same strategies async off `NinjaTraderFeed` +
 `NinjaTraderBroker`/`QuantowerBroker` over a local JSON socket (`adapters/protocol.py`); per-second

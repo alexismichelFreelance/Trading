@@ -32,7 +32,8 @@ def load_states():
     return json.loads(STATES_PATH.read_text()) if STATES_PATH.exists() else None
 
 
-NEEDS_BARS = {"ignition": True, "zones": True, "flow": False, "opendrive": False}
+NEEDS_BARS = {"ignition": True, "zones": True, "flow": False, "opendrive": False,
+              "ibs": True}
 
 
 def make_strategy(name: str, symbol: str, hmm_path: str = HMM_PATH, **kw):
@@ -49,7 +50,10 @@ def make_strategy(name: str, symbol: str, hmm_path: str = HMM_PATH, **kw):
     if name == "opendrive":
         from engine.strategies.open_drive import OpenDriveStrategy
         return OpenDriveStrategy(symbol, **kw)
-    raise SystemExit(f"unknown strategy '{name}' (ignition/flow/zones/opendrive)")
+    if name == "ibs":
+        from engine.strategies.ibs_swing import IBSSwingStrategy
+        return IBSSwingStrategy(symbol, **kw)
+    raise SystemExit(f"unknown strategy '{name}' (ignition/flow/zones/opendrive/ibs)")
 
 
 async def run_one(name: str, symbol: str, days=None, start=None, end=None,
