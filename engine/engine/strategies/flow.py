@@ -12,7 +12,7 @@ from collections import deque
 
 from ..core.events import BookFlow, Trade
 from ..core.orders import Order
-from ..core.timeutil import et_session_date
+from ..core.timeutil import et_session_date, ns_to_utc
 from .base import BaseStrategy
 
 
@@ -27,10 +27,16 @@ def _sign(x: float) -> int:
 
 class FlowFollowingStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, w: int = 120, th: int = 200, scale: float = 3000.0,
-                 maxp: int = 50, add_band: int = 1, hold_band: int = 5) -> None:
+                 maxp: int = 50, add_band: int = 1, hold_band: int = 5,
+                 gate_utc: tuple[int, int] | None = (13, 21)) -> None:
         self.symbol = symbol
         self.w, self.th, self.scale, self.maxp = w, th, scale, maxp
         self.add_band, self.hold_band = add_band, hold_band
+        # trade only inside the VALIDATED window (13-21 UTC = the research grid);
+        # overnight tape is 5-20x thinner and the TH/cost calibration is untested
+        # there. None disables the gate. Replay data only exists inside the
+        # window, so parity is unaffected.
+        self.gate_utc = gate_utc
         self._buf: deque[float] = deque()
         self._F = 0.0
         self._day: str | None = None
@@ -43,6 +49,16 @@ class FlowFollowingStrategy(BaseStrategy):
 
     def on_bookflow(self, bf: BookFlow) -> list[Order]:
         orders: list[Order] = []
+        if self.gate_utc is not None:
+            h = ns_to_utc(bf.ts).hour
+            if not (self.gate_utc[0] <= h < self.gate_utc[1]):
+                self._buf.clear()
+                self._F = 0.0
+                self._adelta = 0
+                if self.pos != 0:                 # window closed: go flat
+                    return [Order(self.symbol, -_sign(self.pos), abs(self.pos),
+                                  tag="window-flat", reduce_only=True)]
+                return []
         day = et_session_date(bf.ts)
         if day != self._day:                      # flat reset each session
             self._day = day

@@ -44,6 +44,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private readonly List<TcpClient> brokerClients = new List<TcpClient>();
         private readonly object mLock = new object(), bLock = new object();
         private readonly Dictionary<string, Order> live = new Dictionary<string, Order>();
+        // historical 1m bars buffered during State.Historical; sent to each market
+        // client on connect so the engine's bar-driven features warm up instantly
+        private readonly List<string> histBars = new List<string>();
         private double lastBid = 0, lastAsk = 0;
         private static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
@@ -89,6 +92,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         private static string J(double d) { return d.ToString("R", CultureInfo.InvariantCulture); }
+
+        // ── historical 1m bars → backfill buffer (chart must be a 1-minute chart;
+        //    the days-to-load setting controls how much history is streamed) ──
+        protected override void OnBarUpdate()
+        {
+            if (State != State.Historical || CurrentBar < 0)
+                return;
+            if (BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
+                return;
+            histBars.Add("{\"t\":\"bar\",\"ts\":" + ToNs(Time[0]) + ",\"tf\":\"1m\",\"o\":" + J(Open[0]) +
+                ",\"h\":" + J(High[0]) + ",\"l\":" + J(Low[0]) + ",\"c\":" + J(Close[0]) +
+                ",\"v\":" + ((long)Volume[0]) + "}");
+            if (histBars.Count > 20000)
+                histBars.RemoveAt(0);
+        }
 
         // ── market data → market clients ─────────────────────────────────
         protected override void OnMarketData(MarketDataEventArgs e)
@@ -197,10 +215,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     TcpClient c;
                     try { c = l.AcceptTcpClient(); } catch { break; }
+                    if (!isBroker) SendBackfill(c);          // warmup bars first
                     lock (lk) clients.Add(c);
                     if (isBroker) new Thread(() => ReadBroker(c)).Start();
                 }
             }) { IsBackground = true }.Start();
+        }
+
+        private void SendBackfill(TcpClient c)
+        {
+            try
+            {
+                var s = c.GetStream();
+                var sb = new StringBuilder();
+                lock (histBars)
+                {
+                    for (int i = 0; i < histBars.Count; i++)
+                        sb.Append(histBars[i]).Append('\n');
+                }
+                byte[] bytes = Encoding.UTF8.GetBytes(sb.ToString());
+                if (bytes.Length > 0) s.Write(bytes, 0, bytes.Length);
+            }
+            catch { }
         }
 
         private void ReadBroker(TcpClient c)
