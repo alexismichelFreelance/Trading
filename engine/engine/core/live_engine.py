@@ -19,6 +19,7 @@ import logging
 
 from .blotter import Blotter
 from .dispatch import dispatch_broker, dispatch_market
+from .events import Bar, Trade
 
 log = logging.getLogger("engine.live")
 
@@ -27,7 +28,8 @@ _END = ("end", None)
 
 class LiveEngine:
     def __init__(self, feed, broker, strategies, clock, blotter: Blotter,
-                 reconnect_delay: float = 1.0, drain_timeout: float = 0.5) -> None:
+                 reconnect_delay: float = 1.0, drain_timeout: float = 0.5,
+                 warmup_gate: bool = True) -> None:
         self.feed = feed
         self.broker = broker
         self.strategies = list(strategies)
@@ -35,6 +37,16 @@ class LiveEngine:
         self.blotter = blotter
         self.reconnect_delay = reconnect_delay
         self.drain_timeout = drain_timeout
+        # SAFETY: on connect the feed replays historical backfill bars (bars only,
+        # no trades) so bar-driven features warm up. Those bars would otherwise
+        # make strategies emit HISTORICAL orders that fill at the LIVE price. While
+        # gated, we still dispatch events (state warms) but DROP the orders. The
+        # first live Trade (backfill has none) flips us live. warmup_gate=False for
+        # feeds with no backfill (tests).
+        self.warmup_gate = warmup_gate
+        self._live = not warmup_gate
+        self._backfill_bars = 0
+        self._suppressed_orders = 0
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
 
@@ -83,9 +95,20 @@ class LiveEngine:
                     continue
                 if kind == "market":
                     self.clock.set(ev.ts)
-                    for o in dispatch_market(self.strategies, ev):
-                        self.blotter.on_order(o)
-                        await self.broker.submit(o)
+                    if not self._live and isinstance(ev, Trade):
+                        self._live = True
+                        log.info("warmup complete: %d backfill bars consumed, %d "
+                                 "warmup orders suppressed; now LIVE",
+                                 self._backfill_bars, self._suppressed_orders)
+                    orders = dispatch_market(self.strategies, ev)
+                    if self._live:
+                        for o in orders:
+                            self.blotter.on_order(o)
+                            await self.broker.submit(o)
+                    else:                                # warmup: state only, no orders
+                        if isinstance(ev, Bar):
+                            self._backfill_bars += 1
+                        self._suppressed_orders += len(orders)
                     self.blotter.on_market_event(ev)
                 else:  # broker event
                     self.blotter.on_broker_event(ev)

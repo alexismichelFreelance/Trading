@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -51,7 +52,7 @@ class ObserveStrategy:
 
     def on_bar(self, e):
         self.bars += 1
-        print(f"  1m bar: {e.o:.2f}/{e.h:.2f}/{e.l:.2f}/{e.c:.2f} v={e.v}")
+        self.last_px = e.c
         return []
 
     def on_quote(self, e):
@@ -98,7 +99,12 @@ async def main() -> None:
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = run until Ctrl-C)")
     ap.add_argument("--market-port", type=int, default=36001)
     ap.add_argument("--broker-port", type=int, default=36002)
+    ap.add_argument("--no-warmup-gate", action="store_true",
+                    help="DANGER: let strategies trade on backfill bars (debug only)")
     a = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
+                        datefmt="%H:%M:%S")
 
     names = [s for s in a.strategies.split(",") if s]
     obs = ObserveStrategy()
@@ -106,18 +112,30 @@ async def main() -> None:
     feed = NinjaTraderFeed("127.0.0.1", a.market_port, symbol=SYMBOL)
     broker = NinjaTraderBroker("127.0.0.1", a.broker_port, symbol=SYMBOL)
     blot = Blotter(SYMBOL, 50.0, verbose=True)
-    eng = LiveEngine(feed, broker, strategies, WallClock(), blot)
+    eng = LiveEngine(feed, broker, strategies, WallClock(), blot,
+                     warmup_gate=not a.no_warmup_gate)
 
     mode = "OBSERVE" if not names else "TRADE(" + ",".join(names) + ")"
     print(f"live session [{mode}] market:{a.market_port} broker:{a.broker_port} "
-          f"{'for %.0fs' % a.seconds if a.seconds else 'until Ctrl-C'}")
+          f"{'for %.0fs' % a.seconds if a.seconds else 'until Ctrl-C'}  "
+          f"(warmup gate {'OFF' if a.no_warmup_gate else 'ON'})")
 
     async def stopper():
         await asyncio.sleep(a.seconds)
         print("(time cap reached, stopping)")
         eng.stop()
 
-    tasks = [asyncio.create_task(eng.run())]
+    async def heartbeat():
+        last = -1
+        while True:
+            await asyncio.sleep(20)
+            state = "LIVE" if eng._live else f"WARMUP({eng._backfill_bars} bars)"
+            if obs.trades != last or not eng._live:
+                print(f"  [{state}] trades={obs.trades} bookflow-s={obs.flows} "
+                      f"bars={obs.bars} last={obs.last_px} orders={blot.n_orders} fills={blot.n_fills}")
+                last = obs.trades
+
+    tasks = [asyncio.create_task(eng.run()), asyncio.create_task(heartbeat())]
     if a.seconds:
         tasks.append(asyncio.create_task(stopper()))
     try:
@@ -130,8 +148,8 @@ async def main() -> None:
             t.cancel()
 
     print(f"\nsession summary: {obs.trades} trades, {obs.flows} bookflow-seconds, "
-          f"{obs.bars} 1m bars, last px {obs.last_px}")
-    print(f"orders {blot.n_orders}, fills {blot.n_fills}")
+          f"{obs.bars} 1m bars ({eng._backfill_bars} backfill), last px {obs.last_px}")
+    print(f"warmup orders suppressed: {eng._suppressed_orders}  |  live orders {blot.n_orders}, fills {blot.n_fills}")
     if blot.trades:
         print(blot.summary(flat_cost_pts=0.0))
 
