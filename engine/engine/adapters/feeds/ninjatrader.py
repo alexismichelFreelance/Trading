@@ -15,7 +15,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 
-from ...core.events import Bar, DepthUpdate, MarketEvent, Quote, Trade
+from ...core.events import Bar, DepthUpdate, MarketEvent, Trade
 from ...features.bookflow import BookFlowAggregator
 from ..protocol import decode_market
 
@@ -35,6 +35,12 @@ class NinjaTraderFeed:
         log.info("NT feed connected %s:%d", self.host, self.port)
         agg = BookFlowAggregator()
         cur_sec: int | None = None
+        # 1m bar builder: the relay streams trades/depth only, but the bar-driven
+        # strategies (ignition zones/levels, zone lifecycle, IBS) need 1m Bars —
+        # build them from trades and emit at each minute rollover (close-stamped).
+        bar_min: int | None = None
+        b_o = b_h = b_l = b_c = 0.0
+        b_v = 0
         try:
             async for raw in reader:                 # StreamReader yields lines
                 line = raw.strip()
@@ -53,12 +59,29 @@ class NinjaTraderFeed:
                 elif sec > cur_sec:                  # close the previous second
                     yield agg.snapshot(cur_sec)
                     cur_sec = sec
-                if isinstance(ev, DepthUpdate):
+                if isinstance(ev, Trade):
+                    minute = ev.ts // (60 * NS)
+                    if bar_min is None:
+                        bar_min = minute
+                        b_o = b_h = b_l = b_c = ev.price
+                        b_v = ev.size
+                    elif minute > bar_min:           # emit closed 1m bar first
+                        yield Bar((bar_min + 1) * 60 * NS, "1m", b_o, b_h, b_l, b_c, b_v)
+                        bar_min = minute
+                        b_o = b_h = b_l = b_c = ev.price
+                        b_v = ev.size
+                    else:
+                        b_h = max(b_h, ev.price)
+                        b_l = min(b_l, ev.price)
+                        b_c = ev.price
+                        b_v += ev.size
+                    yield ev
+                elif isinstance(ev, DepthUpdate):
                     agg.accumulate(ev)
                     if self.emit_depth:
                         yield ev
                 else:
-                    yield ev                          # Trade / Quote / Bar / BookFlow
+                    yield ev                          # Quote / Bar / BookFlow
             if cur_sec is not None:                   # flush the final second
                 yield agg.snapshot(cur_sec)
         finally:
