@@ -65,7 +65,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Terminated)
             {
-                try { marketListener?.Stop(); brokerListener?.Stop(); } catch { }
+                try
+                {
+                    if (marketListener != null) marketListener.Stop();
+                    if (brokerListener != null) brokerListener.Stop();
+                }
+                catch { }
             }
         }
 
@@ -131,24 +136,32 @@ namespace NinjaTrader.NinjaScript.Strategies
             string t = m.Get("t");
             if (t == "place")
             {
-                OrderAction action = (int)m.Num("side") > 0 ? OrderAction.Buy : OrderAction.SellShort;
+                OrderAction action = (int)m.Num("side") > 0 ? OrderAction.Buy : OrderAction.Sell;
                 OrderType type = m.Get("otype") == "LIMIT" ? OrderType.Limit
                                : m.Get("otype") == "STOP" ? OrderType.StopMarket : OrderType.Market;
                 double limit = type == OrderType.Limit ? m.Num("limit") : 0;
                 double stop = type == OrderType.StopMarket ? m.Num("stop") : 0;
                 Order o = Account.CreateOrder(Instrument, action, type, OrderEntry.Manual,
-                    TimeInForce.Day, (int)m.Num("qty"), limit, stop, string.Empty, m.Get("order_id"), null);
+                    TimeInForce.Day, (int)m.Num("qty"), limit, stop, string.Empty,
+                    m.Get("order_id"), Core.Globals.MaxDate, null);
                 live[m.Get("order_id")] = o;
                 Account.Submit(new[] { o });
             }
             else if (t == "cancel")
             {
-                if (live.TryGetValue(m.Get("order_id"), out var o)) Account.Cancel(new[] { o });
+                Order o;
+                if (live.TryGetValue(m.Get("order_id"), out o)) Account.Cancel(new[] { o });
             }
             else if (t == "modify")
             {
-                if (live.TryGetValue(m.Get("order_id"), out var o))
-                    Account.Change(new[] { o });    // set o.LimitPrice/StopPrice first in a full impl
+                Order o;
+                if (live.TryGetValue(m.Get("order_id"), out o))
+                {
+                    if (m.Num("limit") > 0) o.LimitPriceChanged = m.Num("limit");
+                    if (m.Num("stop") > 0) o.StopPriceChanged = m.Num("stop");
+                    if (m.Num("qty") > 0) o.QuantityChanged = (int)m.Num("qty");
+                    Account.Change(new[] { o });
+                }
             }
         }
 
@@ -240,18 +253,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                     int vs = i; while (i < n && s[i] != ',') i++;
                     val = s.Substring(vs, i - vs).Trim();
                 }
-                kv[key] = val;
+                j.kv[key] = val;
                 while (i < n && s[i] != ',') i++; i++;
             }
             return j;
         }
 
-        public string Get(string k) { return kv.TryGetValue(k, out var v) ? v : ""; }
+        public string Get(string k)
+        {
+            string v;
+            return kv.TryGetValue(k, out v) ? v : "";
+        }
 
         public double Num(string k)
         {
-            return kv.TryGetValue(k, out var v) &&
-                   double.TryParse(v, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d : 0.0;
+            string v;
+            double d;
+            return kv.TryGetValue(k, out v) &&
+                   double.TryParse(v, NumberStyles.Any, CultureInfo.InvariantCulture, out d) ? d : 0.0;
         }
     }
 }

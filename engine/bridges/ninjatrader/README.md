@@ -9,6 +9,8 @@ the Python core is untouched.
    generated template with the entire contents of `EngineRelay.cs` and **Compile** (F5). It's
    ONE file with two classes in the same namespace (`EngineRelay` strategy + its `MiniJson`
    helper) — NinjaScript compiles both; you don't need a second file.
+   (The file is verified to compile cleanly against NT8's own assemblies — Core/Gui/Custom —
+   with the strict C# 5 compiler, so it works on both NT 8.0 and 8.1 editors.)
 2. Open an **ES** chart on your **SIM** account. Add the **EngineRelay** strategy;
    set **Calculate = On each tick**. Enable it. It logs `market:36001 broker:36002`.
 3. (For L2 `BookFlow`) ensure the data series provides market depth.
