@@ -59,6 +59,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Realtime)
             {
+                // account-level events: strategy overrides do NOT fire for orders
+                // submitted via Account.Submit, so subscribe to the account itself.
+                Account.ExecutionUpdate += OnAccountExecution;
+                Account.PositionUpdate += OnAccountPosition;
                 StartServer(ref marketListener, MarketPort, marketClients, mLock, false);
                 StartServer(ref brokerListener, BrokerPort, brokerClients, bLock, true);
                 Print("EngineRelay: market:" + MarketPort + " broker:" + BrokerPort);
@@ -67,6 +71,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 try
                 {
+                    if (Account != null)
+                    {
+                        Account.ExecutionUpdate -= OnAccountExecution;
+                        Account.PositionUpdate -= OnAccountPosition;
+                    }
                     if (marketListener != null) marketListener.Stop();
                     if (brokerListener != null) brokerListener.Stop();
                 }
@@ -108,25 +117,36 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ",\"size\":" + size + ",\"level\":" + e.Position + "}");
         }
 
-        // ── executions / positions → broker clients ──────────────────────
-        protected override void OnExecutionUpdate(Execution exec, string executionId, double price,
-            int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        // ── ACCOUNT executions / positions → broker clients ──────────────
+        // (account events fire for every instrument on the account — filter to
+        // the chart's instrument so manual trades elsewhere don't leak in)
+        private void OnAccountExecution(object sender, ExecutionEventArgs e)
         {
-            int signed = marketPosition == MarketPosition.Long ? quantity : -quantity;
-            string tag = exec.Order != null ? exec.Order.Name : "";
+            if (e.Execution == null || e.Execution.Instrument == null
+                || e.Execution.Instrument.MasterInstrument.Name != Instrument.MasterInstrument.Name)
+                return;
+            int qty = e.Execution.Quantity;
+            int signed = e.Execution.MarketPosition == MarketPosition.Long ? qty : -qty;
+            string name = e.Execution.Order != null ? e.Execution.Order.Name : "";
             Broadcast(brokerClients, bLock,
-                "{\"t\":\"fill\",\"ts\":" + ToNs(time) + ",\"order_id\":\"" + orderId + "\",\"symbol\":\"" +
-                Instrument.MasterInstrument.Name + "\",\"price\":" + J(price) + ",\"size\":" + signed +
-                ",\"commission\":" + J(exec.Commission) + ",\"tag\":\"" + tag + "\"}");
+                "{\"t\":\"fill\",\"ts\":" + ToNs(e.Execution.Time) + ",\"order_id\":\"" + name +
+                "\",\"symbol\":\"" + Instrument.MasterInstrument.Name +
+                "\",\"price\":" + J(e.Execution.Price) + ",\"size\":" + signed +
+                ",\"commission\":" + J(e.Execution.Commission) + ",\"tag\":\"" + name + "\"}");
         }
 
-        protected override void OnPositionUpdate(Position position, double averagePrice,
-            int quantity, MarketPosition marketPosition)
+        private void OnAccountPosition(object sender, PositionEventArgs e)
         {
-            int signed = marketPosition == MarketPosition.Long ? quantity : (marketPosition == MarketPosition.Short ? -quantity : 0);
+            if (e.Position == null || e.Position.Instrument == null
+                || e.Position.Instrument.MasterInstrument.Name != Instrument.MasterInstrument.Name)
+                return;
+            int signed = e.Position.MarketPosition == MarketPosition.Long ? e.Position.Quantity
+                       : (e.Position.MarketPosition == MarketPosition.Short ? -e.Position.Quantity : 0);
+            if (e.Operation == Operation.Remove) signed = 0;
             Broadcast(brokerClients, bLock,
                 "{\"t\":\"position\",\"ts\":" + ToNs(DateTime.UtcNow) + ",\"symbol\":\"" +
-                Instrument.MasterInstrument.Name + "\",\"qty\":" + signed + ",\"avg_px\":" + J(averagePrice) + "}");
+                Instrument.MasterInstrument.Name + "\",\"qty\":" + signed +
+                ",\"avg_px\":" + J(e.Position.AveragePrice) + "}");
         }
 
         // ── broker socket: parse order JSON, submit to the account ────────
