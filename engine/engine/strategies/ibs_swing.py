@@ -76,6 +76,11 @@ class IBSSwingStrategy(BaseStrategy):
     def on_position(self, p) -> None:
         self.pos = p.qty
 
+    def reset_for_live(self) -> None:
+        # clear phantom position; keep `_decided` (the 15:59 decision is
+        # time-gated — don't re-decide stale if it passed in the backfill)
+        self.pos = 0
+
     def on_fill(self, f: Fill) -> None:
         return None
 

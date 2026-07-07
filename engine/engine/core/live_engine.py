@@ -160,8 +160,12 @@ class LiveEngine:
                         self.last_px = ev.c
                     if not self._live and isinstance(ev, Trade):
                         self._live = True
+                        for s in self.strategies:      # clear warmup phantom state
+                            reset = getattr(s, "reset_for_live", None)
+                            if callable(reset):
+                                reset()
                         log.info("warmup complete: %d backfill bars consumed, %d "
-                                 "warmup orders suppressed; now LIVE",
+                                 "warmup orders suppressed; strategies reset; now LIVE",
                                  self._backfill_bars, self._suppressed_orders)
                     if not self._live and isinstance(ev, Bar):
                         self._backfill_bars += 1

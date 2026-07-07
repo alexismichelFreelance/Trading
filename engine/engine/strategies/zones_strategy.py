@@ -76,6 +76,16 @@ class ZoneLifecycleStrategy(BaseStrategy):
     def on_position(self, p) -> None:
         self.pos = p.qty
 
+    def reset_for_live(self) -> None:
+        # keep detected zones (market structure), drop the phantom warmup trade
+        # and RE-ARM every still-valid zone so live touches fade/break cleanly
+        self.trade = None
+        self.pos = 0
+        for z in self.zones:
+            if not z.broke:
+                z.fade_done = False
+                z.flip_done = False
+
     # ── per closed 30m bar ───────────────────────────────────────────────
     def _on_30m(self, b: Bar) -> list[Order]:
         self._k += 1

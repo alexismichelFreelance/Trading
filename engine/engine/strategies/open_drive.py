@@ -56,6 +56,13 @@ class OpenDriveStrategy(BaseStrategy):
     def on_position(self, p) -> None:
         self.pos = p.qty
 
+    def reset_for_live(self) -> None:
+        # clear phantom position from suppressed warmup entries. Do NOT re-arm
+        # `entered`: the 10:00 entry is time-gated — if it already passed in the
+        # backfill, today's shot is genuinely gone (re-arming would enter stale).
+        self.pos = 0
+        self.side = 0
+
     # ── core logic ───────────────────────────────────────────────────────
     def _step(self, ts: int, px: float) -> list[Order]:
         t = et(ts)

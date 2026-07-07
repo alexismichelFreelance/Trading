@@ -30,5 +30,15 @@ class BaseStrategy:
     def on_position(self, e: PositionUpdate) -> None:
         return None
 
+    def reset_for_live(self) -> None:
+        """Called ONCE at the warmup->live flip. Warmup dispatches bars so
+        feature/zone detectors warm up, but the warmup gate SUPPRESSES the
+        resulting orders — leaving any 'I've acted' trade-lifecycle state
+        (self.trade, self.entered, fade_done, position) corrupted by trades that
+        never actually filled. Override to reset that trade state to flat/fresh
+        while KEEPING warm detection (zones, averages, HMM). No-op by default;
+        never called in replay, so parity is unaffected."""
+        return None
+
 
 __all__ = ["BaseStrategy"]
