@@ -26,39 +26,63 @@ LIVE_UP = "#FF00E000"
 LIVE_DN = "#FFFF2020"
 ZONE_DEMAND = "#FF32CD32"
 ZONE_SUPPLY = "#FFFF4040"
-OP_VIRGIN = 32
-OP_TESTED = 14
 RES_LINE = "#FFFF4040"       # resistance (supply above)
 SUP_LINE = "#FF32CD32"       # support (demand below)
+
+# timeframes shown, low->high. Higher TF = more opaque (more significant).
+TF_ORDER = ("30m", "1h", "4h", "1d")
+TF_OPACITY = {"30m": 16, "1h": 24, "4h": 34, "1d": 46}
+TF_LABEL = {"4h": True, "1d": True}          # tag these on the chart
 
 GHOST_CAP_PER_TAG = 15
 
 
 class ZoneView:
-    """Independent 30m S/D zone lifecycle for VISUALIZATION (not trading)."""
+    """Independent MULTI-TIMEFRAME S/D zone lifecycle for VISUALIZATION.
+
+    Intraday TFs (30m/1h/4h) are aggregated from the live 1m stream (exact,
+    current contract). Daily is fed separately from daily bars (seed_daily),
+    since a futures 'day' is a session, not a UTC calendar day, and needs long
+    history for the detector's 20-bar window."""
 
     def __init__(self) -> None:
-        self.agg = BarAggregator(("30m",))
-        self.det = ZoneDetector()
-        self.book = ZoneBook()
+        self.agg = BarAggregator(("30m", "1h", "4h"))
+        self.det = {tf: ZoneDetector() for tf in TF_ORDER}
+        self.book = {tf: ZoneBook() for tf in TF_ORDER}
+
+    def _feed(self, tf: str, b) -> None:
+        z = self.det[tf].update(b)
+        if z is not None:
+            self.book[tf].add(z)
+        self.book[tf].on_bar(b)
+        self.book[tf].on_price(b.c, b.ts)
+
+    def seed_daily(self, daily_bars: list) -> None:
+        """Feed historical daily bars (built externally) to the 1d detector."""
+        for b in daily_bars:
+            self._feed("1d", b)
 
     def update(self, bar) -> None:
-        for b in self.agg.update(bar):
-            z = self.det.update(b)
-            if z is not None:
-                self.book.add(z)
-            self.book.on_bar(b)          # break/flip on close-through
-            self.book.on_price(b.c, b.ts)
+        if bar.tf == "1d":
+            self._feed("1d", bar)
+        else:                              # 1m -> 30m/1h/4h
+            for b in self.agg.update(bar):
+                self._feed(b.tf, b)
 
-    def active(self) -> list:
-        return [z for z in self.book.zones if not z.broken]
+    def active(self, tf: str) -> list:
+        return [z for z in self.book[tf].zones if not z.broken]
+
+    def all_active(self):
+        for tf in TF_ORDER:
+            for z in self.active(tf):
+                yield tf, z
 
     def bracket(self, price: float):
-        act = self.active()
-        above = [z for z in act if z.proximal() > price]
-        below = [z for z in act if z.proximal() < price]
-        res = min(above, key=lambda z: z.proximal() - price, default=None)
-        sup = max(below, key=lambda z: z.proximal(), default=None)
+        """Nearest unbroken supply above + demand below across ALL timeframes."""
+        above = [(tf, z) for tf, z in self.all_active() if z.proximal() > price]
+        below = [(tf, z) for tf, z in self.all_active() if z.proximal() < price]
+        res = min(above, key=lambda p: p[1].proximal() - price, default=None)
+        sup = max(below, key=lambda p: p[1].proximal(), default=None)
         return res, sup
 
 
@@ -111,29 +135,40 @@ class PaintController:
                 await self._paint_status(False, backfill_bars, bar.c)
 
     async def _paint_zones(self, now_ts: int) -> None:
-        for z in self.zv.book.zones:
-            tag = f"eng-zone-{z.formed_ts}-{z.direction}"
-            if z.broken:
-                if self._zone_state.get(tag) != "gone":
-                    self._zone_state[tag] = "gone"
-                    await self.p.remove(tag)
-                continue
-            color = ZONE_DEMAND if z.direction == DEMAND else ZONE_SUPPLY
-            op = OP_VIRGIN if z.virgin else OP_TESTED
-            state = (round(z.top, 2), round(z.bot, 2), z.virgin, now_ts // (2 * 60 * NS))
-            if self._zone_state.get(tag) == state:
-                continue
-            self._zone_state[tag] = state
-            await self.p.rect(tag, z.formed_ts, z.top, now_ts, z.bot, color=color, opacity=op)
+        bucket = now_ts // (2 * 60 * NS)
+        for tf in TF_ORDER:
+            for z in self.zv.book[tf].zones:
+                tag = f"eng-zone-{tf}-{z.formed_ts}-{z.direction}"
+                if z.broken:
+                    if self._zone_state.get(tag) != "gone":
+                        self._zone_state[tag] = "gone"
+                        await self.p.remove(tag)
+                        await self.p.remove(tag + "-t")
+                    continue
+                color = ZONE_DEMAND if z.direction == DEMAND else ZONE_SUPPLY
+                op = TF_OPACITY[tf] + (6 if z.virgin else 0)
+                # daily rects are anchored to their own (session) time; intraday
+                # to formed_ts; all extend to the live bar
+                right = now_ts
+                state = (round(z.top, 2), round(z.bot, 2), z.virgin, bucket)
+                if self._zone_state.get(tag) == state:
+                    continue
+                self._zone_state[tag] = state
+                await self.p.rect(tag, z.formed_ts, z.top, right, z.bot, color=color, opacity=op)
+                if TF_LABEL.get(tf):
+                    d = "D" if z.direction == DEMAND else "S"
+                    await self.p.text(tag + "-t", z.formed_ts,
+                                      z.top if z.direction < 0 else z.bot,
+                                      f"{tf} {d}", color=color)
 
     async def _paint_bracket(self, price: float) -> None:
         res, sup = self.zv.bracket(price)
         if res is not None:
-            await self.p.hline("eng-res", res.proximal(), color=RES_LINE)
+            await self.p.hline("eng-res", res[1].proximal(), color=RES_LINE)
         else:
             await self.p.remove("eng-res")
         if sup is not None:
-            await self.p.hline("eng-sup", sup.proximal(), color=SUP_LINE)
+            await self.p.hline("eng-sup", sup[1].proximal(), color=SUP_LINE)
         else:
             await self.p.remove("eng-sup")
 
@@ -150,13 +185,13 @@ class PaintController:
 
     async def _paint_status(self, live: bool, backfill_bars: int, close: float) -> None:
         res, sup = self.zv.bracket(close)
-        act = self.zv.active()
-        d = sum(1 for z in act if z.direction == DEMAND)
         head = "LIVE" if live else f"WARMUP {backfill_bars}b"
         lines = [f"== ENGINE {head}  px {close:.2f} =="]
-        lines.append(f"R {res.proximal():.2f}" if res else "R  --")
-        lines[-1] += f"   S {sup.proximal():.2f}" if sup else "   S  --"
-        lines.append(f"zones: {len(act)} active ({d}D/{len(act)-d}S)  sig {self._n_live}L/{self._n_ghost}G")
+        r = f"R {res[1].proximal():.2f}({res[0]})" if res else "R --"
+        s = f"S {sup[1].proximal():.2f}({sup[0]})" if sup else "S --"
+        lines.append(f"{r}   {s}")
+        counts = "  ".join(f"{tf}:{len(self.zv.active(tf))}" for tf in TF_ORDER)
+        lines.append(f"zones  {counts}   sig {self._n_live}L/{self._n_ghost}G")
         for s in self.strategies:
             name = type(s).__name__.replace("Strategy", "").replace("Following", "")
             if name == "Observe":

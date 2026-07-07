@@ -157,25 +157,39 @@ def test_paint_controller_ghost_and_panel():
     assert ghost["ts"] == 5 * NS and ghost["price"] == 5007.0 and "opendrive" in ghost["label"]
 
 
-def test_zoneview_detects_and_brackets():
+def test_zoneview_multitf_detects_and_brackets():
+    from engine.core.events import Bar
     from engine.features.zones import DEMAND
     from engine.painters import ZoneView
     zv = ZoneView()
-    # a base (3 tight bars) then a big up departure -> a DEMAND zone should form
+    # 30m demand zone from the 1m stream: base (tight) then a big up departure
     t = 0
     for i in range(25):                                # warm the 20-bar averages
         t += 30 * 60 * NS
         zv.update(_bar(t, 5000, 5002, 4998, 5001, 100))
-    base_lo = 4999.0
     for i in range(3):                                 # tight base
         t += 30 * 60 * NS
-        zv.update(_bar(t, 5000, 5001, base_lo, 5000, 80))
+        zv.update(_bar(t, 5000, 5001, 4999.0, 5000, 80))
     t += 30 * 60 * NS
     zv.update(_bar(t, 5000, 5040, 4999, 5038, 400))    # decisive up departure
     t += 30 * 60 * NS
-    zv.update(_bar(t, 5038, 5040, 5036, 5039, 100))    # trailing bar flushes the 30m departure
-    act = zv.active()
-    assert len(act) >= 1
-    assert any(z.direction == DEMAND for z in act)
+    zv.update(_bar(t, 5038, 5040, 5036, 5039, 100))    # trailing bar flushes it
+    assert any(z.direction == DEMAND for z in zv.active("30m"))
     res, sup = zv.bracket(5039.0)
-    assert sup is not None                              # a demand zone sits below price
+    assert sup is not None and sup[0] == "30m"         # (tf, zone) below price
+
+    # daily zones seed independently and appear in the bracket across TFs
+    dt = 0
+    dailies = []
+    for i in range(25):
+        dt += 86400 * NS
+        dailies.append(Bar(dt, "1d", 4800, 4805, 4795, 4802, 1000))
+    for i in range(3):
+        dt += 86400 * NS
+        dailies.append(Bar(dt, "1d", 4800, 4801, 4799, 4800, 800))
+    dt += 86400 * NS
+    dailies.append(Bar(dt, "1d", 4800, 4880, 4799, 4875, 4000))   # daily up departure
+    dt += 86400 * NS
+    dailies.append(Bar(dt, "1d", 4875, 4878, 4873, 4876, 900))
+    zv.seed_daily(dailies)
+    assert any(z.direction == DEMAND for z in zv.active("1d"))

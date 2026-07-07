@@ -35,6 +35,37 @@ HMM_PATH = str(ROOT / "config" / "hmm_es_1h.json")
 SYMBOL = "ES"
 
 
+def fetch_daily_bars(symbol: str = "ES=F", days: int = 320) -> list:
+    """Daily bars for the 1d zone view (Yahoo continuous front ~ current ES,
+    small basis). Returns [] on any failure so painting degrades gracefully."""
+    import time
+
+    import httpx
+
+    from engine.core.events import Bar
+    try:
+        p1 = int(time.time()) - days * 86400
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+               f"?period1={p1}&period2={int(time.time())}&interval=1d")
+        r = httpx.get(url, timeout=20, follow_redirects=True,
+                      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        r.raise_for_status()
+        res = r.json()["chart"]["result"][0]
+        ts = res["timestamp"]
+        q = res["indicators"]["quote"][0]
+        out = []
+        for i, t in enumerate(ts):
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+            if None in (o, h, l, c):
+                continue
+            out.append(Bar((t + 21 * 3600) * 1_000_000_000, "1d", o, h, l, c,
+                           int(q["volume"][i] or 0)))
+        return out
+    except Exception as ex:                       # noqa: BLE001
+        print(f"  (daily-zone fetch failed: {ex}; 1d zones disabled)")
+        return []
+
+
 class ObserveStrategy:
     """Counts events; places no orders. Used to validate the live pipe."""
     symbol = SYMBOL
@@ -127,10 +158,14 @@ async def main() -> None:
     if not a.no_paint:
         if await painter.connect():
             pc = PaintController(painter, strategies, panel_pos=a.panel)
+            daily = fetch_daily_bars()
+            if daily:
+                pc.zv.seed_daily(daily)
+                print(f"seeded {len(daily)} daily bars for 1d zones")
             eng.on_live_order = pc.live_order
             eng.on_bar_hook = pc.on_bar
             eng.on_warmup_signal = pc.ghost_one      # paint ghosts as backfill replays
-            print("chart painting ON (ghost signals, zones, risk lines, status box)")
+            print("chart painting ON (30m/1h/4h/1d zones, S/R bracket, signals, panel)")
 
     mode = "OBSERVE" if not names else "TRADE(" + ",".join(names) + ")"
     print(f"live session [{mode}] market:{a.market_port} broker:{a.broker_port} "
