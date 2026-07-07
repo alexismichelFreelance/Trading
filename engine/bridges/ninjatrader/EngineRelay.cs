@@ -53,6 +53,24 @@ namespace NinjaTrader.NinjaScript.Strategies
         private readonly List<string> histBars = new List<string>();
         private double lastBid = 0, lastAsk = 0;
         private static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        // draws MUST run in a bar/market-data context, not the socket thread —
+        // queue them here and flush inside OnMarketData/OnBarUpdate.
+        private readonly List<MiniJson> drawQueue = new List<MiniJson>();
+        private readonly object dLock = new object();
+        private int rxDraws = 0, execDraws = 0, errDraws = 0;
+        private string lastDrawErr = "";
+        private bool canaryDrawn = false;
+        private DateTime lastDrawLog = DateTime.MinValue;
+        private static readonly string LogPath = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "NinjaTrader 8", "engine_relay.log");
+
+        private void RLog(string msg)
+        {
+            try { System.IO.File.AppendAllText(LogPath,
+                DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg + "\n"); }
+            catch { }
+        }
 
         protected override void OnStateChange()
         {
@@ -81,6 +99,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 StartServer(ref marketListener, MarketPort, marketClients, mLock, false);
                 StartServer(ref brokerListener, BrokerPort, brokerClients, bLock, true);
                 Print("EngineRelay: market:" + MarketPort + " broker:" + BrokerPort);
+                RLog("=== EngineRelay realtime. market:" + MarketPort + " broker:" +
+                     BrokerPort + " chart=" + (ChartControl != null) + " ===");
             }
             else if (State == State.Terminated)
             {
@@ -105,19 +125,65 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private static string J(double d) { return d.ToString("R", CultureInfo.InvariantCulture); }
 
-        // ── historical 1m bars → backfill buffer (chart must be a 1-minute chart;
-        //    the days-to-load setting controls how much history is streamed) ──
+        // ── historical 1m bars → backfill buffer; realtime → canary + draw flush ──
         protected override void OnBarUpdate()
         {
-            if (State != State.Historical || CurrentBar < 0)
+            if (State == State.Historical && CurrentBar >= 0
+                && BarsPeriod.BarsPeriodType == BarsPeriodType.Minute && BarsPeriod.Value == 1)
+            {
+                histBars.Add("{\"t\":\"bar\",\"ts\":" + ToNs(Time[0]) + ",\"tf\":\"1m\",\"o\":" + J(Open[0]) +
+                    ",\"h\":" + J(High[0]) + ",\"l\":" + J(Low[0]) + ",\"c\":" + J(Close[0]) +
+                    ",\"v\":" + ((long)Volume[0]) + "}");
+                if (histBars.Count > 20000)
+                    histBars.RemoveAt(0);
                 return;
-            if (BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
+            }
+            if (State == State.Realtime)
+            {
+                DrawCanary();
+                FlushDraws();
+            }
+        }
+
+        // proof-of-life the user cannot miss: relay draws its OWN status the first
+        // realtime bar, independent of the Python painter. If this shows, the draw
+        // pipe works and any missing overlays are a painter/viewport issue.
+        private void DrawCanary()
+        {
+            if (canaryDrawn)
                 return;
-            histBars.Add("{\"t\":\"bar\",\"ts\":" + ToNs(Time[0]) + ",\"tf\":\"1m\",\"o\":" + J(Open[0]) +
-                ",\"h\":" + J(High[0]) + ",\"l\":" + J(Low[0]) + ",\"c\":" + J(Close[0]) +
-                ",\"v\":" + ((long)Volume[0]) + "}");
-            if (histBars.Count > 20000)
-                histBars.RemoveAt(0);
+            canaryDrawn = true;
+            try
+            {
+                Draw.TextFixed(this, "eng-canary", "EngineRelay: drawing OK (waiting for engine)",
+                               TextPosition.BottomLeft);
+                RLog("canary drawn OK (chart=" + (ChartControl != null) + ")");
+            }
+            catch (Exception ex) { RLog("canary FAILED: " + ex.Message); }
+        }
+
+        // execute queued draws in THIS (bar/market-data) context — the only place
+        // NT8 Draw.* reliably renders.
+        private void FlushDraws()
+        {
+            List<MiniJson> batch = null;
+            lock (dLock)
+            {
+                if (drawQueue.Count > 0)
+                {
+                    batch = new List<MiniJson>(drawQueue);
+                    drawQueue.Clear();
+                }
+            }
+            if (batch != null)
+                foreach (MiniJson m in batch)
+                    HandleDraw(m);
+            if ((DateTime.Now - lastDrawLog).TotalSeconds >= 5 && (rxDraws > 0 || execDraws > 0))
+            {
+                lastDrawLog = DateTime.Now;
+                RLog("draws rx=" + rxDraws + " exec=" + execDraws + " err=" + errDraws +
+                     (lastDrawErr.Length > 0 ? " lastErr=" + lastDrawErr : ""));
+            }
         }
 
         // ── market data → market clients ─────────────────────────────────
@@ -132,6 +198,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Broadcast(marketClients, mLock,
                     "{\"t\":\"trade\",\"ts\":" + ns + ",\"price\":" + J(e.Price) +
                     ",\"size\":" + e.Volume + ",\"aggressor\":" + aggressor + "}");
+            }
+            if (State == State.Realtime)      // draws render reliably from here
+            {
+                DrawCanary();
+                FlushDraws();
             }
         }
 
@@ -215,7 +286,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (t == "draw")
             {
-                HandleDraw(m);
+                lock (dLock) drawQueue.Add(m);      // flushed in OnMarketData/OnBarUpdate
+                rxDraws++;
             }
         }
 
@@ -249,6 +321,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tag = "eng-" + Guid.NewGuid().ToString("N").Substring(0, 8);
             try
             {
+                execDraws++;
                 if (kind == "arrow")
                 {
                     Brush b = BrushOf(m.Get("color"), m.Num("dir") > 0 ? Brushes.LimeGreen : Brushes.Red);
@@ -301,7 +374,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             catch (Exception ex)
             {
-                Print("EngineRelay draw error (" + kind + "/" + tag + "): " + ex.Message);
+                errDraws++;
+                lastDrawErr = kind + ":" + ex.Message;
+                RLog("DRAW ERROR (" + kind + "/" + tag + "): " + ex.Message);
             }
         }
 
