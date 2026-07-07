@@ -155,8 +155,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             canaryDrawn = true;
             try
             {
-                Draw.TextFixed(this, "eng-canary", "EngineRelay: drawing OK (waiting for engine)",
-                               TextPosition.BottomLeft);
+                Draw.TextFixed(this, "eng-canary", "EngineRelay: drawing OK",
+                               TextPosition.BottomRight);
                 RLog("canary drawn OK (chart=" + (ChartControl != null) + ")");
             }
             catch (Exception ex) { RLog("canary FAILED: " + ex.Message); }
@@ -363,8 +363,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else if (kind == "status")
                 {
+                    string ps = m.Get("pos");
+                    TextPosition tp = ps == "topright" ? TextPosition.TopRight
+                                    : ps == "bottomright" ? TextPosition.BottomRight
+                                    : ps == "bottomleft" ? TextPosition.BottomLeft
+                                    : TextPosition.TopLeft;
                     Draw.TextFixed(this, tag.Length > 0 ? tag : "eng-status",
-                                   m.Get("label").Replace("\\n", "\n"), TextPosition.TopRight);
+                                   m.Get("label").Replace("\\n", "\n"), tp);
                 }
                 else if (kind == "remove")
                 {

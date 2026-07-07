@@ -76,8 +76,9 @@ class NTChartPainter:
         await self._send(dict(kind="text", tag=tag, ts=ts, price=price,
                               label=label, color=color))
 
-    async def status(self, label: str, tag: str = "eng-status") -> None:
-        await self._send(dict(kind="status", tag=tag, label=label))
+    async def status(self, label: str, tag: str = "eng-status",
+                     pos: str = "topleft") -> None:
+        await self._send(dict(kind="status", tag=tag, label=label, pos=pos))
 
     async def remove(self, tag: str) -> None:
         await self._send(dict(kind="remove", tag=tag))
