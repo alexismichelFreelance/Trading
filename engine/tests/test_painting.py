@@ -86,6 +86,18 @@ class _NullBroker:
             yield None
 
 
+def test_live_fill_paints_at_actual_fill_price_and_time():
+    from engine.core.events import Fill
+    p = _painter()
+    pc = PaintController(p, [])
+    f = Fill(ts=5 * NS, order_id="O1", symbol="ES", price=7561.25, size=-2,
+             commission=0.0, slippage=0.0, tag="fade-entry")
+    asyncio.run(pc.live_fill(f))
+    arrow = next(m for m in p._w.lines if m["kind"] == "arrow")
+    assert arrow["ts"] == 5 * NS and arrow["price"] == 7561.25   # ACTUAL fill, not decision
+    assert arrow["dir"] == -1 and "7561.25" in arrow["label"]
+
+
 def test_warmup_signals_capture_ts_and_px_and_live_hook_fires():
     bar1 = Bar(100 * NS, "1m", 5000, 5001, 4999, 5000.5, 10)
     bar2 = Bar(160 * NS, "1m", 5000, 5002, 5000, 5001.5, 12)

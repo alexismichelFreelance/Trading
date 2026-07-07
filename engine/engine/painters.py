@@ -120,6 +120,14 @@ class PaintController:
                            color=LIVE_UP if side > 0 else LIVE_DN,
                            label=f"{tag} x{qty}")
 
+    async def live_fill(self, f) -> None:
+        """Paint at the ACTUAL fill ts+price (coincides with NT's native dot)."""
+        self._n_live += 1
+        side = 1 if f.size > 0 else -1
+        await self.p.arrow(f"eng-fill-{self._n_live}", f.ts, f.price, side,
+                           color=LIVE_UP if side > 0 else LIVE_DN,
+                           label=f"{f.tag} @{f.price:.2f}")
+
     # ── per-bar ───────────────────────────────────────────────────────────
     async def on_bar(self, bar, live: bool, backfill_bars: int = 0) -> None:
         self.zv.update(bar)                       # build zone history always

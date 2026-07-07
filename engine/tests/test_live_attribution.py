@@ -122,6 +122,62 @@ def test_reduce_only_dropped_when_flat_and_clamped_when_oversized():
     assert s.positions[-1].qty == 0
 
 
+def test_on_live_fill_fires_for_engine_fills_only():
+    painted = []
+
+    class Sleeve2(Sleeve):
+        pass
+
+    a = Sleeve({1: Order("ES", BUY, 1, tag="a-entry")})
+
+    async def go():
+        msgs = [{"t": "trade", "ts": (i + 1) * NS, "price": 5000.0 + i, "size": 1,
+                 "aggressor": 1} for i in range(4)]
+        manual = {"t": "fill", "ts": 1, "order_id": "ManualZZ", "symbol": "ES",
+                  "price": 5001.0, "size": 2, "commission": 0.0, "tag": "hand"}
+
+        async def market(reader, writer):
+            for m in msgs:
+                writer.write((json.dumps(m) + "\n").encode())
+                await writer.drain()
+                await asyncio.sleep(0.15)
+            writer.close()
+
+        async def broker(reader, writer):
+            writer.write((json.dumps(manual) + "\n").encode())     # a manual fill first
+            await writer.drain()
+            async for raw in reader:
+                line = raw.strip()
+                if not line:
+                    continue
+                m = json.loads(line)
+                if m.get("t") == "place":
+                    writer.write((json.dumps({
+                        "t": "fill", "ts": 5 * NS, "order_id": m["order_id"],
+                        "symbol": m["symbol"], "price": 5000.0, "size": m["side"] * m["qty"],
+                        "commission": 0.0, "tag": m.get("tag", "")}) + "\n").encode())
+                    await writer.drain()
+
+        msrv = await asyncio.start_server(market, "127.0.0.1", 0)
+        bsrv = await asyncio.start_server(broker, "127.0.0.1", 0)
+        eng = LiveEngine(NinjaTraderFeed("127.0.0.1", msrv.sockets[0].getsockname()[1]),
+                         NinjaTraderBroker("127.0.0.1", bsrv.sockets[0].getsockname()[1]),
+                         [a], WallClock(), Blotter("ES", 50.0),
+                         drain_timeout=0.3, warmup_gate=False)
+
+        async def on_fill(f):
+            painted.append((f.order_id, f.price, f.tag))
+        eng.on_live_fill = on_fill
+        await asyncio.wait_for(eng.run(), timeout=10)
+        msrv.close()
+        bsrv.close()
+
+    asyncio.run(go())
+    # only the engine's own fill is painted; the manual fill is not
+    assert len(painted) == 1 and painted[0][2] == "a-entry"
+    assert all(oid != "ManualZZ" for oid, _, _ in painted)
+
+
 def test_manual_fills_do_not_reach_strategies():
     manual = {"t": "fill", "ts": 1, "order_id": "ManualXYZ", "symbol": "ES",
               "price": 5001.0, "size": 3, "commission": 0.0, "tag": "Close"}

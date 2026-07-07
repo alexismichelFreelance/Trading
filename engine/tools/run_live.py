@@ -171,7 +171,7 @@ async def main() -> None:
             if daily:
                 pc.zv.seed_daily(daily)
                 print(f"seeded {len(daily)} daily bars for 1d zones")
-            eng.on_live_order = pc.live_order
+            eng.on_live_fill = pc.live_fill          # mark actual fills, not decisions
             eng.on_bar_hook = pc.on_bar
             eng.on_warmup_signal = pc.ghost_one      # paint ghosts as backfill replays
             print("chart painting ON (30m/1h/4h/1d zones, S/R bracket, signals, panel)")

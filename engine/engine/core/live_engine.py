@@ -56,7 +56,8 @@ class LiveEngine:
         self.warmup_signals: list[tuple[int, int, int, str, float]] = []
         self.last_px: float = 0.0
         # optional async callbacks for the chart painter
-        self.on_live_order = None          # async (ts, side, qty, tag, px)
+        self.on_live_order = None          # async (ts, side, qty, tag, px) — decision time
+        self.on_live_fill = None           # async (Fill) — ACTUAL fill ts+price (preferred)
         self.on_bar_hook = None            # async (ts, close, live, backfill_bars)
         self.on_warmup_signal = None       # async (ts, side, qty, tag, px) — ghosts
         # ── per-strategy attribution ──────────────────────────────────────
@@ -193,7 +194,14 @@ class LiveEngine:
                 else:  # broker event
                     self.blotter.on_broker_event(ev)
                     if isinstance(ev, Fill):
+                        attributed = ev.order_id in self._owner
                         self._attribute_fill(ev)         # owner-only routing
+                        # paint the ACTUAL fill (real ts+price) so our marker
+                        # coincides with NT's native execution dot instead of the
+                        # (delayed) decision time. Only engine fills; manual fills
+                        # already show natively.
+                        if attributed and self.on_live_fill is not None:
+                            await self.on_live_fill(ev)
                     # account-level PositionUpdates are NOT broadcast to
                     # strategies: each sleeve sees only its own attributed book
         finally:
