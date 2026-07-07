@@ -24,7 +24,9 @@ sys.path.insert(0, str(ROOT))
 
 from engine.adapters.brokers.ninjatrader import NinjaTraderBroker   # noqa: E402
 from engine.adapters.feeds.ninjatrader import NinjaTraderFeed       # noqa: E402
+from engine.adapters.feeds.recorder_tee import RecorderTee          # noqa: E402
 from engine.adapters.painter import NTChartPainter                  # noqa: E402
+from engine.adapters.questdb import AsyncQuestDB                     # noqa: E402
 from engine.core.blotter import Blotter                             # noqa: E402
 from engine.core.clock import WallClock                             # noqa: E402
 from engine.core.events import Bar, BookFlow, Trade                 # noqa: E402
@@ -139,6 +141,8 @@ async def main() -> None:
     ap.add_argument("--panel", default="bottomleft",
                     choices=["bottomleft", "topright", "bottomright", "topleft"],
                     help="corner for the engine info panel (default bottomleft)")
+    ap.add_argument("--record", action="store_true",
+                    help="record 1m bars to QuestDB claude_bars_live (grow the library)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -148,6 +152,11 @@ async def main() -> None:
     obs = ObserveStrategy()
     strategies = [obs] + build(names)
     feed = NinjaTraderFeed("127.0.0.1", a.market_port, symbol=SYMBOL)
+    recorder = None
+    if a.record:
+        recorder = RecorderTee(feed, AsyncQuestDB(), symbol=SYMBOL)
+        feed = recorder
+        print("recording 1m bars -> QuestDB claude_bars_live")
     broker = NinjaTraderBroker("127.0.0.1", a.broker_port, symbol=SYMBOL)
     blot = Blotter(SYMBOL, 50.0, verbose=True)
     eng = LiveEngine(feed, broker, strategies, WallClock(), blot,
@@ -202,6 +211,8 @@ async def main() -> None:
             t.cancel()
         await painter.close()
 
+    if recorder is not None:
+        print(f"recorded {recorder.n_recorded} 1m bars -> claude_bars_live")
     print(f"\nsession summary: {obs.trades} trades, {obs.flows} bookflow-seconds, "
           f"{obs.bars} 1m bars ({eng._backfill_bars} backfill), last px {obs.last_px}")
     print(f"warmup orders suppressed: {eng._suppressed_orders}  |  live orders {blot.n_orders}, fills {blot.n_fills}")
