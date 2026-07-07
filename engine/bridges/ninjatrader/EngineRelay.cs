@@ -63,6 +63,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsUnmanaged = true;                 // submit arbitrary orders ourselves
                 EntriesPerDirection = 100;
                 BarsRequiredToTrade = 0;
+                // SAFETY: the relay is a pure conduit + chart painter. It must
+                // NEVER auto-manage positions it did not place — otherwise a
+                // MANUAL position on the same account gets flattened at session
+                // close and the chart's execution display is hijacked. All exits
+                // are placed explicitly by the Python engine.
+                IsExitOnSessionCloseStrategy = false;   // never auto-flatten anything
+                IsAdoptAccountPositionAware = false;    // account/manual pos is NOT ours
+                StartBehavior = StartBehavior.ImmediatelySubmit;  // don't wait-until-flat
             }
             else if (State == State.Realtime)
             {
