@@ -126,6 +126,7 @@ async def main() -> None:
             pc = PaintController(painter, strategies)
             eng.on_live_order = pc.live_order
             eng.on_bar_hook = pc.on_bar
+            eng.on_warmup_signal = pc.ghost_one      # paint ghosts as backfill replays
             print("chart painting ON (ghost signals, zones, risk lines, status box)")
 
     mode = "OBSERVE" if not names else "TRADE(" + ",".join(names) + ")"
@@ -140,18 +141,14 @@ async def main() -> None:
 
     async def heartbeat():
         last = -1
-        ghosts_painted = False
         while True:
             await asyncio.sleep(5)
-            if pc is not None and eng._live and not ghosts_painted:
-                ghosts_painted = True
-                await pc.ghost_signals(eng.warmup_signals)
-                print(f"  painted {min(len(eng.warmup_signals), 400)} ghost signals "
-                      f"on the chart (what the sleeves would have done on backfill days)")
             state = "LIVE" if eng._live else f"WARMUP({eng._backfill_bars} bars)"
+            ghosts = pc._n_ghost if pc is not None else 0
             if obs.trades != last or not eng._live:
-                print(f"  [{state}] trades={obs.trades} bookflow-s={obs.flows} "
-                      f"bars={obs.bars} last={obs.last_px} orders={blot.n_orders} fills={blot.n_fills}")
+                print(f"  [{state}] trades={obs.trades} bars={obs.bars} "
+                      f"last={obs.last_px} ghosts_painted={ghosts} "
+                      f"live_orders={blot.n_orders} fills={blot.n_fills}")
                 last = obs.trades
 
     tasks = [asyncio.create_task(eng.run()), asyncio.create_task(heartbeat())]

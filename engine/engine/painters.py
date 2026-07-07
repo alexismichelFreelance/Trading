@@ -1,52 +1,66 @@
 """PaintController — turns engine/strategy state into NT8 chart drawings.
 
 What appears on the chart:
-  - GHOST signals (hollow gray arrows + label): what the strategies WOULD have
-    done on the backfill days — the warmup-gate's suppressed orders, drawn at
-    their historical time and price.
-  - LIVE signals: solid arrows (lime up / red down) with the order tag at every
+  - GHOST signals (light-blue arrows + [tag]): what the sleeves WOULD have done
+    on the backfill days — the warmup-gate's suppressed orders, drawn at their
+    historical time/price AS THE BACKFILL REPLAYS (immediate, not deferred), and
+    capped per sleeve so a high-frequency sleeve can't flood the chart.
+  - LIVE signals: bright solid arrows (lime up / red down) + "tag xN" at every
     real submitted order.
-  - ZONES (zones sleeve): rectangles colored by lifecycle state — virgin demand
-    green / virgin supply red, dimmed once faded, gray when broken — extending
-    to the current bar.
-  - RISK lines (open-drive): stop and trail as horizontal lines while holding.
-  - STATUS box (top-right): warmup/live state, flow F/target, positions.
+  - ZONES (zones sleeve): rectangles — VIRGIN demand green / supply red (vivid,
+    the tradeable state), muted steel-blue once faded, and REMOVED once broken.
+  - RISK line (open-drive): stop as a horizontal line while holding.
+  - STATUS box (top-right): warmup/live, ghost/live counts, per-sleeve position.
 
-Painting is throttled to 1m-bar boundaries for state (zones/status/lines);
-arrows are event-driven. All drawing is fire-and-forget and never touches the
-trading path.
+All drawing is fire-and-forget and never touches the trading path.
 """
 from __future__ import annotations
 
 from .adapters.painter import NTChartPainter
 
-GHOST = "#909399A6"          # translucent gray
-LIVE_UP = "#FF32CD32"
-LIVE_DN = "#FFFF4040"
-ZONE_DEMAND = "#5532CD32"
-ZONE_SUPPLY = "#55FF4040"
-ZONE_FADED = "#33808080"
+NS = 1_000_000_000
+
+GHOST = "#FFB0C4DE"          # light steel blue — clearly a "what-if", not a live fill
+LIVE_UP = "#FF00E000"        # bright green
+LIVE_DN = "#FFFF2020"        # bright red
+ZONE_DEMAND = "#FF32CD32"    # solid lime; areaOpacity gives the fill transparency
+ZONE_SUPPLY = "#FFFF4040"    # solid red
+ZONE_FADED = "#FF4682B4"     # steel blue — touched (fade played) but not broken
+OP_VIRGIN = 30               # NT areaOpacity (0-100) — vivid
+OP_FADED = 12                # muted but readable
+
+GHOST_CAP_PER_TAG = 80       # so ignition/flow can't bury open-drive/ibs/zones
 
 
 class PaintController:
     def __init__(self, painter: NTChartPainter, strategies: list) -> None:
         self.p = painter
         self.strategies = strategies
-        self._n_arrow = 0
-        self._zone_state: dict[str, tuple] = {}
+        self._n_live = 0
+        self._n_ghost = 0
+        self._ghost_by_tag: dict[str, int] = {}
+        self._zone_state: dict[str, object] = {}
         self._risk_on = False
 
     # ── signals ───────────────────────────────────────────────────────────
-    async def ghost_signals(self, signals: list[tuple[int, int, int, str, float]]) -> None:
-        """signals: (ts, side, qty, tag, px) captured during warmup."""
-        for ts, side, qty, tag, px in signals[-400:]:      # object budget
-            self._n_arrow += 1
-            await self.p.arrow(f"eng-ghost-{self._n_arrow}", ts, px, side,
-                               color=GHOST, label=f"[{tag}]")
+    async def ghost_one(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:
+        """One ghost arrow, painted live as the backfill replays. Per-tag capped."""
+        base = tag.split("-")[0] if tag else "sig"
+        if self._ghost_by_tag.get(base, 0) >= GHOST_CAP_PER_TAG:
+            return
+        self._ghost_by_tag[base] = self._ghost_by_tag.get(base, 0) + 1
+        self._n_ghost += 1
+        await self.p.arrow(f"eng-ghost-{self._n_ghost}", ts, px, side,
+                           color=GHOST, label=f"[{tag}]")
+
+    async def ghost_signals(self, signals: list) -> None:
+        """Batch fallback: paint the most recent suppressed signals at once."""
+        for ts, side, qty, tag, px in signals[-400:]:
+            await self.ghost_one(ts, side, qty, tag, px)
 
     async def live_order(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:
-        self._n_arrow += 1
-        await self.p.arrow(f"eng-live-{self._n_arrow}", ts, px, side,
+        self._n_live += 1
+        await self.p.arrow(f"eng-live-{self._n_live}", ts, px, side,
                            color=LIVE_UP if side > 0 else LIVE_DN,
                            label=f"{tag} x{qty}")
 
@@ -60,24 +74,29 @@ class PaintController:
     async def _paint_zones(self, now_ts: int) -> None:
         for s in self.strategies:
             zones = getattr(s, "zones", None)
-            if zones is None or not isinstance(zones, list):
+            if not isinstance(zones, list):
                 continue
             for z in zones:
                 if getattr(z, "ts", 0) == 0:
                     continue
                 tag = f"eng-zone-{z.ts}"
-                if z.broke:
-                    color = ZONE_FADED
-                elif z.fade_done:
-                    color = ZONE_FADED
+                if z.broke:                              # dead: remove once, done
+                    if self._zone_state.get(tag) != "gone":
+                        self._zone_state[tag] = "gone"
+                        await self.p.remove(tag)
+                    continue
+                if z.fade_done:
+                    color, op = ZONE_FADED, OP_FADED
                 else:
-                    color = ZONE_DEMAND if z.dir > 0 else ZONE_SUPPLY
-                state = (round(z.top, 2), round(z.bot, 2), z.fade_done, z.broke,
-                         now_ts // (5 * 60 * 1_000_000_000))
+                    color, op = (ZONE_DEMAND if z.dir > 0 else ZONE_SUPPLY), OP_VIRGIN
+                # redraw only when the visible state or the right edge (5m bucket)
+                # changes — cheap enough to extend the box to "now" continuously
+                state = (round(z.top, 2), round(z.bot, 2), z.fade_done,
+                         now_ts // (5 * 60 * NS))
                 if self._zone_state.get(tag) == state:
-                    continue                       # unchanged within 5m: skip redraw
+                    continue
                 self._zone_state[tag] = state
-                await self.p.rect(tag, z.ts, z.top, now_ts, z.bot, color=color)
+                await self.p.rect(tag, z.ts, z.top, now_ts, z.bot, color=color, opacity=op)
 
     async def _paint_risk(self, ts: int) -> None:
         for s in self.strategies:
@@ -94,18 +113,23 @@ class PaintController:
                 await self.p.remove("eng-od-stop")
 
     async def _paint_status(self, live: bool, backfill_bars: int, close: float) -> None:
-        lines = [f"ENGINE {'LIVE' if live else f'WARMUP ({backfill_bars} bars)'}   px {close:.2f}"]
+        head = "LIVE" if live else f"WARMUP {backfill_bars}b"
+        lines = [f"ENGINE {head}  px {close:.2f}  ghosts {self._n_ghost} live {self._n_live}"]
         for s in self.strategies:
             name = type(s).__name__.replace("Strategy", "")
+            if name == "Observe":
+                continue
             pos = getattr(s, "pos", None)
-            if pos is None or name == "Observe":
+            if pos is None:
                 continue
             extra = ""
             if hasattr(s, "_F"):
-                extra = f"  F={s._F:+.0f} tgt={max(-s.maxp, min(s.maxp, s._F / s.scale)):+.1f}"
+                tgt = max(-s.maxp, min(s.maxp, s._F / s.scale))
+                extra = f"  F={s._F:+.0f} tgt={tgt:+.1f}"
             if hasattr(s, "peak_fe") and pos:
-                extra += f"  peak_fe={s.peak_fe:+.1f}"
-            lines.append(f"{name:<12} pos {pos:+d}{extra}")
+                extra += f"  peak={s.peak_fe:+.1f}"
+            flag = "  <== IN" if pos else ""
+            lines.append(f"{name:<11} {pos:+d}{extra}{flag}")
         await self.p.status("\\n".join(lines))
 
 

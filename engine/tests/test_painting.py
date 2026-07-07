@@ -139,19 +139,23 @@ def test_paint_controller_zones_and_ghosts():
 
     class _ZoneStrat:
         pos = 0
-        zones = [_Z(10 * NS, 1, 5010.0, 5005.0), _Z(20 * NS, -1, 5030.0, 5025.0, broke=True)]
+        zones = [_Z(10 * NS, 1, 5010.0, 5005.0),                 # virgin demand
+                 _Z(20 * NS, -1, 5030.0, 5025.0, broke=True)]    # broken -> removed
 
     p = _painter()
     pc = PaintController(p, [_ZoneStrat()])
 
     async def go():
-        await pc.ghost_signals([(5 * NS, -1, 2, "opendrive", 5007.0)])
+        await pc.ghost_one(5 * NS, -1, 2, "opendrive-entry", 5007.0)
         await pc.on_bar(60 * NS, 5008.0, live=True)
 
     asyncio.run(go())
     kinds = [m["kind"] for m in p._w.lines]
     assert kinds.count("arrow") == 1                  # the ghost
-    assert kinds.count("rect") == 2                   # both zones painted
+    assert kinds.count("rect") == 1                   # virgin zone painted...
+    assert kinds.count("remove") == 1                 # ...broken zone removed, not grayed
     assert kinds.count("status") == 1
     ghost = next(m for m in p._w.lines if m["kind"] == "arrow")
     assert ghost["ts"] == 5 * NS and ghost["price"] == 5007.0 and "opendrive" in ghost["label"]
+    rect = next(m for m in p._w.lines if m["kind"] == "rect")
+    assert rect["opacity"] == 30                      # virgin = vivid

@@ -58,6 +58,7 @@ class LiveEngine:
         # optional async callbacks for the chart painter
         self.on_live_order = None          # async (ts, side, qty, tag, px)
         self.on_bar_hook = None            # async (ts, close, live, backfill_bars)
+        self.on_warmup_signal = None       # async (ts, side, qty, tag, px) — ghosts
         # ── per-strategy attribution ──────────────────────────────────────
         # Multiple sleeves share one ACCOUNT, so the account net position must
         # never be broadcast to strategies (each sleeve would mis-attribute the
@@ -178,8 +179,10 @@ class LiveEngine:
                                                              o.tag, self.last_px)
                             else:                        # warmup: state only, no orders
                                 self._suppressed_orders += 1
-                                self.warmup_signals.append(
-                                    (ev.ts, o.side, o.qty, o.tag, self.last_px))
+                                sig = (ev.ts, o.side, o.qty, o.tag, self.last_px)
+                                self.warmup_signals.append(sig)
+                                if self.on_warmup_signal is not None:
+                                    await self.on_warmup_signal(*sig)   # ghost now
                     if isinstance(ev, Bar) and self.on_bar_hook is not None:
                         await self.on_bar_hook(ev.ts, ev.c, self._live,
                                                self._backfill_bars)
