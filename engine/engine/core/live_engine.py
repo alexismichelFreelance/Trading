@@ -19,11 +19,15 @@ import logging
 
 from .blotter import Blotter
 from .dispatch import dispatch_broker, dispatch_market
-from .events import Bar, Trade
+from .events import Bar, Fill, PositionUpdate, Trade
 
 log = logging.getLogger("engine.live")
 
 _END = ("end", None)
+
+
+def _sign(x: int) -> int:
+    return int(x > 0) - int(x < 0)
 
 
 class LiveEngine:
@@ -54,11 +58,58 @@ class LiveEngine:
         # optional async callbacks for the chart painter
         self.on_live_order = None          # async (ts, side, qty, tag, px)
         self.on_bar_hook = None            # async (ts, close, live, backfill_bars)
+        # ── per-strategy attribution ──────────────────────────────────────
+        # Multiple sleeves share one ACCOUNT, so the account net position must
+        # never be broadcast to strategies (each sleeve would mis-attribute the
+        # others' inventory to itself — the 2026-07-07 runaway). Instead: every
+        # order is owned by the strategy that emitted it; fills are routed ONLY
+        # to their owner, which also receives a synthetic PositionUpdate of ITS
+        # OWN book. Fills with unknown order_ids (manual trades) hit the blotter
+        # only. reduce_only is enforced HERE against the owner's attributed
+        # position (the NT path cannot enforce it).
+        self._owner: dict[str, object] = {}         # order_id -> strategy
+        self._spos: dict[int, int] = {}              # id(strategy) -> signed qty
+        self._savg: dict[int, float] = {}            # id(strategy) -> avg px
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
         self._stop.set()
+
+    def strategy_position(self, s) -> int:
+        return self._spos.get(id(s), 0)
+
+    def _vet(self, s, o):
+        """Enforce reduce_only against the OWNER's attributed position."""
+        if not o.reduce_only:
+            return o
+        pos = self._spos.get(id(s), 0)
+        if pos == 0 or _sign(o.side) == _sign(pos):
+            log.info("dropped reduce_only %s from %s (own pos %d)",
+                     o.tag, type(s).__name__, pos)
+            return None
+        if o.qty > abs(pos):
+            import dataclasses
+            o = dataclasses.replace(o, qty=abs(pos))
+        return o
+
+    def _attribute_fill(self, f: Fill) -> None:
+        s = self._owner.get(f.order_id)
+        if s is None:
+            log.info("unattributed fill (manual/external): %s", f)
+            return
+        pid = id(s)
+        old = self._spos.get(pid, 0)
+        new = old + f.size
+        if old == 0 or _sign(new) != _sign(old):
+            self._savg[pid] = f.price               # fresh / flipped book
+        elif _sign(f.size) == _sign(old):           # adding: weighted average
+            self._savg[pid] = (self._savg[pid] * abs(old) + f.price * abs(f.size)) \
+                / (abs(old) + abs(f.size))
+        self._spos[pid] = new
+        dispatch_broker([s], f)
+        dispatch_broker([s], PositionUpdate(f.ts, f.symbol, new,
+                                            self._savg.get(pid, f.price)))
 
     async def _pump_feed(self) -> None:
         while not self._stop.is_set():
@@ -111,28 +162,34 @@ class LiveEngine:
                         log.info("warmup complete: %d backfill bars consumed, %d "
                                  "warmup orders suppressed; now LIVE",
                                  self._backfill_bars, self._suppressed_orders)
-                    orders = dispatch_market(self.strategies, ev)
-                    if self._live:
-                        for o in orders:
-                            self.blotter.on_order(o)
-                            await self.broker.submit(o)
-                            if self.on_live_order is not None:
-                                await self.on_live_order(ev.ts, o.side, o.qty,
-                                                         o.tag, self.last_px)
-                    else:                                # warmup: state only, no orders
-                        if isinstance(ev, Bar):
-                            self._backfill_bars += 1
-                        self._suppressed_orders += len(orders)
-                        for o in orders:
-                            self.warmup_signals.append(
-                                (ev.ts, o.side, o.qty, o.tag, self.last_px))
+                    if not self._live and isinstance(ev, Bar):
+                        self._backfill_bars += 1
+                    for s in self.strategies:            # per-strategy: orders are OWNED
+                        for o in dispatch_market([s], ev):
+                            if self._live:
+                                o = self._vet(s, o)
+                                if o is None:
+                                    continue
+                                self._owner[o.order_id] = s
+                                self.blotter.on_order(o)
+                                await self.broker.submit(o)
+                                if self.on_live_order is not None:
+                                    await self.on_live_order(ev.ts, o.side, o.qty,
+                                                             o.tag, self.last_px)
+                            else:                        # warmup: state only, no orders
+                                self._suppressed_orders += 1
+                                self.warmup_signals.append(
+                                    (ev.ts, o.side, o.qty, o.tag, self.last_px))
                     if isinstance(ev, Bar) and self.on_bar_hook is not None:
                         await self.on_bar_hook(ev.ts, ev.c, self._live,
                                                self._backfill_bars)
                     self.blotter.on_market_event(ev)
                 else:  # broker event
                     self.blotter.on_broker_event(ev)
-                    dispatch_broker(self.strategies, ev)
+                    if isinstance(ev, Fill):
+                        self._attribute_fill(ev)         # owner-only routing
+                    # account-level PositionUpdates are NOT broadcast to
+                    # strategies: each sleeve sees only its own attributed book
         finally:
             self._stop.set()
             for t in (feeder, brokerer):

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from ..core.events import Bar
 from ..core.orders import Order
+from ..core.timeutil import ns_to_utc
 from ..features.bars import BarAggregator
 from ..features.zones import ZoneDetector
 from .base import BaseStrategy
@@ -54,7 +55,8 @@ class _Trade:
 
 
 class ZoneLifecycleStrategy(BaseStrategy):
-    def __init__(self, symbol: str) -> None:
+    def __init__(self, symbol: str,
+                 gate_utc: tuple[int, int] | None = (13, 21)) -> None:
         self.symbol = symbol
         self.agg = BarAggregator(("30m",))
         self.det = ZoneDetector()
@@ -62,6 +64,8 @@ class ZoneLifecycleStrategy(BaseStrategy):
         self._k = -1
         self.pos = 0
         self.trade: _Trade | None = None
+        # NEW entries only inside the validated window; management always runs
+        self.gate_utc = gate_utc
 
     def on_bar(self, bar: Bar) -> list[Order]:
         orders: list[Order] = []
@@ -81,7 +85,9 @@ class ZoneLifecycleStrategy(BaseStrategy):
         z = self.det.update(b)
         if z is not None:
             self.zones.append(_ZoneRec(self._k, z.direction, z.top, z.bot, ts=b.ts))
-        if self.trade is None and self.pos == 0:
+        in_window = self.gate_utc is None or \
+            (self.gate_utc[0] <= ns_to_utc(b.ts).hour < self.gate_utc[1])
+        if self.trade is None and self.pos == 0 and in_window:
             orders += self._scan(b)
         return orders
 

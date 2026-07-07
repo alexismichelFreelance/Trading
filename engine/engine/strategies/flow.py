@@ -42,6 +42,7 @@ class FlowFollowingStrategy(BaseStrategy):
         self._day: str | None = None
         self._adelta = 0
         self.pos = 0
+        self._flattening = 0           # >0: flatten in flight (countdown to retry)
 
     def on_trade(self, t: Trade) -> list[Order]:
         self._adelta += t.aggressor * t.size
@@ -55,7 +56,11 @@ class FlowFollowingStrategy(BaseStrategy):
                 self._buf.clear()
                 self._F = 0.0
                 self._adelta = 0
-                if self.pos != 0:                 # window closed: go flat
+                if self.pos != 0:
+                    if self._flattening > 0:      # flatten in flight: wait
+                        self._flattening -= 1     # (bounded retry, ~30s cadence)
+                        return []
+                    self._flattening = 30
                     return [Order(self.symbol, -_sign(self.pos), abs(self.pos),
                                   tag="window-flat", reduce_only=True)]
                 return []
@@ -90,6 +95,8 @@ class FlowFollowingStrategy(BaseStrategy):
 
     def on_position(self, p) -> None:
         self.pos = p.qty
+        if p.qty == 0:
+            self._flattening = 0
 
 
 __all__ = ["FlowFollowingStrategy"]

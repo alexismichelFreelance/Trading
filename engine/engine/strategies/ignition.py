@@ -17,7 +17,7 @@ from collections import deque
 
 from ..core.events import Bar, BookFlow, Trade
 from ..core.orders import Order, OrderType
-from ..core.timeutil import et_session_date, utc_hour
+from ..core.timeutil import et_session_date, ns_to_utc, utc_hour
 from ..features.bars import BarAggregator
 from ..features.efficiency import OnlineKaufmanER, RollingEfficiency
 from ..features.hmm import GaussianHMM2
@@ -37,8 +37,12 @@ class IgnitionStrategy(BaseStrategy):
                  regime_states: dict | None = None, regime_mode: str = "states",
                  er_window_s: int = 7200, er_threshold: float = 0.70,
                  exit_mode: str = "fixed", trail_init: float = 6.0,
-                 trail_width: float = 10.0) -> None:
+                 trail_width: float = 10.0,
+                 gate_utc: tuple[int, int] | None = (13, 21)) -> None:
         self.symbol = symbol
+        # NEW ENTRIES only inside the validated 13-21 UTC window (live feeds run
+        # ~23h; the edge was researched on this window). Exits always run.
+        self.gate_utc = gate_utc
         self.feats = IgnitionFeatures(trend_lag=trend_lag)
         self.agg = BarAggregator(("30m", "1h"))
         self.zdet = ZoneDetector()
@@ -128,6 +132,9 @@ class IgnitionStrategy(BaseStrategy):
 
     # ── logic ────────────────────────────────────────────────────────────
     def _maybe_enter(self, px: float, ts: int) -> list[Order]:
+        if self.gate_utc is not None and \
+                not (self.gate_utc[0] <= ns_to_utc(ts).hour < self.gate_utc[1]):
+            return []
         f = self.feats
         if f.strength is None:
             return []
