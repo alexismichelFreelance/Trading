@@ -131,31 +131,51 @@ def test_painter_json_vocabulary():
     assert arrow["ts"] == 5 * NS and arrow["dir"] == 1 and arrow["label"] == "entry"
 
 
-def test_paint_controller_zones_and_ghosts():
-    class _Z:
-        def __init__(self, ts, d, top, bot, fade=False, broke=False):
-            self.ts, self.dir, self.top, self.bot = ts, d, top, bot
-            self.fade_done, self.broke = fade, broke
+def _bar(ts, o, h, l, c, v=100):
+    from engine.core.events import Bar
+    return Bar(ts, "1m", o, h, l, c, v)
 
-    class _ZoneStrat:
+
+def test_paint_controller_ghost_and_panel():
+    class _Sleeve:
         pos = 0
-        zones = [_Z(10 * NS, 1, 5010.0, 5005.0),                 # virgin demand
-                 _Z(20 * NS, -1, 5030.0, 5025.0, broke=True)]    # broken -> removed
 
     p = _painter()
-    pc = PaintController(p, [_ZoneStrat()])
+    pc = PaintController(p, [_Sleeve()], panel_pos="bottomleft")
 
     async def go():
         await pc.ghost_one(5 * NS, -1, 2, "opendrive-entry", 5007.0)
-        await pc.on_bar(60 * NS, 5008.0, live=True)
+        await pc.on_bar(_bar(60 * NS, 5008, 5009, 5007, 5008), live=True)
 
     asyncio.run(go())
     kinds = [m["kind"] for m in p._w.lines]
     assert kinds.count("arrow") == 1                  # the ghost
-    assert kinds.count("rect") == 1                   # virgin zone painted...
-    assert kinds.count("remove") == 1                 # ...broken zone removed, not grayed
-    assert kinds.count("status") == 1
+    assert kinds.count("status") == 1                 # the info panel
+    status = next(m for m in p._w.lines if m["kind"] == "status")
+    assert status["pos"] == "bottomleft" and "ENGINE" in status["label"]
     ghost = next(m for m in p._w.lines if m["kind"] == "arrow")
     assert ghost["ts"] == 5 * NS and ghost["price"] == 5007.0 and "opendrive" in ghost["label"]
-    rect = next(m for m in p._w.lines if m["kind"] == "rect")
-    assert rect["opacity"] == 30                      # virgin = vivid
+
+
+def test_zoneview_detects_and_brackets():
+    from engine.features.zones import DEMAND
+    from engine.painters import ZoneView
+    zv = ZoneView()
+    # a base (3 tight bars) then a big up departure -> a DEMAND zone should form
+    t = 0
+    for i in range(25):                                # warm the 20-bar averages
+        t += 30 * 60 * NS
+        zv.update(_bar(t, 5000, 5002, 4998, 5001, 100))
+    base_lo = 4999.0
+    for i in range(3):                                 # tight base
+        t += 30 * 60 * NS
+        zv.update(_bar(t, 5000, 5001, base_lo, 5000, 80))
+    t += 30 * 60 * NS
+    zv.update(_bar(t, 5000, 5040, 4999, 5038, 400))    # decisive up departure
+    t += 30 * 60 * NS
+    zv.update(_bar(t, 5038, 5040, 5036, 5039, 100))    # trailing bar flushes the 30m departure
+    act = zv.active()
+    assert len(act) >= 1
+    assert any(z.direction == DEMAND for z in act)
+    res, sup = zv.bracket(5039.0)
+    assert sup is not None                              # a demand zone sits below price

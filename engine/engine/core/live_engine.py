@@ -184,8 +184,7 @@ class LiveEngine:
                                 if self.on_warmup_signal is not None:
                                     await self.on_warmup_signal(*sig)   # ghost now
                     if isinstance(ev, Bar) and self.on_bar_hook is not None:
-                        await self.on_bar_hook(ev.ts, ev.c, self._live,
-                                               self._backfill_bars)
+                        await self.on_bar_hook(ev, self._live, self._backfill_bars)
                     self.blotter.on_market_event(ev)
                 else:  # broker event
                     self.blotter.on_broker_event(ev)
