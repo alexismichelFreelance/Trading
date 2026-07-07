@@ -105,6 +105,9 @@ async def main() -> None:
                     help="DANGER: let strategies trade on backfill bars (debug only)")
     ap.add_argument("--no-paint", action="store_true",
                     help="disable NT8 chart drawing (ghost signals, zones, status box)")
+    ap.add_argument("--panel", default="bottomleft",
+                    choices=["bottomleft", "topright", "bottomright", "topleft"],
+                    help="corner for the engine info panel (default bottomleft)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -123,7 +126,7 @@ async def main() -> None:
     pc: PaintController | None = None
     if not a.no_paint:
         if await painter.connect():
-            pc = PaintController(painter, strategies)
+            pc = PaintController(painter, strategies, panel_pos=a.panel)
             eng.on_live_order = pc.live_order
             eng.on_bar_hook = pc.on_bar
             eng.on_warmup_signal = pc.ghost_one      # paint ghosts as backfill replays

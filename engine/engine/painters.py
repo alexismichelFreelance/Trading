@@ -33,9 +33,11 @@ GHOST_CAP_PER_TAG = 15       # ghosts are secondary; keep the chart uncluttered
 
 
 class PaintController:
-    def __init__(self, painter: NTChartPainter, strategies: list) -> None:
+    def __init__(self, painter: NTChartPainter, strategies: list,
+                 panel_pos: str = "bottomleft") -> None:
         self.p = painter
         self.strategies = strategies
+        self.panel_pos = panel_pos       # bottomleft|topright|bottomright|topleft
         self._n_live = 0
         self._n_ghost = 0
         self._ghost_by_tag: dict[str, int] = {}
@@ -157,7 +159,7 @@ class PaintController:
             if pos:
                 bits += "  <== IN"
             lines.append(bits)
-        await self.p.status("\\n".join(lines))
+        await self.p.status("\\n".join(lines), pos=self.panel_pos)
 
 
 __all__ = ["PaintController"]
