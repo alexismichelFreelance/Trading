@@ -32,6 +32,7 @@ class _ZoneRec:
     broke: bool = False
     break_k: int | None = None
     flip_done: bool = False
+    ts: int = 0                    # creation time (ns) — metadata for chart painting
 
     @property
     def prox(self) -> float:
@@ -79,7 +80,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
             orders += self._manage(b)
         z = self.det.update(b)
         if z is not None:
-            self.zones.append(_ZoneRec(self._k, z.direction, z.top, z.bot))
+            self.zones.append(_ZoneRec(self._k, z.direction, z.top, z.bot, ts=b.ts))
         if self.trade is None and self.pos == 0:
             orders += self._scan(b)
         return orders

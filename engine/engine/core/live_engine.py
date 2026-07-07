@@ -47,6 +47,13 @@ class LiveEngine:
         self._live = not warmup_gate
         self._backfill_bars = 0
         self._suppressed_orders = 0
+        # ghost signals: (ts, side, qty, tag, px) the strategies WOULD have sent
+        # during warmup — consumed by the chart painter after the live flip
+        self.warmup_signals: list[tuple[int, int, int, str, float]] = []
+        self.last_px: float = 0.0
+        # optional async callbacks for the chart painter
+        self.on_live_order = None          # async (ts, side, qty, tag, px)
+        self.on_bar_hook = None            # async (ts, close, live, backfill_bars)
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
 
@@ -95,6 +102,10 @@ class LiveEngine:
                     continue
                 if kind == "market":
                     self.clock.set(ev.ts)
+                    if isinstance(ev, Trade):
+                        self.last_px = ev.price
+                    elif isinstance(ev, Bar):
+                        self.last_px = ev.c
                     if not self._live and isinstance(ev, Trade):
                         self._live = True
                         log.info("warmup complete: %d backfill bars consumed, %d "
@@ -105,10 +116,19 @@ class LiveEngine:
                         for o in orders:
                             self.blotter.on_order(o)
                             await self.broker.submit(o)
+                            if self.on_live_order is not None:
+                                await self.on_live_order(ev.ts, o.side, o.qty,
+                                                         o.tag, self.last_px)
                     else:                                # warmup: state only, no orders
                         if isinstance(ev, Bar):
                             self._backfill_bars += 1
                         self._suppressed_orders += len(orders)
+                        for o in orders:
+                            self.warmup_signals.append(
+                                (ev.ts, o.side, o.qty, o.tag, self.last_px))
+                    if isinstance(ev, Bar) and self.on_bar_hook is not None:
+                        await self.on_bar_hook(ev.ts, ev.c, self._live,
+                                               self._backfill_bars)
                     self.blotter.on_market_event(ev)
                 else:  # broker event
                     self.blotter.on_broker_event(ev)

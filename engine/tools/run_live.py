@@ -24,10 +24,12 @@ sys.path.insert(0, str(ROOT))
 
 from engine.adapters.brokers.ninjatrader import NinjaTraderBroker   # noqa: E402
 from engine.adapters.feeds.ninjatrader import NinjaTraderFeed       # noqa: E402
+from engine.adapters.painter import NTChartPainter                  # noqa: E402
 from engine.core.blotter import Blotter                             # noqa: E402
 from engine.core.clock import WallClock                             # noqa: E402
 from engine.core.events import Bar, BookFlow, Trade                 # noqa: E402
 from engine.core.live_engine import LiveEngine                      # noqa: E402
+from engine.painters import PaintController                         # noqa: E402
 
 HMM_PATH = str(ROOT / "config" / "hmm_es_1h.json")
 SYMBOL = "ES"
@@ -101,6 +103,8 @@ async def main() -> None:
     ap.add_argument("--broker-port", type=int, default=36002)
     ap.add_argument("--no-warmup-gate", action="store_true",
                     help="DANGER: let strategies trade on backfill bars (debug only)")
+    ap.add_argument("--no-paint", action="store_true",
+                    help="disable NT8 chart drawing (ghost signals, zones, status box)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -115,6 +119,15 @@ async def main() -> None:
     eng = LiveEngine(feed, broker, strategies, WallClock(), blot,
                      warmup_gate=not a.no_warmup_gate)
 
+    painter = NTChartPainter("127.0.0.1", a.broker_port)
+    pc: PaintController | None = None
+    if not a.no_paint:
+        if await painter.connect():
+            pc = PaintController(painter, strategies)
+            eng.on_live_order = pc.live_order
+            eng.on_bar_hook = pc.on_bar
+            print("chart painting ON (ghost signals, zones, risk lines, status box)")
+
     mode = "OBSERVE" if not names else "TRADE(" + ",".join(names) + ")"
     print(f"live session [{mode}] market:{a.market_port} broker:{a.broker_port} "
           f"{'for %.0fs' % a.seconds if a.seconds else 'until Ctrl-C'}  "
@@ -127,8 +140,14 @@ async def main() -> None:
 
     async def heartbeat():
         last = -1
+        ghosts_painted = False
         while True:
-            await asyncio.sleep(20)
+            await asyncio.sleep(5)
+            if pc is not None and eng._live and not ghosts_painted:
+                ghosts_painted = True
+                await pc.ghost_signals(eng.warmup_signals)
+                print(f"  painted {min(len(eng.warmup_signals), 400)} ghost signals "
+                      f"on the chart (what the sleeves would have done on backfill days)")
             state = "LIVE" if eng._live else f"WARMUP({eng._backfill_bars} bars)"
             if obs.trades != last or not eng._live:
                 print(f"  [{state}] trades={obs.trades} bookflow-s={obs.flows} "
@@ -146,6 +165,7 @@ async def main() -> None:
     finally:
         for t in tasks[1:]:
             t.cancel()
+        await painter.close()
 
     print(f"\nsession summary: {obs.trades} trades, {obs.flows} bookflow-seconds, "
           f"{obs.bars} 1m bars ({eng._backfill_bars} backfill), last px {obs.last_px}")

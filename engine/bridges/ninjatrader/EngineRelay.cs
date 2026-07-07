@@ -26,9 +26,13 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
 using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
 using NinjaTrader.NinjaScript.Strategies;
 #endregion
 
@@ -200,6 +204,96 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (m.Num("qty") > 0) o.QuantityChanged = (int)m.Num("qty");
                     Account.Change(new[] { o });
                 }
+            }
+            else if (t == "draw")
+            {
+                HandleDraw(m);
+            }
+        }
+
+        // ── chart drawing from the engine ("draw" messages on the broker
+        //    socket) — makes the NT8 chart the engine's visual surface: zones,
+        //    ghost/live signals, trail lines, status box. Same-tag redraw
+        //    REPLACES the object (NT semantics), so movable lines are cheap. ──
+        private static DateTime FromNs(double ns)
+        {
+            return Epoch.AddTicks((long)(ns / 100.0)).ToLocalTime();
+        }
+
+        private Brush BrushOf(string spec, Brush fallback)
+        {
+            if (string.IsNullOrEmpty(spec))
+                return fallback;
+            try
+            {
+                Brush b = (Brush)new BrushConverter().ConvertFromString(spec);
+                b.Freeze();
+                return b;
+            }
+            catch { return fallback; }
+        }
+
+        private void HandleDraw(MiniJson m)
+        {
+            string kind = m.Get("kind");
+            string tag = m.Get("tag");
+            if (tag.Length == 0)
+                tag = "eng-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            try
+            {
+                if (kind == "arrow")
+                {
+                    Brush b = BrushOf(m.Get("color"), m.Num("dir") > 0 ? Brushes.LimeGreen : Brushes.Red);
+                    if (m.Num("dir") > 0)
+                        Draw.ArrowUp(this, tag, false, FromNs(m.Num("ts")), m.Num("price"), b);
+                    else
+                        Draw.ArrowDown(this, tag, false, FromNs(m.Num("ts")), m.Num("price"), b);
+                    string lbl = m.Get("label");
+                    if (lbl.Length > 0)
+                        Draw.Text(this, tag + "-l", false, lbl, FromNs(m.Num("ts")),
+                                  m.Num("price") + (m.Num("dir") > 0 ? -3.0 : 3.0), 0, b,
+                                  null, System.Windows.TextAlignment.Center,
+                                  Brushes.Transparent, Brushes.Transparent, 0);
+                }
+                else if (kind == "rect")
+                {
+                    Brush b = BrushOf(m.Get("color"), Brushes.SteelBlue);
+                    Draw.Rectangle(this, tag, false, FromNs(m.Num("t1")), m.Num("p1"),
+                                   FromNs(m.Num("t2")), m.Num("p2"), Brushes.Transparent, b,
+                                   (int)(m.Num("opacity") > 0 ? m.Num("opacity") : 18));
+                }
+                else if (kind == "hline")
+                {
+                    Draw.HorizontalLine(this, tag, m.Num("price"),
+                                        BrushOf(m.Get("color"), Brushes.Orange));
+                }
+                else if (kind == "line")
+                {
+                    Draw.Line(this, tag, false, FromNs(m.Num("t1")), m.Num("p1"),
+                              FromNs(m.Num("t2")), m.Num("p2"),
+                              BrushOf(m.Get("color"), Brushes.Orange), DashStyleHelper.Dash, 1);
+                }
+                else if (kind == "text")
+                {
+                    Draw.Text(this, tag, false, m.Get("label"), FromNs(m.Num("ts")),
+                              m.Num("price"), 0, BrushOf(m.Get("color"), Brushes.Gray),
+                              null, System.Windows.TextAlignment.Center,
+                              Brushes.Transparent, Brushes.Transparent, 0);
+                }
+                else if (kind == "status")
+                {
+                    Draw.TextFixed(this, tag.Length > 0 ? tag : "eng-status",
+                                   m.Get("label").Replace("\\n", "\n"), TextPosition.TopRight);
+                }
+                else if (kind == "remove")
+                {
+                    RemoveDrawObject(tag);
+                    RemoveDrawObject(tag + "-l");
+                }
+            }
+            catch (Exception ex)
+            {
+                Print("EngineRelay draw error (" + kind + "/" + tag + "): " + ex.Message);
             }
         }
 
