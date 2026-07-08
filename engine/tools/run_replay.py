@@ -43,7 +43,7 @@ def make_strategy(name: str, symbol: str, hmm_path: str = HMM_PATH, **kw):
         return IgnitionStrategy(symbol, hmm_path, **kw)
     if name == "flow":
         from engine.strategies.flow import FlowFollowingStrategy
-        return FlowFollowingStrategy(symbol)
+        return FlowFollowingStrategy(symbol, **kw)
     if name == "zones":
         from engine.strategies.zones_strategy import ZoneLifecycleStrategy
         return ZoneLifecycleStrategy(symbol, **kw)
@@ -85,6 +85,8 @@ def main() -> None:
     ap.add_argument("--trend-cap", type=float)
     ap.add_argument("--book-net", type=float)
     ap.add_argument("--gap-thr", type=float)
+    ap.add_argument("--th", type=int)
+    ap.add_argument("--scale", type=float)
     a = ap.parse_args()
     symbols = ["ESM5", "ESH5"] if a.all_months else [a.symbol or "ESM5"]
 
@@ -101,6 +103,10 @@ def main() -> None:
         kw["book_net"] = a.book_net
     if a.gap_thr is not None:
         kw["gap_thr"] = a.gap_thr
+    if a.th is not None:
+        kw["th"] = a.th
+    if a.scale is not None:
+        kw["scale"] = a.scale
 
     total = 0.0
     for s in symbols:

@@ -103,7 +103,8 @@ class ObserveStrategy:
         print(f"  POSITION {e.qty} @ {e.avg_px}")
 
 
-def build(names: list[str]):
+def build(names: list[str], flow_th: int = 30):
+    FLOW_TH = flow_th
     out = []
     for n in names:
         if n == "ignition":
@@ -115,7 +116,12 @@ def build(names: list[str]):
             out.append(OpenDriveStrategy(SYMBOL))
         elif n == "flow":
             from engine.strategies.flow import FlowFollowingStrategy
-            out.append(FlowFollowingStrategy(SYMBOL, maxp=5))
+            # live feed's per-second |adelta| tops out ~66 (thin flow tail), so
+            # the validated th=200 never fires here. flow_th (default 30) lets it
+            # respond to this feed's flow; scale keeps the 15:1 ratio. th=200 is
+            # the robust all-months-positive reference (parity). See below.
+            out.append(FlowFollowingStrategy(SYMBOL, maxp=5, th=FLOW_TH,
+                                             scale=FLOW_TH * 15.0))
         elif n == "zones":
             from engine.strategies.zones_strategy import ZoneLifecycleStrategy
             out.append(ZoneLifecycleStrategy(SYMBOL))
@@ -143,6 +149,9 @@ async def main() -> None:
                     help="corner for the engine info panel (default bottomleft)")
     ap.add_argument("--record", action="store_true",
                     help="record 1m bars to QuestDB claude_bars_live (grow the library)")
+    ap.add_argument("--flow-th", type=int, default=30,
+                    help="flow threshold for THIS feed (validated=200 but the live feed's "
+                         "|adelta| tops ~66; default 30 lets flow respond here)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -150,7 +159,7 @@ async def main() -> None:
 
     names = [s for s in a.strategies.split(",") if s]
     obs = ObserveStrategy()
-    strategies = [obs] + build(names)
+    strategies = [obs] + build(names, flow_th=a.flow_th)
     feed = NinjaTraderFeed("127.0.0.1", a.market_port, symbol=SYMBOL)
     recorder = None
     if a.record:
