@@ -33,6 +33,7 @@ class Zone:
     direction: int            # +1 demand (support), -1 supply (resistance)
     departure_score: int      # 0-2
     base_score: int           # 0-2
+    is_gap: bool = False       # RTH-open gap zone (needs leave-and-return arming)
     touches: int = 0
     broken: bool = False
     broken_ts: int | None = None      # invalidation time (when a close went through)
@@ -94,7 +95,7 @@ class ZoneDetector:
                     d = DEMAND if gap > 0 else SUPPLY
                     top = max(self._last_close, bar.o)
                     bot = min(self._last_close, bar.o)
-                    zones.append(Zone(bar.ts, top, bot, d, 2, 1))   # gap = strong departure
+                    zones.append(Zone(bar.ts, top, bot, d, 2, 1, is_gap=True))
             self._last_sess = sess
             self._last_close = bar.c
         # base -> departure zone

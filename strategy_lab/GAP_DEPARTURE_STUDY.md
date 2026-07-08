@@ -66,12 +66,30 @@ is constantly in bad gap trades and the base edge drowns.
 - **Chart: gaps ON** as a VISUAL aid (the painter's `ZoneView` passes `gap_thr=5` for intraday) —
   seeing gap levels helps manual reads; we just don't auto-trade them.
 - **The idea isn't dead — the ENTRY is wrong.** Proper S/D semantics require the zone to be left
-  and RE-touched before fading; the gap-at-open violates that. A "wait for leave-and-return"
-  fade (only arm a gap zone once price has cleared it, fade on the first true return) is the
-  obvious fix and could recover the edge — a future study, not deployed on the current result.
+  and RE-touched before fading; the gap-at-open violates that.
+
+## Leave-and-return variant — TESTED, also FAILS (2026-07)
+Implemented "arm a gap zone only after price clears its proximal edge, fade the first true
+return" (`ZoneLifecycleStrategy(gap_thr=5)`, `--gap-thr 5`) and re-ran the single-position engine:
+
+| variant | single-position (deployable) | ESM5 | ESH5 |
+|---|---|---|---|
+| base only | **+$6,961** | +4,254 | +2,707 |
+| naive gaps (fade at open) | −$35,907 | −15,046 | −20,861 |
+| **leave-and-return gaps** | **−$17,903** | +1,619 | −19,522 |
+
+Leave-and-return **halves the damage** but is still a large net loser and still drowns the base
+edge — and it's lopsided (ESM5 ~breakeven, ESH5 −$19.5k). Two entry refinements, both fail the
+gate. **Gaps do not survive as a TRADING signal on this data.**
+
+## Final decision
+- **Trading: gaps OFF** permanently on this evidence (`gap_thr=0` default). Deployed zones sleeve
+  stays base-only (+$6,961).
+- **Chart: gaps ON** as a visual aid (painter `ZoneView` `gap_thr=5`).
+- The gap machinery + leave-and-return logic stay in the code as opt-in (`gap_thr>0`), dormant by
+  default, documenting the negative result and powering the chart.
 
 Lesson (again): the per-signal oracle is a ceiling, not a P&L. The single-position replay is the
-gate that protects real money — it caught a change the oracle loved.
+gate that protects real money — it rejected a change the oracle loved twice over.
 
-Scripts: `strategy_lab/gap_departure.py` (add-on study), `evaluate_zones(gap_thr=5)` (oracle
-reference). Detector `gap_thr` param retained (default 0) for the leave-and-return follow-up.
+Scripts: `strategy_lab/gap_departure.py`, `evaluate_zones(gap_thr=5)`, `run_replay --gap-thr`.

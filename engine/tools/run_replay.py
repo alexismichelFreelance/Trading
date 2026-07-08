@@ -46,7 +46,7 @@ def make_strategy(name: str, symbol: str, hmm_path: str = HMM_PATH, **kw):
         return FlowFollowingStrategy(symbol)
     if name == "zones":
         from engine.strategies.zones_strategy import ZoneLifecycleStrategy
-        return ZoneLifecycleStrategy(symbol)
+        return ZoneLifecycleStrategy(symbol, **kw)
     if name == "opendrive":
         from engine.strategies.open_drive import OpenDriveStrategy
         return OpenDriveStrategy(symbol, **kw)
@@ -84,6 +84,7 @@ def main() -> None:
     ap.add_argument("--chop-stop", type=float)
     ap.add_argument("--trend-cap", type=float)
     ap.add_argument("--book-net", type=float)
+    ap.add_argument("--gap-thr", type=float)
     a = ap.parse_args()
     symbols = ["ESM5", "ESH5"] if a.all_months else [a.symbol or "ESM5"]
 
@@ -98,6 +99,8 @@ def main() -> None:
         kw["trend_cap"] = a.trend_cap
     if a.book_net is not None:
         kw["book_net"] = a.book_net
+    if a.gap_thr is not None:
+        kw["gap_thr"] = a.gap_thr
 
     total = 0.0
     for s in symbols:

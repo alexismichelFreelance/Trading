@@ -34,6 +34,8 @@ class _ZoneRec:
     break_k: int | None = None
     flip_done: bool = False
     ts: int = 0                    # creation time (ns) — metadata for chart painting
+    is_gap: bool = False           # RTH-open gap zone
+    armed: bool = True             # gap zones start disarmed until price leaves them
 
     @property
     def prox(self) -> float:
@@ -56,10 +58,14 @@ class _Trade:
 
 class ZoneLifecycleStrategy(BaseStrategy):
     def __init__(self, symbol: str,
-                 gate_utc: tuple[int, int] | None = (13, 21)) -> None:
+                 gate_utc: tuple[int, int] | None = (13, 21),
+                 gap_thr: float = 0.0) -> None:
         self.symbol = symbol
         self.agg = BarAggregator(("30m",))
-        self.det = ZoneDetector()
+        # gap_thr>0: also detect RTH-open gap zones, faded only after a
+        # leave-and-return (naive immediate-fade lost -$36k; see
+        # strategy_lab/GAP_DEPARTURE_STUDY.md). Default 0 = base-only.
+        self.det = ZoneDetector(gap_thr=gap_thr)
         self.zones: list[_ZoneRec] = []
         self._k = -1
         self.pos = 0
@@ -99,11 +105,18 @@ class ZoneLifecycleStrategy(BaseStrategy):
         if self.trade is not None:
             orders += self._manage(b)
         for z in self.det.update(b):
-            self.zones.append(_ZoneRec(self._k, z.direction, z.top, z.bot, ts=b.ts))
+            self.zones.append(_ZoneRec(self._k, z.direction, z.top, z.bot, ts=b.ts,
+                                       is_gap=z.is_gap, armed=not z.is_gap))
         in_window = self.gate_utc is None or \
             (self.gate_utc[0] <= ns_to_utc(b.ts).hour < self.gate_utc[1])
         if self.trade is None and self.pos == 0 and in_window:
             orders += self._scan(b)
+        # LEAVE-AND-RETURN arming (after scan, so a gap fade needs a PRIOR bar to
+        # have left the zone): a gap zone arms once price clears its proximal edge
+        for z in self.zones:
+            if z.is_gap and not z.armed and not z.broke:
+                if (b.h > z.top) if z.dir > 0 else (b.l < z.bot):
+                    z.armed = True
         return orders
 
     def _opp_target(self, want_dir: int, price: float, before_k: int, dir_sign: int) -> float | None:
@@ -125,8 +138,9 @@ class ZoneLifecycleStrategy(BaseStrategy):
     def _scan(self, b: Bar) -> list[Order]:
         for z in self.zones:
             d = z.dir
-            # FADE — 1st touch of a fresh zone
-            if not z.fade_done and not z.broke:
+            # FADE — 1st touch of a fresh zone (gap zones only once armed: they
+            # must have left and be RE-touched, not faded at the open)
+            if not z.fade_done and not z.broke and z.armed:
                 touch = (b.l <= z.top and b.l >= z.bot - 0.5) if d > 0 else (b.h >= z.bot and b.h <= z.top + 0.5)
                 if touch:
                     z.fade_done = True
