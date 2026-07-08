@@ -43,14 +43,35 @@ Per-setup (≥5pt): FADE +$23,091 (n=52, 88%) · BREAK +$8,878 (n=44, 89%) · FL
   signals overlap and compete for the one position. The realistic number needs the
   single-position replay.
 
-## Verdict / recommendation — BUILD IT (this one survives)
-Unlike the confluence study (too thin), gaps-as-departures is a **strong, well-sampled,
-mechanically-sensible improvement**. Recommend:
-1. Add gap-open detection to `ZoneDetector` (threshold ≥5pt, gap-up→demand / gap-down→supply),
-   feeding the same lifecycle. RTH-only detection (already shipped) is the prerequisite — gaps
-   only exist on RTH bars.
-2. Re-run the SINGLE-POSITION engine (`run_replay zones`) to get the realistic deployable number
-   and confirm months stay same-sign; update the zones parity target to the new base+gap oracle.
-3. Then it's live automatically (same detector powers live + the chart's ZoneView).
+## DEPLOYMENT CHECK — FAILED. Do NOT trade gaps (as implemented).
+Implemented gap detection in the real `ZoneDetector` + oracle and ran the **single-position
+engine** (`run_replay zones`), which is the deployment gate above the oracle:
 
-Script: `strategy_lab/gap_departure.py` (reproducible; reuses the oracle).
+| | oracle (per-signal ceiling) | single-position engine (deployable) |
+|---|---|---|
+| base only | +$47,502 | **+$6,961** |
+| base + gaps (≥5pt) | +$152,251 | **−$35,907** |
+
+Gaps TRIPLED the oracle but turned the realizable edge from +$6,961 to **−$35,907**. The oracle
+was a mirage: it evaluates every signal independently with a generous walk, so it never pays for
+the fatal path problem — **a gap zone forms with price sitting AT its proximal edge (the open),
+so the single-position engine fades it immediately at formation** (buying the top of a gap-up
+demand zone), rather than waiting for price to leave and genuinely RETURN to the level. Many of
+those immediate fades stop out on gap-fill; flooded with ~130 extra gap signals, the one position
+is constantly in bad gap trades and the base edge drowns.
+
+## Verdict
+- **Trading: gaps OFF** (`ZoneDetector` default `gap_thr=0`). The deployed sleeve stays base-only
+  (+$6,961, RTH-fixed). The oracle's +$152k is NOT deployable.
+- **Chart: gaps ON** as a VISUAL aid (the painter's `ZoneView` passes `gap_thr=5` for intraday) —
+  seeing gap levels helps manual reads; we just don't auto-trade them.
+- **The idea isn't dead — the ENTRY is wrong.** Proper S/D semantics require the zone to be left
+  and RE-touched before fading; the gap-at-open violates that. A "wait for leave-and-return"
+  fade (only arm a gap zone once price has cleared it, fade on the first true return) is the
+  obvious fix and could recover the edge — a future study, not deployed on the current result.
+
+Lesson (again): the per-signal oracle is a ceiling, not a P&L. The single-position replay is the
+gate that protects real money — it caught a change the oracle loved.
+
+Scripts: `strategy_lab/gap_departure.py` (add-on study), `evaluate_zones(gap_thr=5)` (oracle
+reference). Detector `gap_thr` param retained (default 0) for the leave-and-return follow-up.

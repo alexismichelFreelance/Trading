@@ -19,6 +19,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from ..core.events import Bar
+from ..core.timeutil import et_session_date
 
 DEMAND = 1
 SUPPLY = -1
@@ -62,19 +63,41 @@ class Zone:
 class ZoneDetector:
     def __init__(self, avg_window: int = 20, dep_range_mult: float = 1.4,
                  dep_body_frac: float = 0.5, base_range_mult: float = 0.8,
-                 max_base: int = 3) -> None:
+                 max_base: int = 3, gap_thr: float = 0.0) -> None:
         self.win = avg_window
         self.dep_range_mult = dep_range_mult
         self.dep_body_frac = dep_body_frac
         self.base_range_mult = base_range_mult
         self.max_base = max_base
+        # GAP-as-departure: the RTH-open gap is an imbalance (a strong departure)
+        # the methodology treats as a fresh zone. gap_thr=0 disables. Validated
+        # (strategy_lab/GAP_DEPARTURE_STUDY.md): ~doubles the opportunity set at
+        # base-zone quality. Requires RTH-only bars (a gap only exists then).
+        self.gap_thr = gap_thr
         self._bars: deque[Bar] = deque(maxlen=avg_window + max_base + 2)
         self._ranges: deque[float] = deque(maxlen=avg_window)
         self._vols: deque[float] = deque(maxlen=avg_window)
+        self._last_sess: str | None = None
+        self._last_close: float | None = None
 
-    def update(self, bar: Bar) -> Zone | None:
-        """Feed a closed 30m bar; return a new Zone if a base->departure fired."""
-        zone = None
+    def update(self, bar: Bar) -> list[Zone]:
+        """Feed a closed 30m bar; return any zones formed (gap and/or
+        base->departure). A gap zone forms on the first bar of a new session."""
+        zones: list[Zone] = []
+        # GAP zone: first bar of a new RTH session, |open - prior close| >= thr
+        if self.gap_thr > 0:
+            sess = et_session_date(bar.ts)
+            if self._last_sess is not None and sess != self._last_sess \
+                    and self._last_close is not None:
+                gap = bar.o - self._last_close
+                if abs(gap) >= self.gap_thr:
+                    d = DEMAND if gap > 0 else SUPPLY
+                    top = max(self._last_close, bar.o)
+                    bot = min(self._last_close, bar.o)
+                    zones.append(Zone(bar.ts, top, bot, d, 2, 1))   # gap = strong departure
+            self._last_sess = sess
+            self._last_close = bar.c
+        # base -> departure zone
         rng = bar.h - bar.l
         if len(self._ranges) >= self.win:
             avg_r = sum(self._ranges) / len(self._ranges)
@@ -96,11 +119,11 @@ class ZoneDetector:
                     dep_score = 1 + (1 if rng >= 2.2 * avg_r else 0)
                     base_r = max(b.h - b.l for b in base)
                     base_score = 2 if base_r <= 0.5 * avg_r else 1
-                    zone = Zone(bar.ts, top, bot, direction, dep_score, base_score)
+                    zones.append(Zone(bar.ts, top, bot, direction, dep_score, base_score))
         self._bars.append(bar)
         self._ranges.append(rng)
         self._vols.append(bar.v)
-        return zone
+        return zones
 
 
 class ZoneBook:

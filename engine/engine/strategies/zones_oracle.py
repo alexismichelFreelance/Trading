@@ -34,6 +34,30 @@ def _month(ns: int) -> str:
     return pd.Timestamp(ns, unit="ns", tz="UTC").strftime("%Y-%m")
 
 
+def _gap_zones(ts, o, c, thr):
+    """RTH-open gap zones: |session-open − prior-session-close| >= thr.
+    gap-up -> demand [prev_close, open], gap-down -> supply. off=1: no base, so
+    the fade/break scan starts the bar after the open (vs +4 for base zones).
+    See strategy_lab/GAP_DEPARTURE_STUDY.md."""
+    et = pd.to_datetime(ts, utc=True).tz_convert("America/New_York").strftime("%Y-%m-%d")
+    sess = np.asarray(et)
+    first_idx, last_idx = {}, {}
+    for i, s in enumerate(sess):
+        first_idx.setdefault(s, i)
+        last_idx[s] = i
+    order = list(dict.fromkeys(sess))
+    zones = []
+    for k in range(1, len(order)):
+        oi = first_idx[order[k]]
+        pc = c[last_idx[order[k - 1]]]
+        gap = o[oi] - pc
+        if abs(gap) < thr:
+            continue
+        d = 1 if gap > 0 else -1
+        zones.append({"j": oi, "dir": d, "top": max(pc, o[oi]), "bot": min(pc, o[oi]), "off": 1})
+    return zones
+
+
 def _detect_zones(o, h, l, c, v):
     n = len(c)
     rng = h - l
@@ -95,7 +119,9 @@ def _walk(direction, entry, stop, target, si, n, h, l, c):
     return ((pA + pB) / 2.0) * PV * size - COST * size
 
 
-def evaluate_zones(sym: str, q: QuestDB | None = None):
+def evaluate_zones(sym: str, q: QuestDB | None = None, gap_thr: float = 0.0):
+    """gap_thr=0 -> base zones only (the frozen Gate-C reference, +$47,502).
+    gap_thr>0 -> add RTH-open gap zones (the deployed detector, gap_thr=5)."""
     q = q or QuestDB()
     df = q.df(f"SELECT ts, first(o) o, max(h) h, min(l) l, last(c) c, sum(vol) v "
               f"FROM claude_bars_1m WHERE symbol='{sym}' SAMPLE BY 30m ALIGN TO CALENDAR").dropna(subset=["c"])
@@ -104,6 +130,8 @@ def evaluate_zones(sym: str, q: QuestDB | None = None):
     v = df["v"].to_numpy(dtype=float)
     n = len(df)
     Z = _detect_zones(o, h, l, c, v)
+    if gap_thr > 0:
+        Z = sorted(Z + _gap_zones(ts, o, c, gap_thr), key=lambda z: z["j"])
 
     setups = defaultdict(lambda: [0, 0.0])       # name -> [n, $]
     months = defaultdict(lambda: [0, 0.0])        # month -> [n, $]
@@ -119,7 +147,7 @@ def evaluate_zones(sym: str, q: QuestDB | None = None):
         prox = top if d > 0 else bot
         fade_done = False
         break_bar = -1
-        for i in range(j + 4, n):
+        for i in range(j + z.get("off", 4), n):
             touch = (l[i] <= top and l[i] >= bot - 0.5) if d > 0 else (h[i] >= bot and h[i] <= top + 0.5)
             if touch and not fade_done:
                 opp = [zz for zz in Z if zz["dir"] == -d and zz["j"] < i

@@ -64,14 +64,16 @@ def _bar(i, o, h, l, c, v):
 
 
 def test_detect_demand_zone():
-    det = ZoneDetector()
-    z = None
+    det = ZoneDetector(gap_thr=0)                         # isolate base->departure
+    zones = []
     for i in range(20):                                   # warmup range 2, vol 100
-        z = det.update(_bar(i, 5000, 5001, 4999, 5000, 100)) or z
+        zones += det.update(_bar(i, 5000, 5001, 4999, 5000, 100))
     for i in (20, 21):                                    # tight base range 0.6, vol 80
-        z = det.update(_bar(i, 5000, 5000.3, 4999.7, 5000, 80)) or z
-    z = det.update(_bar(22, 5000.0, 5005.0, 5000.0, 5004.0, 200)) or z   # up departure
-    assert z is not None and z.direction == DEMAND
+        zones += det.update(_bar(i, 5000, 5000.3, 4999.7, 5000, 80))
+    zones += det.update(_bar(22, 5000.0, 5005.0, 5000.0, 5004.0, 200))   # up departure
+    assert len(zones) == 1
+    z = zones[0]
+    assert z.direction == DEMAND
     assert abs(z.top - 5000.3) < 1e-9 and abs(z.bot - 4999.7) < 1e-9
     assert z.departure_score == 2 and z.base_score == 2
 
@@ -108,11 +110,10 @@ def test_zone_frequency_matches_research():
     df = q.df("SELECT ts, first(o) o, max(h) h, min(l) l, last(c) c, sum(vol) v "
               "FROM claude_bars_1m WHERE symbol='ESM5' SAMPLE BY 30m ALIGN TO CALENDAR")
     df = df.dropna(subset=["c"])
-    det = ZoneDetector()
+    det = ZoneDetector(gap_thr=0)                         # base-zone frequency vs research
     n = 0
     for r in df.itertuples():
-        if det.update(Bar(int(r.ts.value), "30m", r.o, r.h, r.l, r.c, int(r.v))):
-            n += 1
+        n += len(det.update(Bar(int(r.ts.value), "30m", r.o, r.h, r.l, r.c, int(r.v))))
     days = df["ts"].dt.tz_convert("America/New_York").dt.date.nunique()
     rate = n / days
     print(f"\nESM5 zones: {n} over {days} days = {rate:.2f}/day (research ~0.51)")

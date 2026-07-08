@@ -53,12 +53,12 @@ class ZoneView:
 
     def __init__(self) -> None:
         self.agg = BarAggregator(("30m", "1h", "4h"))
-        self.det = {tf: ZoneDetector() for tf in TF_ORDER}
+        # gap-as-departure on intraday TFs; daily bars are already sessions
+        self.det = {tf: ZoneDetector(gap_thr=5.0 if tf != "1d" else 0.0) for tf in TF_ORDER}
         self.book = {tf: ZoneBook() for tf in TF_ORDER}
 
     def _feed(self, tf: str, b) -> None:
-        z = self.det[tf].update(b)
-        if z is not None:
+        for z in self.det[tf].update(b):
             self.book[tf].add(z)
         self.book[tf].on_bar(b)
         self.book[tf].on_price(b.c, b.ts)

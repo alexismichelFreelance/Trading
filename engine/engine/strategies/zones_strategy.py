@@ -98,8 +98,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
         orders: list[Order] = []
         if self.trade is not None:
             orders += self._manage(b)
-        z = self.det.update(b)
-        if z is not None:
+        for z in self.det.update(b):
             self.zones.append(_ZoneRec(self._k, z.direction, z.top, z.bot, ts=b.ts))
         in_window = self.gate_utc is None or \
             (self.gate_utc[0] <= ns_to_utc(b.ts).hour < self.gate_utc[1])

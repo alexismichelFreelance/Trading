@@ -11,6 +11,7 @@ from engine.strategies.zones_oracle import evaluate_zones
 TARGET = 47502.0
 TOL = 0.15
 SETUP_TARGET = {"FADE": 17534, "BREAK": 5180, "FLIP": 24789}
+GAP_TARGET = 152251.0        # base + RTH-open gap zones (gap_thr=5); see GAP_DEPARTURE_STUDY.md
 
 
 def _db_up() -> bool:
@@ -63,3 +64,41 @@ def test_zones_all_four_months_positive(zone_results):
     assert len(months) == 4, f"expected 4 months, got {sorted(months)}"
     for m, (_, d) in months.items():
         assert d > 0, f"month {m} not positive (${d:.0f})"
+
+
+@pytest.fixture(scope="session")
+def zone_gap_results():
+    q = QuestDB()
+    setups = defaultdict(lambda: [0, 0.0])
+    months = defaultdict(lambda: [0, 0.0])
+    for sym in ("ESM5", "ESH5"):
+        r = evaluate_zones(sym, q, gap_thr=5.0)
+        for k, (n, d) in r["setups"].items():
+            setups[k][0] += n
+            setups[k][1] += d
+        for k, (n, d) in r["months"].items():
+            months[k][0] += n
+            months[k][1] += d
+    return {"setups": dict(setups), "months": dict(months)}
+
+
+def test_zones_with_gap_departures(zone_gap_results):
+    """Base + RTH-open gap zones ORACLE reference (+$152k, gaps ~3x the ceiling).
+    CEILING ONLY — NOT deployed: the single-position engine LOSES with gaps
+    (-$35,907 vs +$6,961 base-only) because a gap zone forms with price at its
+    proximal edge and gets faded at the open instead of on a true return. Gaps
+    are OFF for trading (ZoneDetector gap_thr=0), ON for the chart. See
+    strategy_lab/GAP_DEPARTURE_STUDY.md."""
+    total = sum(d for _, d in zone_gap_results["setups"].values())
+    print(f"\n=== Zone+GAP oracle: ${total:+,.0f}  (target ${GAP_TARGET:+,.0f}) ===")
+    for k in ("FADE", "BREAK", "FLIP"):
+        n, d = zone_gap_results["setups"][k]
+        print(f"  {k:6s} n={n:3d}  ${d:+11,.0f}")
+        assert d > 0, f"{k} not positive with gaps"
+    assert (1 - TOL) * GAP_TARGET <= total <= (1 + TOL) * GAP_TARGET, \
+        f"zone+gap {total:.0f} outside band of {GAP_TARGET}"
+    assert total > 2 * TARGET, "gaps should materially expand the edge"
+    months = zone_gap_results["months"]
+    assert len(months) == 4
+    for m, (_, d) in months.items():
+        assert d > 0, f"month {m} not positive with gaps (${d:.0f})"
