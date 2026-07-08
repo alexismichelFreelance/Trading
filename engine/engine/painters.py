@@ -16,8 +16,14 @@ Zones are computed on EVERY bar (so history warms up), painted only when LIVE
 from __future__ import annotations
 
 from .adapters.painter import NTChartPainter
+from .core.timeutil import ns_to_utc
 from .features.bars import BarAggregator
 from .features.zones import DEMAND, ZoneBook, ZoneDetector
+
+# the validated intraday session = 13:00-21:00 UTC (what claude_bars_1m uses).
+# Intraday S/D zones are RTH-only per the methodology: overnight/Globex bars are
+# low-volume and their levels don't carry the same weight. Live must match.
+RTH_LO, RTH_HI = 13, 21
 
 NS = 1_000_000_000
 
@@ -65,7 +71,7 @@ class ZoneView:
     def update(self, bar) -> None:
         if bar.tf == "1d":
             self._feed("1d", bar)
-        else:                              # 1m -> 30m/1h/4h
+        elif RTH_LO <= ns_to_utc(bar.ts).hour < RTH_HI:   # RTH-only intraday zones
             for b in self.agg.update(bar):
                 self._feed(b.tf, b)
 

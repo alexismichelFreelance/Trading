@@ -68,6 +68,12 @@ class ZoneLifecycleStrategy(BaseStrategy):
         self.gate_utc = gate_utc
 
     def on_bar(self, bar: Bar) -> list[Order]:
+        # RTH-only DETECTION (matches the validated claude_bars_1m 13-21 UTC
+        # window + the methodology). Live feeds carry overnight bars; without
+        # this the live 30m zones diverge from the backtest. Replay bars are all
+        # inside 13-21 UTC, so parity is unaffected.
+        if not (13 <= ns_to_utc(bar.ts).hour < 21):
+            return []
         orders: list[Order] = []
         for b in self.agg.update(bar):
             orders += self._on_30m(b)

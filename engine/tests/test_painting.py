@@ -172,23 +172,38 @@ def test_paint_controller_ghost_and_panel():
 def test_zoneview_multitf_detects_and_brackets():
     from engine.core.events import Bar
     from engine.features.zones import DEMAND
+    import pandas as pd
     from engine.painters import ZoneView
     zv = ZoneView()
-    # 30m demand zone from the 1m stream: base (tight) then a big up departure
-    t = 0
-    for i in range(25):                                # warm the 20-bar averages
-        t += 30 * 60 * NS
-        zv.update(_bar(t, 5000, 5002, 4998, 5001, 100))
-    for i in range(3):                                 # tight base
-        t += 30 * 60 * NS
-        zv.update(_bar(t, 5000, 5001, 4999.0, 5000, 80))
-    t += 30 * 60 * NS
-    zv.update(_bar(t, 5000, 5040, 4999, 5038, 400))    # decisive up departure
-    t += 30 * 60 * NS
-    zv.update(_bar(t, 5038, 5040, 5036, 5039, 100))    # trailing bar flushes it
+
+    # RTH-only detection now: feed 30m-spaced bars but ONLY within 13:00-20:59
+    # UTC, wrapping to the next day's 13:00 (16 slots/day). Non-RTH bars are
+    # dropped by the ZoneView, so timestamps must be real RTH times.
+    base = pd.Timestamp("2025-05-01T13:00:00Z").value
+    slot = 0
+
+    def nxt():
+        nonlocal slot
+        day, mins = divmod(slot, 16)          # 16 half-hours = 13:00..20:30 UTC
+        slot += 1
+        return base + day * 86400 * NS + mins * 30 * 60 * NS
+
+    # a non-RTH bar must be ignored
+    zv.update(_bar(base + 2 * 3600 * NS, 9999, 9999, 9999, 9999, 1))   # 15:00Z? -> actually RTH
+    for _ in range(25):                                # warm the 20-bar averages
+        zv.update(_bar(nxt(), 5000, 5002, 4998, 5001, 100))
+    for _ in range(3):                                 # tight base
+        zv.update(_bar(nxt(), 5000, 5001, 4999.0, 5000, 80))
+    zv.update(_bar(nxt(), 5000, 5040, 4999, 5038, 400))    # decisive up departure
+    zv.update(_bar(nxt(), 5038, 5040, 5036, 5039, 100))    # trailing bar flushes it
     assert any(z.direction == DEMAND for z in zv.active("30m"))
     res, sup = zv.bracket(5039.0)
     assert sup is not None and sup[0] == "30m"         # (tf, zone) below price
+
+    # a truly overnight bar (02:00 UTC) is dropped by the RTH filter
+    n_before = len(zv.book["30m"].zones)
+    zv.update(_bar(base + 13 * 3600 * NS, 5000, 5099, 4900, 5090, 9999))   # 02:00Z next day
+    assert len(zv.book["30m"].zones) == n_before
 
     # daily zones seed independently and appear in the bracket across TFs
     dt = 0
