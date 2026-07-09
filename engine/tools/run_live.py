@@ -104,7 +104,6 @@ class ObserveStrategy:
 
 
 def build(names: list[str], flow_th: int = 30):
-    FLOW_TH = flow_th
     out = []
     for n in names:
         if n == "ignition":
@@ -116,12 +115,11 @@ def build(names: list[str], flow_th: int = 30):
             out.append(OpenDriveStrategy(SYMBOL))
         elif n == "flow":
             from engine.strategies.flow import FlowFollowingStrategy
-            # live feed's per-second |adelta| tops out ~66 (thin flow tail), so
-            # the validated th=200 never fires here. flow_th (default 30) lets it
-            # respond to this feed's flow; scale keeps the 15:1 ratio. th=200 is
-            # the robust all-months-positive reference (parity). See below.
-            out.append(FlowFollowingStrategy(SYMBOL, maxp=5, th=FLOW_TH,
-                                             scale=FLOW_TH * 15.0))
+            # ADAPTIVE (scale-invariant) threshold: th_t = mean + 4*std of
+            # |adelta| — fires on THIS feed's own distribution (fixed th=200
+            # never fires here, |adelta| tops ~66). NOT more robust than fixed on
+            # research; flow is fragile either way. See FLOW_ADAPTIVE_STUDY.md.
+            out.append(FlowFollowingStrategy(SYMBOL, maxp=5, adaptive=True, adapt_k=4.0))
         elif n == "zones":
             from engine.strategies.zones_strategy import ZoneLifecycleStrategy
             out.append(ZoneLifecycleStrategy(SYMBOL))

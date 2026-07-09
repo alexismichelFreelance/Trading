@@ -87,6 +87,8 @@ def main() -> None:
     ap.add_argument("--gap-thr", type=float)
     ap.add_argument("--th", type=int)
     ap.add_argument("--scale", type=float)
+    ap.add_argument("--adaptive", action="store_true")
+    ap.add_argument("--adapt-k", type=float)
     a = ap.parse_args()
     symbols = ["ESM5", "ESH5"] if a.all_months else [a.symbol or "ESM5"]
 
@@ -107,6 +109,10 @@ def main() -> None:
         kw["th"] = a.th
     if a.scale is not None:
         kw["scale"] = a.scale
+    if a.adaptive:
+        kw["adaptive"] = True
+    if a.adapt_k is not None:
+        kw["adapt_k"] = a.adapt_k
 
     total = 0.0
     for s in symbols:

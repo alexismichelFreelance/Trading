@@ -28,14 +28,21 @@ def _sign(x: float) -> int:
 class FlowFollowingStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, w: int = 120, th: int = 200, scale: float = 3000.0,
                  maxp: int = 50, add_band: int = 1, hold_band: int = 5,
-                 gate_utc: tuple[int, int] | None = (13, 21)) -> None:
+                 gate_utc: tuple[int, int] | None = (13, 21),
+                 adaptive: bool = False, adapt_k: float = 4.0,
+                 vol_win: int = 1800, warm: int = 300) -> None:
         self.symbol = symbol
         self.w, self.th, self.scale, self.maxp = w, th, scale, maxp
         self.add_band, self.hold_band = add_band, hold_band
-        # trade only inside the VALIDATED window (13-21 UTC = the research grid);
-        # overnight tape is 5-20x thinner and the TH/cost calibration is untested
-        # there. None disables the gate. Replay data only exists inside the
-        # window, so parity is unaffected.
+        # ADAPTIVE (scale-invariant) threshold: th_t = rolling_mean + k*rolling_std
+        # of |adelta| over a trailing vol_win seconds (reset per day, `warm`-sec
+        # warmup); scale_t keeps the validated th:scale = 1:15 ratio. This makes
+        # flow fire on ANY feed's own distribution (the live NT feed's |adelta|
+        # tops ~66, so fixed th=200 never fires). NOTE: adaptive is NOT more
+        # robust than fixed on the research data — flow is the fragile sleeve
+        # either way (strategy_lab/FLOW_ADAPTIVE_STUDY.md). Default OFF (parity).
+        self.adaptive, self.adapt_k = adaptive, adapt_k
+        self.vol_win, self.warm = vol_win, warm
         self.gate_utc = gate_utc
         self._buf: deque[float] = deque()
         self._F = 0.0
@@ -43,6 +50,26 @@ class FlowFollowingStrategy(BaseStrategy):
         self._adelta = 0
         self.pos = 0
         self._flattening = 0           # >0: flatten in flight (countdown to retry)
+        self._vbuf: deque[float] = deque()   # trailing |adelta| for the vol estimate
+        self._vsum = 0.0
+        self._vsq = 0.0
+
+    def _adapt(self, absad: float) -> tuple[float, float]:
+        """Update the trailing |adelta| stats and return (th_t, scale_t)."""
+        self._vbuf.append(absad)
+        self._vsum += absad
+        self._vsq += absad * absad
+        if len(self._vbuf) > self.vol_win:
+            old = self._vbuf.popleft()
+            self._vsum -= old
+            self._vsq -= old * old
+        n = len(self._vbuf)
+        if n < self.warm:
+            return float("inf"), 1.0          # not warm: emit nothing
+        mean = self._vsum / n
+        var = max(0.0, self._vsq / n - mean * mean)
+        th = mean + self.adapt_k * (var ** 0.5)
+        return th, 15.0 * th
 
     def on_trade(self, t: Trade) -> list[Order]:
         self._adelta += t.aggressor * t.size
@@ -69,6 +96,8 @@ class FlowFollowingStrategy(BaseStrategy):
             self._day = day
             self._buf.clear()
             self._F = 0.0
+            self._vbuf.clear()                    # re-warm the vol estimate daily
+            self._vsum = self._vsq = 0.0
             if self.pos != 0:
                 orders.append(Order(self.symbol, -_sign(self.pos), abs(self.pos),
                                     tag="session-flat", reduce_only=True))
@@ -77,13 +106,14 @@ class FlowFollowingStrategy(BaseStrategy):
             held = self.pos
 
         ad, self._adelta = self._adelta, 0
-        x = ad if abs(ad) >= self.th else 0
+        th, scale = self._adapt(abs(ad)) if self.adaptive else (self.th, self.scale)
+        x = ad if abs(ad) >= th else 0
         self._buf.append(x)
         self._F += x
         if len(self._buf) > self.w:
             self._F -= self._buf.popleft()
 
-        tgt = max(-self.maxp, min(self.maxp, self._F / self.scale))
+        tgt = max(-self.maxp, min(self.maxp, self._F / scale))
         delta = tgt - held
         band = self.add_band if held == 0 else (
             self.add_band if _sign(delta) == _sign(held) else self.hold_band)
