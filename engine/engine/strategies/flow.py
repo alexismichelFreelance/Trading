@@ -69,6 +69,8 @@ class FlowFollowingStrategy(BaseStrategy):
         mean = self._vsum / n
         var = max(0.0, self._vsq / n - mean * mean)
         th = mean + self.adapt_k * (var ** 0.5)
+        if th <= 0.0:                          # dead-quiet window (all-zero flow):
+            return float("inf"), 1.0           # nothing to measure -> emit nothing
         return th, 15.0 * th
 
     def on_trade(self, t: Trade) -> list[Order]:
@@ -113,6 +115,8 @@ class FlowFollowingStrategy(BaseStrategy):
         if len(self._buf) > self.w:
             self._F -= self._buf.popleft()
 
+        if scale <= 0:                            # defensive: never divide by zero
+            return orders
         tgt = max(-self.maxp, min(self.maxp, self._F / scale))
         delta = tgt - held
         band = self.add_band if held == 0 else (

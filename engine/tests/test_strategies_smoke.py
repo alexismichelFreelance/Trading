@@ -30,6 +30,29 @@ def test_flow_session_reset_flattens():
     assert any(o.tag == "session-flat" and o.reduce_only for o in orders)
 
 
+def test_adaptive_flow_survives_dead_tape_then_fires():
+    # REGRESSION (run_live ZeroDivisionError): a dead-quiet 30-min window makes
+    # the adaptive threshold 0 -> scale 0 -> F/scale crashed. Must emit nothing
+    # on dead tape, never crash, and still respond to a genuine surge later.
+    # vol_win must dwarf the surge length (as live: 30min vs ~2min bursts),
+    # else the threshold chases the surge itself and never fires.
+    s = FlowFollowingStrategy("ESM5", maxp=5, adaptive=True, adapt_k=4.0,
+                              vol_win=600, warm=60)
+    # 100 seconds of ZERO flow (no trades at all) -> th<=0 path (the crash)
+    for i in range(100):
+        out = s.on_bookflow(BookFlow(T0 + i * NS, 0, 0, 0, 0))
+        assert out == []                                  # no crash, no orders
+    # mild two-sided tape to establish a small baseline
+    for i in range(100, 300):
+        s.on_trade(Trade(T0 + i * NS, 5000.0, 3, BUY if i % 2 else SELL))
+        s.on_bookflow(BookFlow(T0 + i * NS, 0, 0, 0, 0))
+    orders = []
+    for i in range(300, 360):                             # 60s one-sided surge
+        s.on_trade(Trade(T0 + i * NS, 5000.0 + i * 0.05, 120, BUY))
+        orders += s.on_bookflow(BookFlow(T0 + i * NS, 0, 0, 0, 0))
+    assert any(o.side == 1 for o in orders)               # the surge fires
+
+
 def test_zone_strategy_protocol_and_run():
     s = ZoneLifecycleStrategy("ESM5")
     assert isinstance(s, Strategy)
