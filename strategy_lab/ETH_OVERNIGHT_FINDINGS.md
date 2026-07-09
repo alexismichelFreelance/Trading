@@ -43,6 +43,31 @@ a MINORITY of nights win, top-5 nights = 180-999% of the total. The adaptive thr
 normalise to the thin overnight tape but cannot create signal that isn't there — overnight ES has
 no persistent aggressor-flow edge. **Flow stays RTH-only (`gate_utc=(13,21)`).**
 
+## FULL FAMILY SWEEP (2026-07, user mandate: "try all possibilities") — six families
+**Structure first (user's observation CONFIRMED):** median night range **53pt**, 89% of nights
+≥30pt; Asia hours move 9–17pt/hour on the thinnest volume (6–13k/h). The overnight MOVES.
+**But 30-min return lag-1 autocorrelation = +0.004 — ZERO persistence.** The moves don't follow
+through, which predicts every result below (`strategy_lab/eth_families.py`, `eth_zone_touch.py`):
+
+| family | result (72 nights, cost 0.30/0.60) | verdict |
+|---|---|---|
+| 1. fixed flow th=200 | 2 trades/72 nights | dormant |
+| 2. adaptive z-flow (k=3/4/5, strictly-prior) | +135/−19/+156 @0.60, 3/4 months −, top5 180–999% | mirage |
+| 3. VOLUME-TIME flow (V=300 bars, z-th) | **zero trades ever** — volume-bucketing compresses the fat tail flow feeds on (CLT); the clock-adaptation destroys the signal | structural dead end |
+| 4. Asia-open range breakout (21→00/23 form, trail) | −149 to −306, 35% win-nights, 1/4 months + | fails (no follow-through) |
+| 5. slow momentum (2h lookback, hourly) | −256/−432, 1/4 months + | fails |
+| 6. overnight touches of RTH ZONES (±3 race) | 165 touches: **56% bounce vs 52% baseline** (virgin 55%, Mar 47% < baseline, May-dominated 110/165) | the RTH zone edge (88–93% virgin) DECAYS to ~noise overnight |
+
+**Verdict:** on Feb–May 2025, the overnight has large ranges but **no exploitable structure by
+anything we possess** — no persistence, no breakout follow-through, no flow tail, and even the
+strongest RTH signal (zones) barely beats a coin flip at night. No overnight sleeve ships.
+
+**Open honestly:** the user trades 2026 overnights manually with success. Non-exclusive
+explanations: (a) regime — our sample is crash-quarter 2025; (b) information beyond price/flow
+(news, context, judgment about WHICH level/WHEN) that these mechanical rules don't encode;
+(c) small sample. `claude_bars_live` (RecorderTee) is now accumulating CURRENT-regime full-session
+bars → **re-run families 4/5/6 on 2026 nights in a few weeks** — the decisive retest.
+
 ## What the ETH data IS good for (next uses)
 1. **Context features for RTH sleeves** — overnight range/gap/drift as inputs to the day book
    (e.g., condition open-drive on the overnight range; Asian/London-window ranges are now
