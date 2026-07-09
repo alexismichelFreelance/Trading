@@ -27,6 +27,22 @@ honest costs — three of four months negative, the entire total from ~5 May new
 (the other 67 nights net −1,030pt). Textbook mirage via oversizing into outlier nights, and
 the TH/SCALE rescale was itself a calibration (multiplicity). Gate stays.
 
+## RETEST with ADAPTIVE (scale-invariant) flow (2026-07) — still NO
+After building the z-score adaptive threshold (`th_t = mean + k·std` of |adelta|, which fires on
+any distribution), re-ran flow on the 72 ETH sessions — the middle path the original study lacked
+(fixed th=200 dormant, hand-picked th=20 a mirage). It now TRADES overnight, but has NO robust
+edge (`strategy_lab/eth_adaptive_flow.py`), at cost 0.60:
+| k | net | winning nights | top-5 nights % of total | all-months+ |
+|---|---|---|---|---|
+| 3 | +135 | 49% | +460% | no (only May +) |
+| 4 | −19 | 36% | +999% | no |
+| 5 | +156 | 14% | +184% | no (only May +) |
+
+Same mirage signature as the fixed rescale: 3/4 months NEGATIVE (all "profit" is one month, May),
+a MINORITY of nights win, top-5 nights = 180-999% of the total. The adaptive threshold can
+normalise to the thin overnight tape but cannot create signal that isn't there — overnight ES has
+no persistent aggressor-flow edge. **Flow stays RTH-only (`gate_utc=(13,21)`).**
+
 ## What the ETH data IS good for (next uses)
 1. **Context features for RTH sleeves** — overnight range/gap/drift as inputs to the day book
    (e.g., condition open-drive on the overnight range; Asian/London-window ranges are now
