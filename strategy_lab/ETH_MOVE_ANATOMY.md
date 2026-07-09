@@ -46,3 +46,30 @@ goes one level down. No strategy until the mechanism is seen.
 
 Scripts: `strategy_lab/move_anatomy.py` (catalog), `anatomy_checks.py` (baselines),
 `tools/build_eth_book.py` (data). Catalog: `strategy_lab/eth_move_catalog.csv`.
+
+## L3 TOP-OF-BOOK RECONSTRUCTION — first pass (2026-07)
+Built the full L3 replayer (`strategy_lab/l3_touch.py`): replays raw MBO A/C/M/F events
+(2–6.4M/night), maintains per-side price-level aggregates + best bid/ask, and classifies every
+CLEAR of the best level by terminal event — **filled (eaten) vs cancelled (abandoned) vs
+repriced**. Validated: correct session spans, 48k–193k classified clears/night, phantom-removal
+rate ~7% (empty-book bootstrap at 21:00, no snapshots in our MBO; touch state populates fast).
+Case-control: catalogued move-starts vs random quiet controls, 4 nights (calm/median/news).
+
+**Pooled first-pass "findings" — BOTH DIED in the within-night confound check:**
+| pooled (seductive) | per-night (true) |
+|---|---|
+| depth@best at move-start 2 vs 8 quiet ("thin touch precedes moves!") | 03-07: 8v7 · 03-11: 6v4 (case THICKER) · 05-19: 9v13 · 04-09: no controls exist |
+| pre-move cancel-clears 148 vs 89 ("abandonment spikes before moves!") | 98v116 / 199v100 / 61v85 — inconsistent |
+
+The pooled effects were **Simpson's paradox via night mix**: 281 of 349 cases came from the
+2025-04-09 news night (thin book ALL night, zero quiet controls), controls from calm nights.
+Within nights, move-starts are NOT distinguishable from quiet moments by touch depth or clear
+composition at 1s resolution — on this 4-night design.
+
+**Design lessons for pass 2:** (a) within-night controls ONLY, hour-matched; (b) scale to all 72
+nights (news nights analyzed separately or dropped); (c) the zigzag pivot is a coarse anchor —
+initiation should be re-anchored in event time (first tick of the run). The microscope works;
+the first 4-night sample answered "nothing at this resolution/design," not "nothing exists."
+
+Session tally of candidate discoveries killed by verification: **four** (gross withdrawal ratio,
+level pull, thin-touch precursor, abandonment spike). This is the observation discipline working.
