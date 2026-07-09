@@ -78,6 +78,25 @@ def test_detect_demand_zone():
     assert z.departure_score == 2 and z.base_score == 2
 
 
+def test_detector_output_feeds_zonebook_by_iteration():
+    # REGRESSION (run_live break 2026-07): ZoneDetector.update() returns a LIST;
+    # callers feeding a ZoneBook must ITERATE. Adding the list itself made
+    # ZoneBook.on_bar crash on `z.broken` (ignition / ignition_oracle path).
+    det = ZoneDetector(gap_thr=0)
+    book = ZoneBook()
+    for i in range(20):
+        for z in det.update(_bar(i, 5000, 5001, 4999, 5000, 100)):
+            book.add(z)
+    for i in (20, 21):
+        for z in det.update(_bar(i, 5000, 5000.3, 4999.7, 5000, 80)):
+            book.add(z)
+    for z in det.update(_bar(22, 5000.0, 5005.0, 5000.0, 5004.0, 200)):
+        book.add(z)
+    assert len(book.zones) == 1 and all(isinstance(z, Zone) for z in book.zones)
+    book.on_bar(_bar(23, 5004, 5006, 4990, 4991, 100))       # must not raise
+    assert book.zones[0].broken                              # closed below the zone
+
+
 def test_zone_lifecycle_touch_break_flip():
     book = ZoneBook()
     z = Zone(0, 5000.3, 4999.7, DEMAND, 2, 2)

@@ -93,8 +93,7 @@ class IgnitionStrategy(BaseStrategy):
         self.levels.update_bar(bar)
         for hb in self.agg.update(bar):
             if hb.tf == "30m":
-                z = self.zdet.update(hb)
-                if z is not None:
+                for z in self.zdet.update(hb):     # update() returns a list of zones
                     self.zbook.add(z)
                 self.zbook.on_bar(hb)
             elif hb.tf == "1h" and self.regime_states is None:

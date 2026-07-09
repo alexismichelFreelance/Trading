@@ -39,8 +39,7 @@ def _zones(q: QuestDB, sym: str):
     det, book = ZoneDetector(), ZoneBook()
     for r in df.itertuples():
         bar = Bar(int(r.ts.value) + 30 * 60 * NS, "30m", r.o, r.h, r.l, r.c, int(r.v))
-        z = det.update(bar)
-        if z is not None:
+        for z in det.update(bar):          # update() returns a list of zones
             book.add(z)
         book.on_bar(bar)
     return book.zones
