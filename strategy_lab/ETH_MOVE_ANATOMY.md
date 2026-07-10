@@ -97,7 +97,35 @@ is **instability of the quote layer** (cancel-led repricing at the front), not d
 aggressor pressure. DUR-window composition: the receding front is more often *abandoned* than
 *eaten* even as the move runs. This is the first candidate that survived the within-night design.
 
-**Standing confound (named, untested): activity clustering.** Controls are hour-matched QUIET
+## PASS 3 — the confound test: the churn precursor is DEAD (2026-07)
+Activity-matched controls (per case: the same-night quiet moments with the CLOSEST recent
+event-rate; match quality excellent — median rate error 2%), timing curve in 30s bins, and
+side-specificity (`l3_pass3.py`/`l3_pass3_agg.py`, 2,282 cases / 4,531 controls, all 72 nights):
+
+| question | result | verdict |
+|---|---|---|
+| Q1 pre-liftoff cancel-clears vs activity-matched controls | **−12.0** (27/67 nights+, ns) | the +14.5 excess REVERSES — it was activity clustering |
+| Q1 pre-liftoff fill-clears | −13.0 (17/67, p≈0.000 — FEWER) | see artifact note below |
+| Q2 timing curve (10×30s bins) | controls ABOVE cases in every bin; both ramp with activity | no move-specific build-up |
+| Q3 receding−advancing side churn | median 0.0 within-case; night-level −4.5 (18/60+, p≈0.003 NEGATIVE) | no directional tell; the sign reflects the PRIOR leg's mechanics |
+
+(The Q1 fill-clear "inversion" — busy-but-quiet moments have MORE front consumption than
+pre-move moments — is likely a composition artifact: controls were matched on TOTAL event rate,
+not on trade/quote mix. Not claimed.)
+
+**Campaign conclusion (Feb–May 2025 data, all resolutions tried):** overnight ES ≥8pt moves have
+**no detectable endogenous precursor** in gross flow, aggressor imbalance, toolkit levels, touch
+depth, best-level clear composition, or side-specific churn — at 1-second and L3-event
+resolution, under within-night and activity-matched designs. Moves cluster in busy tape; given
+equal busyness, the moments before a move look like any other busy moment. The most consistent
+reading: overnight initiations are **exogenous arrivals** (news / cross-market impulses — Nikkei,
+USDJPY, bonds — which this tape only sees as their ES shadow) hitting a book that churns
+identically at all times. The remaining honest paths: (a) 2026-regime retest on recorder data,
+(b) cross-market inputs as conditioning features, (c) sub-second event-sequencing (the one
+unexplored resolution). Verification tally for the campaign: **five** candidate discoveries
+killed before reaching a trading decision.
+
+**Standing confound (named, untested — RESOLVED by pass 3 above): activity clustering.** Controls are hour-matched QUIET
 moments; cases sit amid action (the PRE window overlaps the preceding opposite leg). "Elevated
 churn near moves" may partly restate "moves cluster in locally-active periods." To claim a
 PRECURSOR, pass 3 must use **activity-matched controls** (same recent event-rate, no subsequent
