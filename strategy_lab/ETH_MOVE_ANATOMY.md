@@ -73,3 +73,34 @@ the first 4-night sample answered "nothing at this resolution/design," not "noth
 
 Session tally of candidate discoveries killed by verification: **four** (gross withdrawal ratio,
 level pull, thin-touch precursor, abandonment spike). This is the observation discipline working.
+
+## PASS 2 — all 72 nights, within-night controls, liftoff anchoring (2026-07)
+Full-population replay (~350M events, per-night checkpoints, 0 failures): 2,282 liftoff-anchored
+cases vs 4,531 within-night hour-matched controls (fallback chain when the hour is blocked).
+Night-level paired deltas + sign tests across nights (`l3_pass2.py` / `l3_pass2_agg.py`):
+
+| metric (per window, receding side) | median night-delta (case−ctrl) | nights positive | p (sign) |
+|---|---|---|---|
+| PRE cancel-clears [−300,0) | **+14.5** | **43/65** | **~0.01** |
+| PRE fill-clears | +10.0 | 40/67 | 0.14 (ns) |
+| DUR cancel-clears [0,+120) | +17.0 | 49/67 | ~0.00 |
+| DUR fill-clears | +13.0 | 46/67 | ~0.00 |
+| depth@liftoff | **+0.8 (THICKER)** | 39/55 | ~0.00 |
+| within-case depth Δ (0 vs −300s) | 0.0 | — | — |
+
+**The surviving observation:** overnight moves emerge from **front-of-book CHURN, not thinness.**
+In the 5 minutes before liftoff, receding-side best-level **abandonment (cancel-clears) is
+elevated ~15% (significant across nights) while consumption is NOT** (fills ns pre-move); during
+the move both rise (partly mechanical — an 8pt move ≥32 best-clears by definition), cancels
+leading. Depth at best is NOT reduced — marginally thicker. The touch signature near initiations
+is **instability of the quote layer** (cancel-led repricing at the front), not depletion, and not
+aggressor pressure. DUR-window composition: the receding front is more often *abandoned* than
+*eaten* even as the move runs. This is the first candidate that survived the within-night design.
+
+**Standing confound (named, untested): activity clustering.** Controls are hour-matched QUIET
+moments; cases sit amid action (the PRE window overlaps the preceding opposite leg). "Elevated
+churn near moves" may partly restate "moves cluster in locally-active periods." To claim a
+PRECURSOR, pass 3 must use **activity-matched controls** (same recent event-rate, no subsequent
+move) + a timing curve (when does the elevation start, in 30s bins?) + side-specificity (does
+ASK-front churn precede UP moves specifically = directional information, or is it symmetric?).
+No trading claims until then.
