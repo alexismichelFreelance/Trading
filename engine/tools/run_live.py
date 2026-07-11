@@ -163,6 +163,11 @@ async def main() -> None:
                     help="allocate by dealer-gamma regime: trend sleeves (ignition/opendrive/"
                          "flow) take entries only on short-gamma days (gexp_prev<=1/3); "
                          "zones/ibs always on. Validated on 2025 (gamma/GEX_FINDINGS.md D).")
+    ap.add_argument("--gex-levels", action="store_true",
+                    help="draw prior-session gamma strikes (put wall/call wall/flip) as S/R "
+                         "lines on the chart (claude_gex_levels, CBOE true-OI).")
+    ap.add_argument("--gex-basis", type=float, default=52.0,
+                    help="SPX->ES basis added to gamma strikes (measured ~+52pt; recalibrate)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -220,6 +225,23 @@ async def main() -> None:
             eng.on_bar_hook = pc.on_bar
             eng.on_warmup_signal = pc.ghost_one      # paint ghosts as backfill replays
             print("chart painting ON (30m/1h/4h/1d zones, S/R bracket, signals, panel)")
+            if a.gex_levels:
+                from datetime import datetime, timezone
+
+                from engine.features.gamma_levels import GammaLevels
+                try:
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    lv = GammaLevels().levels_prev(today, basis=a.gex_basis)
+                    if lv:
+                        pc.set_gamma_levels(lv)
+                        print(f"gamma S/R levels ON ({lv['sess']}, +{a.gex_basis:.0f} ES basis): "
+                              f"putW {lv['put_wall']:.0f}  callW {lv['call_wall']:.0f}  "
+                              f"flip {lv['flip'] and round(lv['flip'])}  "
+                              f"{'long' if lv['net_sign']>0 else 'SHORT'}-gamma")
+                    else:
+                        print("  (no prior gamma-levels row; run tools/fetch_cboe_gex.py)")
+                except Exception as ex:                  # noqa: BLE001
+                    print(f"  (gamma levels disabled: {ex})")
 
     mode = "OBSERVE" if not names else "TRADE(" + ",".join(names) + ")"
     print(f"live session [{mode}] market:{a.market_port} broker:{a.broker_port} "

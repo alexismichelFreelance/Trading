@@ -34,6 +34,9 @@ ZONE_DEMAND = "#FF32CD32"
 ZONE_SUPPLY = "#FFFF4040"
 RES_LINE = "#FFFF4040"       # resistance (supply above)
 SUP_LINE = "#FF32CD32"       # support (demand below)
+GEX_PUT = "#FF1E90FF"        # put wall  (gamma support)  — dodger blue
+GEX_CALL = "#FFFFA500"       # call wall (gamma resistance) — orange
+GEX_FLIP = "#FFBA90E0"       # zero-gamma flip (regime divider) — violet
 
 # timeframes shown, low->high. Higher TF = more opaque (more significant).
 TF_ORDER = ("30m", "1h", "4h", "1d")
@@ -105,6 +108,7 @@ class PaintController:
         self._zone_state: dict[str, object] = {}
         self._last_px = 0.0
         self._warm_n = 0
+        self._gamma: dict | None = None       # prior-session gamma levels (ES terms)
 
     # ── signals ───────────────────────────────────────────────────────────
     async def ghost_one(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:
@@ -141,6 +145,7 @@ class PaintController:
         if live:
             await self._paint_zones(bar.ts)
             await self._paint_bracket(bar.c)
+            await self._paint_gamma(bar.ts)
             await self._paint_risk()
             await self._paint_status(True, backfill_bars, bar.c)
         else:
@@ -185,6 +190,23 @@ class PaintController:
             await self.p.hline("eng-sup", sup[1].proximal(), color=SUP_LINE)
         else:
             await self.p.remove("eng-sup")
+
+    def set_gamma_levels(self, levels: dict | None) -> None:
+        """Store prior-session gamma levels (ES terms) to draw as S/R lines."""
+        self._gamma = levels
+
+    async def _paint_gamma(self, now_ts: int) -> None:
+        g = self._gamma
+        if not g:
+            return
+        reg = "long-gamma" if g["net_sign"] > 0 else "SHORT-gamma"
+        rows = [("eng-gex-pw", g["put_wall"], GEX_PUT, "put wall"),
+                ("eng-gex-cw", g["call_wall"], GEX_CALL, "call wall")]
+        if g.get("flip") is not None:
+            rows.append(("eng-gex-flip", g["flip"], GEX_FLIP, f"gamma flip ({reg})"))
+        for tag, px, color, label in rows:
+            await self.p.hline(tag, round(px * 4) / 4, color=color)
+            await self.p.text(tag + "-t", now_ts, px, label, color=color)
 
     async def _paint_risk(self) -> None:
         for s in self.strategies:
