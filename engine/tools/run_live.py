@@ -127,6 +127,12 @@ def build(names: list[str], flow_th: int = 30):
         elif n == "ibs":
             from engine.strategies.ibs_swing import IBSSwingStrategy
             out.append(IBSSwingStrategy(SYMBOL))
+        elif n == "dipbuy":
+            # long-gamma mean-reversion sleeve (user-modeled). Gate to gexp_prev>1/3
+            # via --gex-gate; NOT yet a validated edge (rides the late-Aug forward
+            # test). See engine/strategies/dip_buy.py, strategy_lab/DAY_SELECTION.md.
+            from engine.strategies.dip_buy import DipBuyStrategy
+            out.append(DipBuyStrategy(SYMBOL))
         else:
             raise SystemExit(f"unknown strategy '{n}'")
     return out

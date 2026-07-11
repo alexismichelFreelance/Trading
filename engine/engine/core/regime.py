@@ -24,6 +24,8 @@ log = logging.getLogger("engine.regime")
 
 # the trend sleeves this gate applies to (class names)
 TREND_SLEEVES = ("IgnitionStrategy", "OpenDriveStrategy", "FlowFollowingStrategy")
+# mean-reversion sleeves — the EXACT complement: on when trend is off
+MR_SLEEVES = ("DipBuyStrategy",)
 
 
 def increases_exposure(base: int, side: int, qty: int) -> bool:
@@ -32,18 +34,22 @@ def increases_exposure(base: int, side: int, qty: int) -> bool:
 
 
 class RegimeGate:
-    def __init__(self, gamma, trend_sleeves=TREND_SLEEVES,
+    def __init__(self, gamma, trend_sleeves=TREND_SLEEVES, mr_sleeves=MR_SLEEVES,
                  max_pctl: float = 1.0 / 3.0, enabled: bool = True) -> None:
         self.gamma = gamma                       # GammaRegime | None
         self.trend = set(trend_sleeves)
-        self.max_pctl = max_pctl
+        self.mr = set(mr_sleeves)
+        self.max_pctl = max_pctl                 # gexp_prev threshold; trend<=, MR>
         self.enabled = enabled
         self._logged_days: set[str] = set()      # log the day's regime once
 
     def blocks(self, name: str, base: int, side: int, qty: int, ts: int) -> bool:
-        """True -> suppress this order (a trend-sleeve entry on a non-short-gamma
-        day). Exits/reduces and non-trend sleeves are never blocked."""
-        if not self.enabled or name not in self.trend:
+        """True -> suppress this ENTRY. Trend sleeves are blocked on non-short-gamma
+        days; mean-reversion sleeves are blocked on short-gamma days (the exact
+        complement). Exits/reduces and ungated sleeves are never blocked; fail-open
+        on unknown regime."""
+        is_trend, is_mr = name in self.trend, name in self.mr
+        if not self.enabled or not (is_trend or is_mr):
             return False
         if not increases_exposure(base, side, qty):
             return False                          # exits always allowed
@@ -56,9 +62,12 @@ class RegimeGate:
             v = self.gamma.gexp_prev(day)
             log.info("regime %s: gexp_prev=%s -> %s", day,
                      "n/a" if v is None else f"{v:.2f}",
-                     "unknown (allow)" if sg is None else
-                     ("SHORT-gamma (trend ON)" if sg else "long/mid-gamma (trend OFF)"))
-        return sg is False                        # block only when KNOWN non-short
+                     "unknown (allow all)" if sg is None else
+                     ("SHORT-gamma (trend ON / dip-buy OFF)" if sg
+                      else "mid/long-gamma (trend OFF / dip-buy ON)"))
+        if sg is None:
+            return False                          # unknown -> allow
+        return (sg is False) if is_trend else (sg is True)
 
 
-__all__ = ["RegimeGate", "TREND_SLEEVES", "increases_exposure"]
+__all__ = ["RegimeGate", "TREND_SLEEVES", "MR_SLEEVES", "increases_exposure"]

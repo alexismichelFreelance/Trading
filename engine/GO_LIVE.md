@@ -16,6 +16,9 @@ cd D:/Trading/engine
 - `--strategies zones` — start with the sleeve that matches the user's regime
   (long-gamma mean reversion). Add `ignition,opendrive` once the GEX gate has a
   live track record; they are trend sleeves and only fire on short-gamma days.
+  `dipbuy` (the user-modeled mean-reversion sleeve, DIP_BUY_SLEEVE.md) is built
+  and anchor-tested but stays OFF until the late-Aug forward test validates it;
+  when added it is auto-gated to gexp_prev>1/3 by --gex-gate.
 - `--gex-gate` — trend sleeves take entries only when gexp_prev<=1/3 (validated).
 - `--gex-levels` — draw put wall / call wall / flip as S/R lines (eyeball the
   put-wall line vs price on the first session; recalibrate `--gex-basis` if off).

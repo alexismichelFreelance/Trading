@@ -46,10 +46,14 @@ calmer prior sessions (gap +3.9, prior|ret| 35.9) vs stand-down days (gap −4.5
 prior|ret| 44.0).
 
 ## Pre-registered selection rule for the dip-buy sleeve (task 26)
-Causal (all knowable pre-open), the mirror of the validated trend gate:
-1. **Engage in long-gamma: gexp_prev ≥ 2/3** (the user's proven press zone). Skip
-   short-gamma (gexp_prev ≤ 1/3) entirely — that is their stand-down regime and
-   the sleeve's tail-risk regime.
+Causal (all knowable pre-open), the exact **complement** of the validated trend
+gate:
+1. **Engage when gexp_prev > 1/3 (mid + long gamma); skip short-gamma
+   (gexp_prev ≤ 1/3).** The user engages across mid AND high gamma (median 11 and
+   13 early fills) and stands down only in short-gamma (median 2). So the gate is
+   the mirror of the trend gate (trend ON ≤ 1/3, dip-buy ON > 1/3), not a
+   high-only gate — and it catches both anchor days (2026-07-08 gexp 0.37,
+   2026-07-10 gexp 0.61, both mid).
 2. **Cap aggression** — model the "mid AM" band, not "heavy"; over-sizing is where
    the left tail lives. A hard per-day size cap, not a conviction ramp.
 3. **Optional damp after big prior moves** (prior|ret| high) — a secondary
