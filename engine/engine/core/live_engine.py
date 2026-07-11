@@ -20,6 +20,7 @@ import logging
 from .blotter import Blotter
 from .dispatch import dispatch_broker, dispatch_market
 from .events import Bar, Fill, PositionUpdate, Trade
+from .regime import RegimeGate
 from .risk import RiskSupervisor
 
 log = logging.getLogger("engine.live")
@@ -34,7 +35,8 @@ def _sign(x: int) -> int:
 class LiveEngine:
     def __init__(self, feed, broker, strategies, clock, blotter: Blotter,
                  reconnect_delay: float = 1.0, drain_timeout: float = 0.5,
-                 warmup_gate: bool = True, risk: RiskSupervisor | None = None) -> None:
+                 warmup_gate: bool = True, risk: RiskSupervisor | None = None,
+                 regime: RegimeGate | None = None) -> None:
         self.feed = feed
         self.broker = broker
         self.strategies = list(strategies)
@@ -77,6 +79,8 @@ class LiveEngine:
         # every production limit OFF, but in-flight-aware reduce_only vetting
         # is always on — that closed the 2026-07-09 duplicate-flatten bug.
         self.risk = risk if risk is not None else RiskSupervisor()
+        # allocation gate (dealer-gamma regime). Default OFF (None) -> no gating.
+        self.regime = regime
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
 
@@ -178,6 +182,10 @@ class LiveEngine:
                     for s in self.strategies:            # per-strategy: orders are OWNED
                         for o in dispatch_market([s], ev):
                             if self._live:
+                                if self.regime is not None and self.regime.blocks(
+                                        type(s).__name__, self._spos.get(id(s), 0),
+                                        o.side, o.qty, ev.ts):
+                                    continue         # trend sleeve off this regime
                                 o = self._vet(s, o, ev.ts)
                                 if o is None:
                                     continue

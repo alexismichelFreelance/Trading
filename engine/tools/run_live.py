@@ -159,6 +159,10 @@ async def main() -> None:
                     help="risk: daily marked-loss kill switch in USD (default -5000)")
     ap.add_argument("--no-risk", action="store_true",
                     help="DANGER: disable production risk limits (in-flight vetting stays on)")
+    ap.add_argument("--gex-gate", action="store_true",
+                    help="allocate by dealer-gamma regime: trend sleeves (ignition/opendrive/"
+                         "flow) take entries only on short-gamma days (gexp_prev<=1/3); "
+                         "zones/ibs always on. Validated on 2025 (gamma/GEX_FINDINGS.md D).")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -190,8 +194,18 @@ async def main() -> None:
         print(f"risk: sleeve cap {a.max_sleeve}, gross cap {a.max_gross}, "
               f"4 orders/5s, halt at ${a.risk_halt:+,.0f}, "
               f"entry lockout 15:45 ET, EOD flatten 15:58 ET")
+    regime = None
+    if a.gex_gate:
+        from engine.core.regime import RegimeGate
+        from engine.features.gamma import GammaRegime
+        try:
+            regime = RegimeGate(GammaRegime())
+            print("GEX allocation gate ON: trend sleeves only in short-gamma "
+                  "(gexp_prev<=1/3); zones/ibs always on")
+        except Exception as ex:                      # noqa: BLE001
+            print(f"  (GEX gate disabled: {ex})")
     eng = LiveEngine(feed, broker, strategies, WallClock(), blot,
-                     warmup_gate=not a.no_warmup_gate, risk=risk)
+                     warmup_gate=not a.no_warmup_gate, risk=risk, regime=regime)
 
     painter = NTChartPainter("127.0.0.1", a.broker_port)
     pc: PaintController | None = None

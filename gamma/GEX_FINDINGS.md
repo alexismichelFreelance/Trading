@@ -54,6 +54,16 @@ On this window the rule is a **drawdown reducer, not a P&L adder**; its expected
 larger out-of-window: in a long calm (high-GEX) regime it keeps the trend sleeves from
 bleeding through months of chop (their known failure mode).
 
+### D.1 Wired live + replay-verified (2026-07-11)
+The rule is now a live allocation gate — `engine/core/regime.py` `RegimeGate`, consulted by
+`LiveEngine` before risk vetting, built by `run_live.py --gex-gate` from the causal
+`GammaRegime`. It suppresses only trend-sleeve ENTRIES on known long/mid-gamma days; exits,
+reduces, zones and IBS always pass; fail-open on unknown regime. `portfolio_report.py
+--gex-gate` reproduces this table from fresh 65-day replay dumps: 43 short-gamma days (trend
+ON) / 22 long-mid (trend OFF); **gated $79,806 (96% of ungated $82,720) at maxDD $-15,744
+(-27%)** — matching the row above to the dollar on drawdown. 8 gate unit tests; replay/parity
+paths are ungated (gate defaults OFF), so all 12 parity gates stay pinned.
+
 ## E. DIX bonus (noted, NOT wired)
 High prev-day DIX tercile → next-day ES +17.4pt mean, 60% up (LOW/MID negative). The
 documented dark-pool drift, present here — a possible future long-bias overlay, but 70 days
