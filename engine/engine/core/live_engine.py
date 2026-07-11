@@ -20,6 +20,7 @@ import logging
 from .blotter import Blotter
 from .dispatch import dispatch_broker, dispatch_market
 from .events import Bar, Fill, PositionUpdate, Trade
+from .risk import RiskSupervisor
 
 log = logging.getLogger("engine.live")
 
@@ -33,7 +34,7 @@ def _sign(x: int) -> int:
 class LiveEngine:
     def __init__(self, feed, broker, strategies, clock, blotter: Blotter,
                  reconnect_delay: float = 1.0, drain_timeout: float = 0.5,
-                 warmup_gate: bool = True) -> None:
+                 warmup_gate: bool = True, risk: RiskSupervisor | None = None) -> None:
         self.feed = feed
         self.broker = broker
         self.strategies = list(strategies)
@@ -72,6 +73,10 @@ class LiveEngine:
         self._owner: dict[str, object] = {}         # order_id -> strategy
         self._spos: dict[int, int] = {}              # id(strategy) -> signed qty
         self._savg: dict[int, float] = {}            # id(strategy) -> avg px
+        # central risk supervisor (see core/risk.py). The default config has
+        # every production limit OFF, but in-flight-aware reduce_only vetting
+        # is always on — that closed the 2026-07-09 duplicate-flatten bug.
+        self.risk = risk if risk is not None else RiskSupervisor()
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
 
@@ -81,19 +86,18 @@ class LiveEngine:
     def strategy_position(self, s) -> int:
         return self._spos.get(id(s), 0)
 
-    def _vet(self, s, o):
-        """Enforce reduce_only against the OWNER's attributed position."""
-        if not o.reduce_only:
-            return o
-        pos = self._spos.get(id(s), 0)
-        if pos == 0 or _sign(o.side) == _sign(pos):
-            log.info("dropped reduce_only %s from %s (own pos %d)",
-                     o.tag, type(s).__name__, pos)
-            return None
-        if o.qty > abs(pos):
-            import dataclasses
-            o = dataclasses.replace(o, qty=abs(pos))
-        return o
+    def _vet(self, s, o, ts):
+        """All order safety is delegated to the RiskSupervisor: reduce_only
+        against the owner's attributed book (in-flight aware), caps, rate
+        limits, lockouts, halt."""
+        return self.risk.vet(id(s), type(s).__name__, o, ts,
+                             self._spos.get(id(s), 0))
+
+    async def _submit_owned(self, s, o) -> None:
+        self._owner[o.order_id] = s
+        self.blotter.on_order(o)
+        await self.broker.submit(o)
+        self.risk.on_submit(id(s), o)
 
     def _attribute_fill(self, f: Fill) -> None:
         s = self._owner.get(f.order_id)
@@ -101,6 +105,7 @@ class LiveEngine:
             log.info("unattributed fill (manual/external): %s", f)
             return
         pid = id(s)
+        self.risk.on_fill(pid, f.order_id, f.size, f.price)
         old = self._spos.get(pid, 0)
         new = old + f.size
         if old == 0 or _sign(new) != _sign(old):
@@ -173,12 +178,10 @@ class LiveEngine:
                     for s in self.strategies:            # per-strategy: orders are OWNED
                         for o in dispatch_market([s], ev):
                             if self._live:
-                                o = self._vet(s, o)
+                                o = self._vet(s, o, ev.ts)
                                 if o is None:
                                     continue
-                                self._owner[o.order_id] = s
-                                self.blotter.on_order(o)
-                                await self.broker.submit(o)
+                                await self._submit_owned(s, o)
                                 if self.on_live_order is not None:
                                     await self.on_live_order(ev.ts, o.side, o.qty,
                                                              o.tag, self.last_px)
@@ -188,6 +191,12 @@ class LiveEngine:
                                 self.warmup_signals.append(sig)
                                 if self.on_warmup_signal is not None:
                                     await self.on_warmup_signal(*sig)   # ghost now
+                    if self._live:                       # supervisor-owned actions
+                        books = [(id(s), type(s).__name__, s.symbol,
+                                  self._spos.get(id(s), 0)) for s in self.strategies]
+                        for sid, o in self.risk.on_market(ev.ts, self.last_px, books):
+                            owner = next(s for s in self.strategies if id(s) == sid)
+                            await self._submit_owned(owner, o)
                     if isinstance(ev, Bar) and self.on_bar_hook is not None:
                         await self.on_bar_hook(ev, self._live, self._backfill_bars)
                     self.blotter.on_market_event(ev)

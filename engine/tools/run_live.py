@@ -31,6 +31,7 @@ from engine.core.blotter import Blotter                             # noqa: E402
 from engine.core.clock import WallClock                             # noqa: E402
 from engine.core.events import Bar, BookFlow, Trade                 # noqa: E402
 from engine.core.live_engine import LiveEngine                      # noqa: E402
+from engine.core.risk import RiskConfig, RiskSupervisor             # noqa: E402
 from engine.painters import PaintController                         # noqa: E402
 
 HMM_PATH = str(ROOT / "config" / "hmm_es_1h.json")
@@ -150,6 +151,14 @@ async def main() -> None:
     ap.add_argument("--flow-th", type=int, default=30,
                     help="flow threshold for THIS feed (validated=200 but the live feed's "
                          "|adelta| tops ~66; default 30 lets flow respond here)")
+    ap.add_argument("--max-sleeve", type=int, default=10,
+                    help="risk: cap on any sleeve's |position| (default 10)")
+    ap.add_argument("--max-gross", type=int, default=15,
+                    help="risk: cap on account gross exposure across sleeves (default 15)")
+    ap.add_argument("--risk-halt", type=float, default=-5000.0,
+                    help="risk: daily marked-loss kill switch in USD (default -5000)")
+    ap.add_argument("--no-risk", action="store_true",
+                    help="DANGER: disable production risk limits (in-flight vetting stays on)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -166,8 +175,23 @@ async def main() -> None:
         print("recording 1m bars -> QuestDB claude_bars_live")
     broker = NinjaTraderBroker("127.0.0.1", a.broker_port, symbol=SYMBOL)
     blot = Blotter(SYMBOL, 50.0, verbose=True)
+    # production risk config (the 2026-07-09 burst fixes). IBS carries positions
+    # overnight by design, so EOD flatten stays compatible only because IBS
+    # isn't in the default live set; revisit eod_flatten_et before enabling it.
+    if a.no_risk:
+        risk = RiskSupervisor(RiskConfig())
+        print("risk: PRODUCTION LIMITS OFF (--no-risk); in-flight vetting only")
+    else:
+        risk = RiskSupervisor(RiskConfig(
+            max_pos_per_sleeve=a.max_sleeve, max_account_gross=a.max_gross,
+            rate_max_orders=4, rate_window_s=5.0,
+            daily_loss_halt=a.risk_halt,
+            entry_lockout_et=(15, 45), eod_flatten_et=(15, 58)))
+        print(f"risk: sleeve cap {a.max_sleeve}, gross cap {a.max_gross}, "
+              f"4 orders/5s, halt at ${a.risk_halt:+,.0f}, "
+              f"entry lockout 15:45 ET, EOD flatten 15:58 ET")
     eng = LiveEngine(feed, broker, strategies, WallClock(), blot,
-                     warmup_gate=not a.no_warmup_gate)
+                     warmup_gate=not a.no_warmup_gate, risk=risk)
 
     painter = NTChartPainter("127.0.0.1", a.broker_port)
     pc: PaintController | None = None
