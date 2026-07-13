@@ -29,6 +29,19 @@ cd D:/Trading/engine
 Pre-market: run `tools/fetch_cboe_gex.py` (or the scheduled task) so the day's
 gamma levels + regime are current.
 
+## Watch the dip-buy sleeve in sim
+To SEE the user-modeled mean-reversion sleeve trade (paper only — its P&L is not
+yet validated, see DIP_BUY_SLEEVE.md):
+```
+# first look — UNGATED so it fires regardless of today's regime:
+.venv/Scripts/python.exe tools/run_live.py --strategies zones,dipbuy --gex-levels --record
+# real behavior — gated to gexp_prev>1/3 (stands down on short-gamma days):
+.venv/Scripts/python.exe tools/run_live.py --strategies zones,dipbuy --gex-gate --gex-levels --record
+```
+Its entries/exits paint as arrows tagged `dipA/dipB-entry`, `dip-scale`,
+`dip-vwap`, `dip-stop`; the panel shows its position. Preview on recorded bars:
+`strategy_lab/dipbuy_preview.py` (14 trades, mechanism looks like the user's).
+
 ## Nightly scorecard
 ```
 .venv/Scripts/python.exe tools/scorecard.py --days 20
