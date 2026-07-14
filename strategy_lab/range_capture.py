@@ -136,10 +136,12 @@ def report(tag, R):
           f"trades/day median {int(R.ntr.median())}")
 
 
-def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0):
+def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False):
     """The user's SCALING fade: add a unit every add_step against you (up to maxu),
     cover ALL at VWAP; catastrophe-exit if price runs `cat` beyond the first entry.
-    Per-unit capture (avg entry vs cover) so it's 1-lot-comparable to run()."""
+    Per-unit capture (avg entry vs cover) so it's 1-lot-comparable to run().
+    dir_gate: use the first-60m VWAP side (which persists, +0.45 corr) to block
+    LONG fades on below-VWAP days and SHORT fades on above-VWAP days."""
     days = sorted(df.day.unique()); prev = None; week = []; rows = []
     for d in days:
         g = df[df.day == d].sort_values("mod")
@@ -164,6 +166,13 @@ def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0):
         def near(px, arr):
             return len(arr) and np.min(np.abs(arr - px)) <= TOL
 
+        # first-60m VWAP side (causal, known by 10:30 ET): it persists, so it says
+        # whether VWAP is support (price above -> buy dips) or resistance (below).
+        em = mod < 630
+        e_below = float(np.mean(c[em] < vwap[em])) if em.any() else 0.5
+        allow_long = (not dir_gate) or e_below <= 0.65      # block longs on down-days
+        allow_short = (not dir_gate) or e_below >= 0.35      # block shorts on up-days
+
         pos = 0; avg = 0.0; units = 0; first = 0.0; nextadd = 0.0; captured = 0.0; ntr = 0
         i = 30
         while i < len(g):
@@ -173,9 +182,9 @@ def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0):
                 break
             if pos == 0:
                 up = vwap[i] + 2 * sd[i]; dn = vwap[i] - 2 * sd[i]
-                if h[i] >= up and (near(up, res) or near(h[i], res)):
+                if allow_short and h[i] >= up and (near(up, res) or near(h[i], res)):
                     pos = -1; avg = up; units = 1; first = up; nextadd = up + add_step
-                elif l[i] <= dn and (near(dn, sup) or near(l[i], sup)):
+                elif allow_long and l[i] <= dn and (near(dn, sup) or near(l[i], sup)):
                     pos = 1; avg = dn; units = 1; first = dn; nextadd = dn - add_step
             else:
                 if pos < 0:                              # short fade
@@ -209,3 +218,6 @@ if __name__ == "__main__":
     print("\n== SCALING fade (add into it, cover at VWAP) ==")
     report("2026 scaling ", run_scale(load_2026(), gam))
     report("2025 scaling ", run_scale(load_2025(), gam))
+    print("\n== + DIRECTIONAL gate (VWAP side persists: no dip-buys on below-VWAP days) ==")
+    report("2026 dir-gate", run_scale(load_2026(), gam, dir_gate=True))
+    report("2025 dir-gate", run_scale(load_2025(), gam, dir_gate=True))
