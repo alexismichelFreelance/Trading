@@ -3,7 +3,7 @@ batched INSERTs; a broken QuestDB never breaks the feed."""
 import asyncio
 
 from engine.adapters.feeds.recorder_tee import RecorderTee
-from engine.core.events import Bar, Trade
+from engine.core.events import Bar, BookFlow, Trade
 
 NS = 1_000_000_000
 
@@ -79,3 +79,43 @@ def test_broken_qdb_does_not_break_feed():
     out = asyncio.run(go())
     assert len(out) == 3                           # feed still fully transparent
     assert feed.n_recorded == 0                    # nothing recorded, no exception
+
+
+def test_records_per_second_aggressor_features():
+    qdb = _FakeQDB()
+    NSs = NS
+    # second 1: BUY 3 @5000, SELL 1 @5001 -> adelta=+2, avol=4, ntr=2, pxc=5001
+    # BookFlow at the 2s boundary closes second 1; then SELL 2 in second 2
+    evs = [
+        Trade(1 * NSs + 10, 5000.0, 3, 1),
+        Trade(1 * NSs + 20, 5001.0, 1, -1),
+        BookFlow(1 * NSs, 7, 4, 2, 9),             # bid_cancel/ask_cancel/bid_add/ask_add
+        Trade(2 * NSs + 10, 5002.0, 2, -1),
+        BookFlow(2 * NSs, 0, 0, 1, 0),
+    ]
+    feed = RecorderTee(_FakeFeed(evs), qdb, symbol="ES")
+
+    async def go():
+        return [e async for e in feed.stream()]
+
+    out = asyncio.run(go())
+    assert len(out) == 5                            # everything passed through
+    assert feed.n_sec == 2
+    sec_ins = [q for q in qdb.queries if q.startswith("INSERT") and "claude_sec_live" in q]
+    assert len(sec_ins) >= 1
+    # first second: adelta=+2, avol=4, ntr=2, pxc=5001, plus the bookflow 7,4,2,9
+    assert "5001.0,2,4,2,7,4,2,9" in sec_ins[0]
+    # a sec-table was created with DEDUP
+    assert any("claude_sec_live" in q and "DEDUP UPSERT" in q for q in qdb.queries)
+
+
+def test_record_sec_off_disables_second_stream():
+    qdb = _FakeQDB()
+    feed = RecorderTee(_FakeFeed(_events(2)), qdb, symbol="ES", record_sec=False)
+
+    async def go():
+        return [e async for e in feed.stream()]
+
+    asyncio.run(go())
+    assert feed.n_sec == 0
+    assert not any("claude_sec_live" in q for q in qdb.queries)

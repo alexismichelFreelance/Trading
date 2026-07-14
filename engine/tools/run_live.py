@@ -187,7 +187,8 @@ async def main() -> None:
     if a.record:
         recorder = RecorderTee(feed, AsyncQuestDB(), symbol=SYMBOL)
         feed = recorder
-        print("recording 1m bars -> QuestDB claude_bars_live")
+        print("recording -> QuestDB: 1m bars (claude_bars_live) + per-second "
+              "aggressor/book (claude_sec_live, so ignition/flow are replayable)")
     broker = NinjaTraderBroker("127.0.0.1", a.broker_port, symbol=SYMBOL)
     blot = Blotter(SYMBOL, 50.0, verbose=True)
     # production risk config (the 2026-07-09 burst fixes). IBS carries positions
