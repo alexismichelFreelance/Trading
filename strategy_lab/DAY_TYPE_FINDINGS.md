@@ -50,3 +50,16 @@ user's precision.
 - **Next lever:** the persistence is stronger by noon — an afternoon-only fade
   gated on the confirmed morning side is the next test; and cross-market/news
   context (exogenous, per the L3 finding) likely holds the rest of the signal.
+
+## Update — the afternoon-fade test (b) FAILED
+`run_scale(enter_after=720, gate_min=150, dir_gate=True)`: afternoon-only fade,
+gated on the morning VWAP side confirmed by noon. Clears the 20% bar on 3% (2025)
+/ 5% (2026) of days, median negative, ~0 trades/day — WORSE than the full-day
+version. Restricting to the afternoon discards most of the day's range, and the
++0.55 side-persistence biases direction without making the mechanical fade
+capture. Fifth mechanization of the user's edge to miss the bar (one-shot,
+scaling, dir-gate full-day, afternoon-gate). The consistent gap is the user's
+discretionary execution + exogenous day-character that price history does not
+contain — bar-level hand-rules capture the structure but not the edge. Path
+forward is data-driven (mine the recorded per-second tape + all-sleeve paper
+signals for what actually precedes the good setups), not more hand-crafted rules.

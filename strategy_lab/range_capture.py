@@ -136,12 +136,15 @@ def report(tag, R):
           f"trades/day median {int(R.ntr.median())}")
 
 
-def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False):
+def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False,
+              gate_min=60, enter_after=600):
     """The user's SCALING fade: add a unit every add_step against you (up to maxu),
     cover ALL at VWAP; catastrophe-exit if price runs `cat` beyond the first entry.
     Per-unit capture (avg entry vs cover) so it's 1-lot-comparable to run().
-    dir_gate: use the first-60m VWAP side (which persists, +0.45 corr) to block
-    LONG fades on below-VWAP days and SHORT fades on above-VWAP days."""
+    dir_gate: use the first `gate_min` VWAP side (which persists) to block LONG
+    fades on below-VWAP days and SHORT fades on above-VWAP days. `enter_after`
+    (ET minute-of-day) delays NEW entries — e.g. 720 = afternoon-only, after the
+    morning side is confirmed (persistence is +0.55 by noon)."""
     days = sorted(df.day.unique()); prev = None; week = []; rows = []
     for d in days:
         g = df[df.day == d].sort_values("mod")
@@ -166,9 +169,9 @@ def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False):
         def near(px, arr):
             return len(arr) and np.min(np.abs(arr - px)) <= TOL
 
-        # first-60m VWAP side (causal, known by 10:30 ET): it persists, so it says
+        # morning VWAP side (causal, over first gate_min): it persists, so it says
         # whether VWAP is support (price above -> buy dips) or resistance (below).
-        em = mod < 630
+        em = mod < 570 + gate_min
         e_below = float(np.mean(c[em] < vwap[em])) if em.any() else 0.5
         allow_long = (not dir_gate) or e_below <= 0.65      # block longs on down-days
         allow_short = (not dir_gate) or e_below >= 0.35      # block shorts on up-days
@@ -181,6 +184,8 @@ def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False):
                     captured += pos * (c[i] - avg); ntr += 1
                 break
             if pos == 0:
+                if mod[i] < enter_after:
+                    i += 1; continue                     # no new entries yet
                 up = vwap[i] + 2 * sd[i]; dn = vwap[i] - 2 * sd[i]
                 if allow_short and h[i] >= up and (near(up, res) or near(h[i], res)):
                     pos = -1; avg = up; units = 1; first = up; nextadd = up + add_step
