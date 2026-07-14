@@ -36,7 +36,8 @@ class LiveEngine:
     def __init__(self, feed, broker, strategies, clock, blotter: Blotter,
                  reconnect_delay: float = 1.0, drain_timeout: float = 0.5,
                  warmup_gate: bool = True, risk: RiskSupervisor | None = None,
-                 regime: RegimeGate | None = None) -> None:
+                 regime: RegimeGate | None = None,
+                 live_owners: set | None = None) -> None:
         self.feed = feed
         self.broker = broker
         self.strategies = list(strategies)
@@ -81,8 +82,20 @@ class LiveEngine:
         self.risk = risk if risk is not None else RiskSupervisor()
         # allocation gate (dealer-gamma regime). Default OFF (None) -> no gating.
         self.regime = regime
+        # PAPER vs LIVE routing. live_owners = set of id(strategy) that route to
+        # the real broker (NT8); every other strategy ALWAYS paper-trades — its
+        # orders fill inline at last_px, attributed to its own book, visible and
+        # usable as signals, but never sent to the broker and never risk/regime
+        # gated (we want to see the raw strategy). None = all strategies live
+        # (backward compatible: tests + the pre-paper behavior).
+        self.live_owners = live_owners
+        self.on_paper_fill = None                   # async (Fill) for the painter
+        self.paper_fills: list[Fill] = []
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
+
+    def _is_live(self, s) -> bool:
+        return self.live_owners is None or id(s) in self.live_owners
 
     def stop(self) -> None:
         self._stop.set()
@@ -103,13 +116,33 @@ class LiveEngine:
         await self.broker.submit(o)
         self.risk.on_submit(id(s), o)
 
+    async def _paper_submit(self, s, o) -> None:
+        """Fill a paper strategy's order inline at last_px (market model), against
+        its OWN attributed book. reduce_only clamps/drops so the paper book stays
+        coherent; no broker, no risk/regime gate. Visible + recorded."""
+        pid = id(s)
+        pos = self._spos.get(pid, 0)
+        qty = o.qty
+        if o.reduce_only:
+            if pos == 0 or _sign(o.side) == _sign(pos):
+                return                               # nothing to reduce
+            qty = min(qty, abs(pos))
+        self._owner[o.order_id] = s
+        f = Fill(self.clock.now(), o.order_id, o.symbol, self.last_px,
+                 o.side * qty, 0.0, 0.0, o.tag)
+        self.paper_fills.append(f)
+        self._attribute_fill(f)                      # own book only (not live risk)
+        if self.on_paper_fill is not None:
+            await self.on_paper_fill(f)
+
     def _attribute_fill(self, f: Fill) -> None:
         s = self._owner.get(f.order_id)
         if s is None:
             log.info("unattributed fill (manual/external): %s", f)
             return
         pid = id(s)
-        self.risk.on_fill(pid, f.order_id, f.size, f.price)
+        if self._is_live(s):                         # risk supervisor tracks LIVE only
+            self.risk.on_fill(pid, f.order_id, f.size, f.price)
         old = self._spos.get(pid, 0)
         new = old + f.size
         if old == 0 or _sign(new) != _sign(old):
@@ -181,7 +214,15 @@ class LiveEngine:
                         self._backfill_bars += 1
                     for s in self.strategies:            # per-strategy: orders are OWNED
                         for o in dispatch_market([s], ev):
-                            if self._live:
+                            if not self._live:           # warmup: state only, no orders
+                                self._suppressed_orders += 1
+                                sig = (ev.ts, o.side, o.qty, o.tag, self.last_px)
+                                self.warmup_signals.append(sig)
+                                if self.on_warmup_signal is not None:
+                                    await self.on_warmup_signal(*sig)   # ghost now
+                            elif not self._is_live(s):   # PAPER: raw signal, inline fill
+                                await self._paper_submit(s, o)
+                            else:                        # LIVE: gated -> real broker
                                 if self.regime is not None and self.regime.blocks(
                                         type(s).__name__, self._spos.get(id(s), 0),
                                         o.side, o.qty, ev.ts):
@@ -193,15 +234,10 @@ class LiveEngine:
                                 if self.on_live_order is not None:
                                     await self.on_live_order(ev.ts, o.side, o.qty,
                                                              o.tag, self.last_px)
-                            else:                        # warmup: state only, no orders
-                                self._suppressed_orders += 1
-                                sig = (ev.ts, o.side, o.qty, o.tag, self.last_px)
-                                self.warmup_signals.append(sig)
-                                if self.on_warmup_signal is not None:
-                                    await self.on_warmup_signal(*sig)   # ghost now
-                    if self._live:                       # supervisor-owned actions
+                    if self._live:                       # supervisor-owned actions (LIVE only)
                         books = [(id(s), type(s).__name__, s.symbol,
-                                  self._spos.get(id(s), 0)) for s in self.strategies]
+                                  self._spos.get(id(s), 0)) for s in self.strategies
+                                 if self._is_live(s)]
                         for sid, o in self.risk.on_market(ev.ts, self.last_px, books):
                             owner = next(s for s in self.strategies if id(s) == sid)
                             await self._submit_owned(owner, o)

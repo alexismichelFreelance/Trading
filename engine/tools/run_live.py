@@ -104,44 +104,67 @@ class ObserveStrategy:
         print(f"  POSITION {e.qty} @ {e.avg_px}")
 
 
-def build(names: list[str], flow_th: int = 30):
-    out = []
-    for n in names:
-        if n == "ignition":
-            from engine.strategies.ignition import IgnitionStrategy
-            out.append(IgnitionStrategy(SYMBOL, HMM_PATH, exit_mode="trailing",
-                                        regime_states=None))
-        elif n == "opendrive":
-            from engine.strategies.open_drive import OpenDriveStrategy
-            out.append(OpenDriveStrategy(SYMBOL))
-        elif n == "flow":
-            from engine.strategies.flow import FlowFollowingStrategy
-            # ADAPTIVE (scale-invariant) threshold: th_t = mean + 4*std of
-            # |adelta| — fires on THIS feed's own distribution (fixed th=200
-            # never fires here, |adelta| tops ~66). NOT more robust than fixed on
-            # research; flow is fragile either way. See FLOW_ADAPTIVE_STUDY.md.
-            out.append(FlowFollowingStrategy(SYMBOL, maxp=5, adaptive=True, adapt_k=4.0))
-        elif n == "zones":
-            from engine.strategies.zones_strategy import ZoneLifecycleStrategy
-            out.append(ZoneLifecycleStrategy(SYMBOL))
-        elif n == "ibs":
-            from engine.strategies.ibs_swing import IBSSwingStrategy
-            out.append(IBSSwingStrategy(SYMBOL))
-        elif n == "dipbuy":
-            # long-gamma mean-reversion sleeve (user-modeled). Gate to gexp_prev>1/3
-            # via --gex-gate; NOT yet a validated edge (rides the late-Aug forward
-            # test). See engine/strategies/dip_buy.py, strategy_lab/DAY_SELECTION.md.
-            from engine.strategies.dip_buy import DipBuyStrategy
-            out.append(DipBuyStrategy(SYMBOL))
-        else:
-            raise SystemExit(f"unknown strategy '{n}'")
-    return out
+def _make(label: str, flow_th: int = 30):
+    """One strategy instance by roster label (includes every variant)."""
+    from engine.strategies.dip_buy import DipBuyStrategy
+    from engine.strategies.flow import FlowFollowingStrategy
+    from engine.strategies.ibs_swing import IBSSwingStrategy
+    from engine.strategies.ignition import IgnitionStrategy
+    from engine.strategies.open_drive import OpenDriveStrategy
+    from engine.strategies.zones_strategy import ZoneLifecycleStrategy
+    if label == "ignition":
+        return IgnitionStrategy(SYMBOL, HMM_PATH, exit_mode="trailing", regime_states=None)
+    if label == "ignition_fixed":    # variant: fixed/regime exits instead of trailing
+        return IgnitionStrategy(SYMBOL, HMM_PATH, exit_mode="fixed", regime_states=None)
+    if label == "opendrive":
+        return OpenDriveStrategy(SYMBOL)
+    if label == "flow":              # adaptive z-score threshold (scale-invariant)
+        return FlowFollowingStrategy(SYMBOL, maxp=5, adaptive=True, adapt_k=4.0)
+    if label == "flow_fixed":        # variant: fixed threshold (research default)
+        return FlowFollowingStrategy(SYMBOL, maxp=5, adaptive=False, th=flow_th)
+    if label == "zones":
+        return ZoneLifecycleStrategy(SYMBOL)
+    if label == "zones_gap":         # variant: leave-and-return gap zones on
+        return ZoneLifecycleStrategy(SYMBOL, gap_thr=5.0)
+    if label == "dipbuy":
+        return DipBuyStrategy(SYMBOL)
+    if label == "ibs":
+        return IBSSwingStrategy(SYMBOL)
+    if label == "ibs_gex":           # variant: size up in long-gamma
+        from engine.features.gamma import GammaRegime
+        try:
+            return IBSSwingStrategy(SYMBOL, gamma=GammaRegime())
+        except Exception:            # noqa: BLE001 - no GEX table -> base IBS
+            return IBSSwingStrategy(SYMBOL)
+    raise SystemExit(f"unknown strategy '{label}'")
+
+
+# every strategy + variant — the full paper roster (--paper all)
+ALL_LABELS = ("ignition", "ignition_fixed", "opendrive", "flow", "flow_fixed",
+              "zones", "zones_gap", "dipbuy", "ibs", "ibs_gex")
+
+
+def build_roster(paper: str, flow_th: int = 30):
+    labels = list(ALL_LABELS) if paper.strip() in ("all", "") else \
+        [x for x in paper.split(",") if x]
+    roster = []
+    for lb in labels:
+        s = _make(lb, flow_th)
+        s.label = lb                 # for display / paper reporting
+        roster.append((lb, s))
+    return roster
 
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--paper", default="all",
+                    help="roster that ALWAYS paper-trades (visible signals): 'all' (every "
+                         "strategy + variant) or a comma list of labels. Default 'all'.")
+    ap.add_argument("--live", default="",
+                    help="comma list of roster labels that ALSO route to the NT8 broker "
+                         "(the few that trade live). Empty = pure paper/observation.")
     ap.add_argument("--strategies", default="",
-                    help="comma list: ignition,opendrive,flow,zones,ibs (empty = observe only)")
+                    help="DEPRECATED alias for --live (kept for old commands)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = run until Ctrl-C)")
     ap.add_argument("--market-port", type=int, default=36001)
     ap.add_argument("--broker-port", type=int, default=36002)
@@ -179,9 +202,17 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
                         datefmt="%H:%M:%S")
 
-    names = [s for s in a.strategies.split(",") if s]
+    # full paper roster; a subset (--live, or the deprecated --strategies) also
+    # routes to the NT8 broker. Everything else paper-trades and is visible.
+    roster = build_roster(a.paper, flow_th=a.flow_th)
+    live_names = set(x for x in (a.live or a.strategies).split(",") if x)
+    unknown = live_names - {lb for lb, _ in roster}
+    if unknown:
+        raise SystemExit(f"--live names not in the paper roster: {sorted(unknown)}")
     obs = ObserveStrategy()
-    strategies = [obs] + build(names, flow_th=a.flow_th)
+    strategies = [obs] + [s for _, s in roster]
+    live_owners = {id(s) for lb, s in roster if lb in live_names}
+    label_by_id = {id(s): lb for lb, s in roster}
     feed = NinjaTraderFeed("127.0.0.1", a.market_port, symbol=SYMBOL)
     recorder = None
     if a.record:
@@ -218,7 +249,12 @@ async def main() -> None:
         except Exception as ex:                      # noqa: BLE001
             print(f"  (GEX gate disabled: {ex})")
     eng = LiveEngine(feed, broker, strategies, WallClock(), blot,
-                     warmup_gate=not a.no_warmup_gate, risk=risk, regime=regime)
+                     warmup_gate=not a.no_warmup_gate, risk=risk, regime=regime,
+                     live_owners=live_owners)
+    live_lbls = sorted(lb for lb, s in roster if id(s) in live_owners)
+    paper_lbls = sorted(lb for lb, s in roster if id(s) not in live_owners)
+    print(f"roster ({len(roster)}): LIVE->NT8 {live_lbls or '(none)'}  |  "
+          f"PAPER {paper_lbls}")
 
     painter = NTChartPainter("127.0.0.1", a.broker_port)
     pc: PaintController | None = None
@@ -230,9 +266,10 @@ async def main() -> None:
                 pc.zv.seed_daily(daily)
                 print(f"seeded {len(daily)} daily bars for 1d zones")
             eng.on_live_fill = pc.live_fill          # mark actual fills, not decisions
+            eng.on_paper_fill = pc.paper_fill        # paper sleeves' signals (muted cyan)
             eng.on_bar_hook = pc.on_bar
             eng.on_warmup_signal = pc.ghost_one      # paint ghosts as backfill replays
-            print("chart painting ON (30m/1h/4h/1d zones, S/R bracket, signals, panel)")
+            print("chart painting ON (zones, S/R, gamma, live + paper signals, panel)")
             if a.gex_levels:
                 from datetime import datetime, timezone
 
@@ -251,7 +288,7 @@ async def main() -> None:
                 except Exception as ex:                  # noqa: BLE001
                     print(f"  (gamma levels disabled: {ex})")
 
-    mode = "OBSERVE" if not names else "TRADE(" + ",".join(names) + ")"
+    mode = "PAPER-ONLY" if not live_owners else "LIVE(" + ",".join(live_lbls) + ")+PAPER"
     print(f"live session [{mode}] market:{a.market_port} broker:{a.broker_port} "
           f"{'for %.0fs' % a.seconds if a.seconds else 'until Ctrl-C'}  "
           f"(warmup gate {'OFF' if a.no_warmup_gate else 'ON'})")
@@ -287,12 +324,30 @@ async def main() -> None:
         await painter.close()
 
     if recorder is not None:
-        print(f"recorded {recorder.n_recorded} 1m bars -> claude_bars_live")
+        print(f"recorded {recorder.n_recorded} 1m bars -> claude_bars_live, "
+              f"{recorder.n_sec} per-second rows -> claude_sec_live")
     print(f"\nsession summary: {obs.trades} trades, {obs.flows} bookflow-seconds, "
           f"{obs.bars} 1m bars ({eng._backfill_bars} backfill), last px {obs.last_px}")
     print(f"warmup orders suppressed: {eng._suppressed_orders}  |  live orders {blot.n_orders}, fills {blot.n_fills}")
     if blot.trades:
         print(blot.summary(flat_cost_pts=0.0))
+    # per-sleeve PAPER activity (avg-cost realized pts, net position)
+    if eng.paper_fills:
+        book: dict[str, list] = {}
+        for f in eng.paper_fills:
+            lb = label_by_id.get(id(eng._owner.get(f.order_id)), "?")
+            book.setdefault(lb, []).append((f.size, f.price))
+        print(f"\npaper sleeves ({len(eng.paper_fills)} fills):")
+        for lb in sorted(book):
+            pos = 0; avg = 0.0; real = 0.0; n = len(book[lb])
+            for q, px in book[lb]:
+                if pos == 0 or (q > 0) == (pos > 0):
+                    avg = (avg * abs(pos) + px * abs(q)) / (abs(pos) + abs(q)) if pos + q else px
+                    pos += q
+                else:
+                    c = min(abs(q), abs(pos)); real += (px - avg) * (1 if pos > 0 else -1) * c
+                    pos += (1 if q > 0 else -1) * c
+            print(f"  {lb:16s} fills={n:3d}  realized {real:+7.1f}pt  net pos {pos:+d}")
 
 
 if __name__ == "__main__":

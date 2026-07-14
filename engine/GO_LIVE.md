@@ -4,21 +4,28 @@ The engine is safe to run daily in paper (Sim101) alongside manual trading:
 per-strategy attribution, the RiskSupervisor (in-flight vetting, caps, rate
 limit, kill switch, EOD flatten), the GEX regime gate, and the one-chart overlay.
 
+## Paper vs live model
+EVERY strategy + variant ALWAYS paper-trades (visible signals, own book, never
+sent to the broker, never risk/regime gated — you see the raw strategy). Only the
+`--live` subset ALSO routes to the NT8 broker. Paper fills paint in muted cyan
+(`~tag`); live fills paint green/red.
+
 ## Daily session command
 ```
 cd D:/Trading/engine
 .venv/Scripts/python.exe tools/run_live.py \
-    --strategies zones \
+    --paper all \
+    --live zones,dipbuy \
     --gex-gate --gex-levels \
     --record \
     --panel bottomleft
 ```
-- `--strategies zones` — start with the sleeve that matches the user's regime
-  (long-gamma mean reversion). Add `ignition,opendrive` once the GEX gate has a
-  live track record; they are trend sleeves and only fire on short-gamma days.
-  `dipbuy` (the user-modeled mean-reversion sleeve, DIP_BUY_SLEEVE.md) is built
-  and anchor-tested but stays OFF until the late-Aug forward test validates it;
-  when added it is auto-gated to gexp_prev>1/3 by --gex-gate.
+- `--paper all` — the full roster paper-trades: ignition, ignition_fixed,
+  opendrive, flow, flow_fixed, zones, zones_gap, dipbuy, ibs, ibs_gex. Every
+  signal (incl. ignition) is visible on the one chart.
+- `--live zones,dipbuy` — only these route to NT8. Empty = pure paper/observation.
+  The GEX gate + risk limits apply to the LIVE subset only.
+- End-of-session prints per-paper-sleeve realized pts + net position.
 - `--gex-gate` — trend sleeves take entries only when gexp_prev<=1/3 (validated).
 - `--gex-levels` — draw put wall / call wall / flip as S/R lines (eyeball the
   put-wall line vs price on the first session; recalibrate `--gex-basis` if off).

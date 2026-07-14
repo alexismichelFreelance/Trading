@@ -37,6 +37,8 @@ SUP_LINE = "#FF32CD32"       # support (demand below)
 GEX_PUT = "#FF1E90FF"        # put wall  (gamma support)  — dodger blue
 GEX_CALL = "#FFFFA500"       # call wall (gamma resistance) — orange
 GEX_FLIP = "#FFBA90E0"       # zero-gamma flip (regime divider) — violet
+PAPER = "#FF66CCCC"          # paper-sleeve fills (not routed to broker) — muted cyan
+PAPER_CAP_PER_TAG = 40
 
 # timeframes shown, low->high. Higher TF = more opaque (more significant).
 TF_ORDER = ("30m", "1h", "4h", "1d")
@@ -104,7 +106,9 @@ class PaintController:
         self.zv = ZoneView()
         self._n_live = 0
         self._n_ghost = 0
+        self._n_paper = 0
         self._ghost_by_tag: dict[str, int] = {}
+        self._paper_by_tag: dict[str, int] = {}
         self._zone_state: dict[str, object] = {}
         self._last_px = 0.0
         self._warm_n = 0
@@ -137,6 +141,20 @@ class PaintController:
         await self.p.arrow(f"eng-fill-{self._n_live}", f.ts, f.price, side,
                            color=LIVE_UP if side > 0 else LIVE_DN,
                            label=f"{f.tag} @{f.price:.2f}")
+
+    async def paper_fill(self, f) -> None:
+        """Paint a PAPER (non-live) sleeve's fill in a distinct muted colour so
+        every strategy's signals are visible without being confused for the few
+        that route to the broker. Capped per tag to avoid clutter."""
+        base = f.tag.split("-")[0] if f.tag else "paper"
+        n = self._paper_by_tag.get(base, 0)
+        if n >= PAPER_CAP_PER_TAG:
+            return
+        self._paper_by_tag[base] = n + 1
+        self._n_paper += 1
+        side = 1 if f.size > 0 else -1
+        await self.p.arrow(f"eng-paper-{self._n_paper}", f.ts, f.price, side,
+                           color=PAPER, label=f"~{f.tag}")
 
     # ── per-bar ───────────────────────────────────────────────────────────
     async def on_bar(self, bar, live: bool, backfill_bars: int = 0) -> None:
