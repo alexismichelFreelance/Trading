@@ -120,6 +120,27 @@ def test_eod_flatten_once_then_block_then_retry():
     assert len(out) == 1 and out[0][1].qty == 7
 
 
+def test_swing_sleeve_enters_late_and_survives_eod_flatten():
+    """IBS enters at 15:59 and holds overnight: exempt from the entry lockout and
+    the EOD flatten; intraday sleeves are still flattened; kill switch still
+    flattens IBS (catastrophe)."""
+    cfg = RiskConfig(entry_lockout_et=(15, 45), eod_flatten_et=(15, 58),
+                     daily_loss_halt=-3000.0, swing_sleeves=("IBSSwingStrategy",))
+    r = RiskSupervisor(cfg)
+    # EOD flatten fires at 15:58: flattens the intraday zones book, spares IBS
+    books = [(1, "ZoneLifecycleStrategy", "ES", 3), (2, "IBSSwingStrategy", "ES", 2)]
+    flat = r.on_market(ts_et("15:58"), 5000.0, books)
+    ids = [sid for sid, _ in flat]
+    assert 1 in ids and 2 not in ids                  # zones flattened, IBS spared
+    assert flat[0][1].tag == "risk_eod"
+    # IBS's 15:59 entry is allowed despite lockout + post-EOD
+    o = r.vet(2, "IBSSwingStrategy", Order("ES", BUY, 1, tag="ibs-entry"),
+              ts_et("15:59"), 0)
+    assert o is not None and o.qty == 1
+    # an intraday sleeve is still locked out / post-EOD
+    assert r.vet(1, "ZoneLifecycleStrategy", Order("ES", BUY, 1), ts_et("15:59"), 0) is None
+
+
 def test_kill_switch_flattens_and_halts_until_next_session():
     r = RiskSupervisor(RiskConfig(daily_loss_halt=-3000.0, point_value=50.0))
     # book: long 2 @ 5000, price falls to 4960 -> marked -80pt*50 = -4000

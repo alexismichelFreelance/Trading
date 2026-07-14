@@ -201,10 +201,11 @@ async def main() -> None:
             max_pos_per_sleeve=a.max_sleeve, max_account_gross=a.max_gross,
             rate_max_orders=4, rate_window_s=5.0,
             daily_loss_halt=a.risk_halt,
-            entry_lockout_et=(15, 45), eod_flatten_et=(15, 58)))
+            entry_lockout_et=(15, 45), eod_flatten_et=(15, 58),
+            swing_sleeves=("IBSSwingStrategy",)))     # IBS enters 15:59 + holds overnight
         print(f"risk: sleeve cap {a.max_sleeve}, gross cap {a.max_gross}, "
               f"4 orders/5s, halt at ${a.risk_halt:+,.0f}, "
-              f"entry lockout 15:45 ET, EOD flatten 15:58 ET")
+              f"entry lockout 15:45 ET, EOD flatten 15:58 ET (IBS exempt: swing)")
     regime = None
     if a.gex_gate:
         from engine.core.regime import RegimeGate

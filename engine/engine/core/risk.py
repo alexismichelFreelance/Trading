@@ -56,6 +56,10 @@ class RiskConfig:
     eod_flatten_et: tuple[int, int] | None = None     # e.g. (15, 58): flatten all books
     inflight_ttl_s: float = 20.0             # pending order expiry (lost-fill safety)
     reemit_s: float = 10.0                   # retry cadence for eod/halt flattens
+    swing_sleeves: tuple = ()                # sleeves that ENTER late + HOLD overnight
+    # by design (e.g. IBS at 15:59): exempt from the entry lockout and the EOD
+    # flatten so they can actually trade. The daily-loss kill switch still
+    # applies (catastrophe backstop).
 
 
 class RiskSupervisor:
@@ -124,7 +128,8 @@ class RiskSupervisor:
             self._deny(name, o, "halted (daily loss)")
             return None
         m = et_minute_of_day(ts)
-        if self._eod_done and m < EVENING_ET_MIN:
+        swing = name in c.swing_sleeves          # enters late + holds overnight by design
+        if self._eod_done and m < EVENING_ET_MIN and not swing:
             self._deny(name, o, "post-EOD")
             return None
 
@@ -142,7 +147,7 @@ class RiskSupervisor:
             base = pos + self._pending_net(sid)
             projected = base + o.side * o.qty
             increases = abs(projected) > abs(base)
-            if increases and c.entry_lockout_et is not None:
+            if increases and c.entry_lockout_et is not None and not swing:
                 lock = c.entry_lockout_et[0] * 60 + c.entry_lockout_et[1]
                 if lock <= m < EVENING_ET_MIN:
                     self._deny(name, o, "entry lockout (late session)")
@@ -244,9 +249,12 @@ class RiskSupervisor:
                 return []
             tag = "risk_halt" if self.halted else "risk_eod"
         out: list[tuple[int, Order]] = []
-        for sid, name, symbol, pos in books:
+        eod_only = tag == "risk_eod"                       # kill switch flattens ALL;
+        for sid, name, symbol, pos in books:               # EOD spares swing sleeves
             if pos == 0:
                 continue
+            if eod_only and name in c.swing_sleeves:
+                continue                                   # IBS holds overnight by design
             avail = abs(pos) - self._pending_reduces(sid, _sign(pos))
             if avail <= 0:
                 continue                                   # flatten already working
