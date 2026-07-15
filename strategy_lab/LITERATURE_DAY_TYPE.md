@@ -67,3 +67,31 @@ whether it's a "range" day.
    - The one causal, published, testable idea still un-mined: **Gao's volume
      conditioning** — fade only on LOW relative-volume mornings (rotational),
      stand aside on high-volume (institutional/trend). Next test.
+
+## Follow-up tests (2026-07-15)
+
+**Volume conditioning (Gao).** First-hour relative volume gating the fade:
+- 2025 (real volume, 67d): NULL — low-vol AM −3% vs high-vol −4%, no difference.
+- 2026 (thin feed, 16d): high-vol mornings got the fade **crushed (−17%, 0%
+  positive, −8.5pt median)** while low-vol were slightly green (+3%). Matches Gao,
+  but only on the delayed feed. Verdict: "**don't fade high-volume mornings**" is
+  a defensible risk filter; the low-vol side is not a strong positive.
+
+**Asia/Europe → US session (the user's memory; ICT "AMD" framing — already
+rejected as unfalsifiable, but the quantitative core = Crabel).** 19 recorded
+24h days: quiet Asia (rho −0.25) and quiet Europe (rho −0.23) both lean toward a
+more *efficient/trending* US session — the RIGHT sign (quiet overnight →
+expansion, matching Crabel and the user's recollection) — but **not significant
+at n=19**, and the quiet-vs-active split is tiny (US efficiency 0.06 vs 0.04).
+Pre-registered forward test: re-run once the recorder has ≥40 full 24h days
+(~mid-Aug); this is the most promising thread because it matches both the user's
+intuition and the one predictor that already showed signal.
+
+## The consistent meta-truth (across every predictor tested)
+VWAP-side (+0.45) · Crabel prior-range (−0.36) · Gao momentum (weak) · IB width
+(null) · volume (mixed) · Asia/Europe overnight (right sign, n-starved). **Every
+day-character signal is a moderate tilt (|rho| ≤ 0.45), never a clean switch** —
+exactly what efficient-markets logic predicts (a reliable classifier would be
+arbitraged). The honest engine use is an **ensemble of tilts as a sizing / co-pilot
+input**, not a hard gate; and to keep recording 24h data so the session test
+(the best-aligned idea) can be run with real power.
