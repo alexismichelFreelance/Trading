@@ -201,6 +201,9 @@ async def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
                         datefmt="%H:%M:%S")
+    # silence per-request HTTP logs (QuestDB recorder calls via httpx) — pure noise
+    for noisy in ("httpx", "httpcore", "hpack", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # full paper roster; a subset (--live, or the deprecated --strategies) also
     # routes to the NT8 broker. Everything else paper-trades and is visible.
