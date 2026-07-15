@@ -38,14 +38,14 @@ GEX_PUT = "#FF1E90FF"        # put wall  (gamma support)  — dodger blue
 GEX_CALL = "#FFFFA500"       # call wall (gamma resistance) — orange
 GEX_FLIP = "#FFBA90E0"       # zero-gamma flip (regime divider) — violet
 PAPER = "#FF66CCCC"          # paper-sleeve fills (not routed to broker) — muted cyan
-PAPER_CAP_PER_TAG = 40
+PAPER_CAP_PER_TAG = 12       # with 10 paper sleeves this bounds total chart objects
 
 # timeframes shown, low->high. Higher TF = more opaque (more significant).
 TF_ORDER = ("30m", "1h", "4h", "1d")
 TF_OPACITY = {"30m": 16, "1h": 24, "4h": 34, "1d": 46}
 TF_LABEL = {"4h": True, "1d": True}          # tag these on the chart
 
-GHOST_CAP_PER_TAG = 15
+GHOST_CAP_PER_TAG = 6        # persistent chart objects — keep low so NT8 stays responsive
 
 
 class ZoneView:
@@ -113,6 +113,7 @@ class PaintController:
         self._last_px = 0.0
         self._warm_n = 0
         self._gamma: dict | None = None       # prior-session gamma levels (ES terms)
+        self._gamma_painted = False
 
     # ── signals ───────────────────────────────────────────────────────────
     async def ghost_one(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:
@@ -172,7 +173,7 @@ class PaintController:
                 await self._paint_status(False, backfill_bars, bar.c)
 
     async def _paint_zones(self, now_ts: int) -> None:
-        bucket = now_ts // (2 * 60 * NS)
+        bucket = now_ts // (10 * 60 * NS)          # extend zone rects every 10m, not 2m
         for tf in TF_ORDER:
             for z in self.zv.book[tf].zones:
                 tag = f"eng-zone-{tf}-{z.formed_ts}-{z.direction}"
@@ -212,11 +213,13 @@ class PaintController:
     def set_gamma_levels(self, levels: dict | None) -> None:
         """Store prior-session gamma levels (ES terms) to draw as S/R lines."""
         self._gamma = levels
+        self._gamma_painted = False
 
     async def _paint_gamma(self, now_ts: int) -> None:
         g = self._gamma
-        if not g:
-            return
+        if not g or self._gamma_painted:           # static prior-session levels:
+            return                                  # draw once, not every bar
+        self._gamma_painted = True
         reg = "long-gamma" if g["net_sign"] > 0 else "SHORT-gamma"
         rows = [("eng-gex-pw", g["put_wall"], GEX_PUT, "put wall"),
                 ("eng-gex-cw", g["call_wall"], GEX_CALL, "call wall")]

@@ -25,6 +25,7 @@ from ..questdb import AsyncQuestDB
 log = logging.getLogger("engine.recorder")
 
 BATCH = 100
+SEC_BATCH = 30           # per-second rows per flush (~2 HTTP POSTs/min, not 60)
 
 
 def _ts(ns: int) -> str:
@@ -115,7 +116,9 @@ class RecorderTee:
                         f"('{self.symbol}','{_ts(ev.ts)}',{self._pxc},{self._adelta},"
                         f"{self._avol},{self._ntr},{ev.bid_cancel},{ev.ask_cancel},"
                         f"{ev.bid_add},{ev.ask_add})")
-                    if self._live:
+                    # BATCH: flush ~2x/min, not every second — a per-second HTTP POST
+                    # backpressures the market socket NT8 writes on (chart lag).
+                    if len(self._sbuf) >= SEC_BATCH:
                         await self._flush_sec()
                 self._adelta = self._avol = self._ntr = 0     # reset for next second
             elif self._ready and isinstance(ev, Bar) and ev.tf == "1m":
