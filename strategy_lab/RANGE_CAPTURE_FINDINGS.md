@@ -55,4 +55,20 @@ hit: entries mechanize, day/setup selection doesn't (yet).
    early (the day-taxonomy found first-30m range predicts the day) to gate the
    fade — fade only on days predicted to mean-revert. Pre-registered next test.
 Nothing deployed. `range_capture.py` is the permanent scorecard for any future
-variant: it must clear "≥20% of range on a majority of days" before it ships.
+variant.
+
+## Exit experiments (2026-07-17) — motivated by 07-16
+On 2026-07-16 the live engine shorted a rally (right side — the day closed −22pt)
+but covered at breakeven and missed the decline, suggesting a regime-aware exit
+(let a with-trend fade RIDE instead of covering at VWAP). Two versions, both FAIL:
+- **Posture-runner** (`run_scale(runner=True)`: on a directional day per the early
+  VWAP side, the with-trend fade rides to the next level): **zero aggregate effect**
+  (2025/2026 identical). And it cannot help 07-16 — at the 10:20 entry the day's
+  first-hour posture was **balanced (e_below 0.43)**; the weakness developed later.
+  "Should have ridden" is hindsight; the direction isn't known at entry.
+- **Trailing exit** (classification-free: ride the move, cover on a retrace):
+  **worse** — mean −48pt (2025) / −16pt vs −9.7 / −6.4 for cover-at-VWAP. Letting
+  winners run also keeps the fade sitting in losing trends.
+Conclusion: the exit is not the fix. No exit rule rescues a fade that enters wrong
+~half the time; the missing piece stays the discretionary read of which setup is
+real. `runner=` is kept off by default as a documented negative.

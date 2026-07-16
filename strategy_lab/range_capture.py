@@ -137,7 +137,7 @@ def report(tag, R):
 
 
 def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False,
-              gate_min=60, enter_after=600):
+              gate_min=60, enter_after=600, runner=False):
     """The user's SCALING fade: add a unit every add_step against you (up to maxu),
     cover ALL at VWAP; catastrophe-exit if price runs `cat` beyond the first entry.
     Per-unit capture (avg entry vs cover) so it's 1-lot-comparable to run().
@@ -176,7 +176,24 @@ def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False,
         allow_long = (not dir_gate) or e_below <= 0.65      # block longs on down-days
         allow_short = (not dir_gate) or e_below >= 0.35      # block shorts on up-days
 
+        # REGIME-AWARE exit (runner): on a directional day (posture from the
+        # persistent early VWAP side), a WITH-trend fade rides to the next level
+        # instead of covering at VWAP; if it gives the move back to VWAP, exit
+        # there (lock the VWAP gain). Weak day (e_below>0.6): shorts ride down to
+        # the next support. Strong day (e_below<0.4): longs ride up to next resist.
+        weak = e_below > 0.6
+        strong = e_below < 0.4
+
+        def below(px, arr):
+            dn = arr[arr < px - 1]
+            return dn.max() if len(dn) else px - 0.5 * rng
+
+        def above(px, arr):
+            up = arr[arr > px + 1]
+            return up.min() if len(up) else px + 0.5 * rng
+
         pos = 0; avg = 0.0; units = 0; first = 0.0; nextadd = 0.0; captured = 0.0; ntr = 0
+        run_tgt = None; reached = False
         i = 30
         while i < len(g):
             if mod[i] >= 959:
@@ -189,19 +206,39 @@ def run_scale(df, gam, maxu=5, add_step=4.0, cat=12.0, dir_gate=False,
                 up = vwap[i] + 2 * sd[i]; dn = vwap[i] - 2 * sd[i]
                 if allow_short and h[i] >= up and (near(up, res) or near(h[i], res)):
                     pos = -1; avg = up; units = 1; first = up; nextadd = up + add_step
+                    run_tgt = below(vwap[i], sup) if (runner and weak) else None; reached = False
                 elif allow_long and l[i] <= dn and (near(dn, sup) or near(l[i], sup)):
                     pos = 1; avg = dn; units = 1; first = dn; nextadd = dn - add_step
+                    run_tgt = above(vwap[i], res) if (runner and strong) else None; reached = False
             else:
                 if pos < 0:                              # short fade
                     if h[i] >= first + cat:              # catastrophe
                         captured += -(first + cat - avg); pos = 0; ntr += 1
-                    elif l[i] <= vwap[i]:                # cover all at VWAP
+                    elif run_tgt is not None:            # RUNNER (weak day, with-trend)
+                        if l[i] <= run_tgt:              # rode to the next support
+                            captured += (avg - run_tgt); pos = 0; ntr += 1
+                        elif reached and h[i] >= vwap[i]:  # gave it back -> lock VWAP
+                            captured += (avg - vwap[i]); pos = 0; ntr += 1
+                        elif l[i] <= vwap[i]:
+                            reached = True               # passed VWAP; ride on
+                        elif h[i] >= nextadd and units < maxu:
+                            avg = (avg * units + nextadd) / (units + 1); units += 1; nextadd += add_step
+                    elif l[i] <= vwap[i]:                # normal: cover at VWAP
                         captured += (avg - vwap[i]); pos = 0; ntr += 1
                     elif h[i] >= nextadd and units < maxu:
                         avg = (avg * units + nextadd) / (units + 1); units += 1; nextadd += add_step
                 else:                                    # long fade
                     if l[i] <= first - cat:
                         captured += (first - cat - avg); pos = 0; ntr += 1
+                    elif run_tgt is not None:            # RUNNER (strong day, with-trend)
+                        if h[i] >= run_tgt:
+                            captured += (run_tgt - avg); pos = 0; ntr += 1
+                        elif reached and l[i] <= vwap[i]:
+                            captured += (vwap[i] - avg); pos = 0; ntr += 1
+                        elif h[i] >= vwap[i]:
+                            reached = True
+                        elif l[i] <= nextadd and units < maxu:
+                            avg = (avg * units + nextadd) / (units + 1); units += 1; nextadd -= add_step
                     elif h[i] >= vwap[i]:
                         captured += (vwap[i] - avg); pos = 0; ntr += 1
                     elif l[i] <= nextadd and units < maxu:
