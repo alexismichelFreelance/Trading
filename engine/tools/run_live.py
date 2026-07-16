@@ -291,6 +291,25 @@ async def main() -> None:
                 except Exception as ex:                  # noqa: BLE001
                     print(f"  (gamma levels disabled: {ex})")
 
+    # DayScore morning read (co-pilot: fade-friendliness lean + VWAP posture).
+    # A moderate-tilt SIZING input, not a switch; Crabel prior-range is the most
+    # robust live component (volume/overnight are noisy on the delayed feed).
+    try:
+        from engine.adapters.questdb import QuestDB as _SyncQDB
+        from engine.features.day_score import morning_read
+        _b = _SyncQDB().df("SELECT ts,o,h,l,c,vol FROM claude_bars_live "
+                           "WHERE ts > dateadd('d',-40,now()) ORDER BY ts")
+        _r = morning_read(_b) if len(_b) else None
+        if _r:
+            _c = "  ".join(f"{k} {v:.0%}" for k, v in _r["components"].items())
+            _tag = "pre-market lean" if _r.get("premarket") else "last session"
+            print(f"DAY READ [{_tag}] {_r['day']}: fade-friendliness {_r['score']:.0f}/100 "
+                  f"[{_r['label']}]  |  posture: {_r['posture']}  |  {_c}")
+            print("  (moderate-tilt sizing input, not a switch; Crabel is the robust "
+                  "live component — volume/overnight are noisy on the delayed feed)")
+    except Exception as ex:                          # noqa: BLE001 - never block startup
+        print(f"  (day read unavailable: {ex})")
+
     mode = "PAPER-ONLY" if not live_owners else "LIVE(" + ",".join(live_lbls) + ")+PAPER"
     print(f"live session [{mode}] market:{a.market_port} broker:{a.broker_port} "
           f"{'for %.0fs' % a.seconds if a.seconds else 'until Ctrl-C'}  "
