@@ -218,11 +218,15 @@ async def main() -> None:
     label_by_id = {id(s): lb for lb, s in roster}
     feed = NinjaTraderFeed("127.0.0.1", a.market_port, symbol=SYMBOL)
     recorder = None
+    paper_blot = None
     if a.record:
         recorder = RecorderTee(feed, AsyncQuestDB(), symbol=SYMBOL)
         feed = recorder
+        from engine.adapters.paper_blotter import PaperBlotter
+        paper_blot = PaperBlotter(AsyncQuestDB(), symbol=SYMBOL)
+        await paper_blot.start()
         print("recording -> QuestDB: 1m bars (claude_bars_live) + per-second "
-              "aggressor/book (claude_sec_live, so ignition/flow are replayable)")
+              "aggressor/book (claude_sec_live) + paper fills (claude_paper_fills)")
     broker = NinjaTraderBroker("127.0.0.1", a.broker_port, symbol=SYMBOL)
     blot = Blotter(SYMBOL, 50.0, verbose=True)
     # production risk config (the 2026-07-09 burst fixes). IBS carries positions
@@ -269,7 +273,6 @@ async def main() -> None:
                 pc.zv.seed_daily(daily)
                 print(f"seeded {len(daily)} daily bars for 1d zones")
             eng.on_live_fill = pc.live_fill          # mark actual fills, not decisions
-            eng.on_paper_fill = pc.paper_fill        # paper sleeves' signals (muted cyan)
             eng.on_bar_hook = pc.on_bar
             eng.on_warmup_signal = pc.ghost_one      # paint ghosts as backfill replays
             print("chart painting ON (zones, S/R, gamma, live + paper signals, panel)")
@@ -290,6 +293,15 @@ async def main() -> None:
                         print("  (no prior gamma-levels row; run tools/fetch_cboe_gex.py)")
                 except Exception as ex:                  # noqa: BLE001
                     print(f"  (gamma levels disabled: {ex})")
+
+    # paper fills: paint (muted cyan, if painting) AND persist to claude_paper_fills
+    # (if recording), tagged with the owning sleeve label.
+    async def _paper_sink(f):
+        if pc is not None:
+            await pc.paper_fill(f)
+        if paper_blot is not None:
+            await paper_blot.record(f, label_by_id.get(id(eng._owner.get(f.order_id)), "?"))
+    eng.on_paper_fill = _paper_sink
 
     # DayScore morning read (co-pilot: fade-friendliness lean + VWAP posture).
     # A moderate-tilt SIZING input, not a switch; Crabel prior-range is the most
@@ -347,7 +359,8 @@ async def main() -> None:
 
     if recorder is not None:
         print(f"recorded {recorder.n_recorded} 1m bars -> claude_bars_live, "
-              f"{recorder.n_sec} per-second rows -> claude_sec_live")
+              f"{recorder.n_sec} per-second rows -> claude_sec_live"
+              + (f", {paper_blot.n} paper fills -> claude_paper_fills" if paper_blot else ""))
     print(f"\nsession summary: {obs.trades} trades, {obs.flows} bookflow-seconds, "
           f"{obs.bars} 1m bars ({eng._backfill_bars} backfill), last px {obs.last_px}")
     print(f"warmup orders suppressed: {eng._suppressed_orders}  |  live orders {blot.n_orders}, fills {blot.n_fills}")

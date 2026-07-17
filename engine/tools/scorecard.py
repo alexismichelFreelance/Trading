@@ -144,9 +144,42 @@ def main() -> None:
               f"best ${md.max():,.0f}")
     nflag = sum(1 for r in rows if r["flags"])
     print(f"flagged days: {nflag}/{len(rows)}")
+
+    _paper_section(days, a.sym)
+
     if a.json:
         Path(a.json).write_text(json.dumps(rows, default=float, indent=0))
         print(f"wrote {a.json}")
+
+
+def _paper_section(days, sym):
+    """Per-sleeve paper P&L from claude_paper_fills (avg-cost, over the window)."""
+    try:
+        from engine.adapters.questdb import QuestDB
+        pf = QuestDB().df(f"SELECT ts, sleeve, side, qty, price FROM claude_paper_fills "
+                          f"WHERE symbol='{sym}' ORDER BY ts")
+    except Exception:                                # noqa: BLE001
+        return
+    if not len(pf):
+        print("\npaper sleeves: (no claude_paper_fills yet - run run_live --record)")
+        return
+    pf["day"] = pf.ts.dt.tz_convert("America/New_York").dt.strftime("%Y-%m-%d")
+    pf = pf[pf.day.isin(days)]
+    pf["sq"] = np.where(pf.side > 0, pf.qty, -pf.qty)
+    print(f"\n=== PAPER sleeves ({sym}, {pf.day.nunique()} days, avg-cost pts) ===")
+    print(f"{'sleeve':<14}{'fills':>6}{'days':>6}{'realized_pt':>12}{'net':>5}")
+    for sl, g in pf.groupby("sleeve"):
+        pos = 0; avg = 0.0; real = 0.0
+        for r in g.sort_values("ts").itertuples():
+            q, px = r.sq, r.price
+            while q != 0:
+                if pos == 0 or (q > 0) == (pos > 0):
+                    avg = (avg * abs(pos) + px * abs(q)) / (abs(pos) + abs(q)) if pos + q else px
+                    pos += q; q = 0
+                else:
+                    c = min(abs(q), abs(pos)); real += (px - avg) * (1 if pos > 0 else -1) * c
+                    pos += (1 if q > 0 else -1) * c; q -= (1 if q > 0 else -1) * c
+        print(f"{sl:<14}{len(g):>6}{g.day.nunique():>6}{real:>+12.1f}{pos:>+5d}")
 
 
 if __name__ == "__main__":
