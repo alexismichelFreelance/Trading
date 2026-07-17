@@ -220,3 +220,24 @@ def test_zoneview_multitf_detects_and_brackets():
     dailies.append(Bar(dt, "1d", 4875, 4878, 4873, 4876, 900))
     zv.seed_daily(dailies)
     assert any(z.direction == DEMAND for z in zv.active("1d"))
+
+
+def test_fill_arrows_reasserted_on_top_after_zones():
+    """A fill arrow is remembered and, on the next 4-min redraw cycle, removed
+    and re-added (so NT renders it above the zone fills)."""
+    from engine.core.events import Fill
+    p = _painter()
+    pc = PaintController(p, [])
+
+    async def go():
+        f = Fill(10 * NS, "O1", "ES", 5000.0, 1, 0.0, 0.0, "dipA-entry")
+        await pc.live_fill(f)
+        p._w.lines.clear()
+        # first bar establishes the arrow bucket; a later bar (>4 min) re-asserts
+        await pc._reassert_arrows(10 * NS)
+        first = [m for m in p._w.lines if m.get("kind") in ("arrow", "remove")]
+        await pc._reassert_arrows(10 * NS + 5 * 60 * NS)      # next 4-min bucket
+        kinds = [m["kind"] for m in p._w.lines if m.get("kind") in ("arrow", "remove")]
+
+    asyncio.run(go())
+    assert "eng-fill-1" in pc._arrows                          # remembered

@@ -39,6 +39,7 @@ GEX_CALL = "#FFFFA500"       # call wall (gamma resistance) — orange
 GEX_FLIP = "#FFBA90E0"       # zero-gamma flip (regime divider) — violet
 PAPER = "#FF66CCCC"          # paper-sleeve fills (not routed to broker) — muted cyan
 PAPER_CAP_PER_TAG = 12       # with 10 paper sleeves this bounds total chart objects
+ARROW_KEEP = 80              # most-recent fill arrows re-asserted on top of zones
 
 # timeframes shown, low->high. Higher TF = more opaque (more significant).
 TF_ORDER = ("30m", "1h", "4h", "1d")
@@ -109,6 +110,8 @@ class PaintController:
         self._n_paper = 0
         self._ghost_by_tag: dict[str, int] = {}
         self._paper_by_tag: dict[str, int] = {}
+        self._arrows: dict[str, tuple] = {}   # fill arrows to re-assert above zones
+        self._arrow_bucket = -1
         self._zone_state: dict[str, object] = {}
         self._last_px = 0.0
         self._warm_n = 0
@@ -139,7 +142,10 @@ class PaintController:
         """Paint at the ACTUAL fill ts+price (coincides with NT's native dot)."""
         self._n_live += 1
         side = 1 if f.size > 0 else -1
-        await self.p.arrow(f"eng-fill-{self._n_live}", f.ts, f.price, side,
+        tag = f"eng-fill-{self._n_live}"
+        self._remember_arrow(tag, f.ts, f.price, side,
+                             LIVE_UP if side > 0 else LIVE_DN, f"{f.tag} @{f.price:.2f}")
+        await self.p.arrow(tag, f.ts, f.price, side,
                            color=LIVE_UP if side > 0 else LIVE_DN,
                            label=f"{f.tag} @{f.price:.2f}")
 
@@ -154,8 +160,25 @@ class PaintController:
         self._paper_by_tag[base] = n + 1
         self._n_paper += 1
         side = 1 if f.size > 0 else -1
-        await self.p.arrow(f"eng-paper-{self._n_paper}", f.ts, f.price, side,
-                           color=PAPER, label=f"~{f.tag}")
+        tag = f"eng-paper-{self._n_paper}"
+        self._remember_arrow(tag, f.ts, f.price, side, PAPER, f"~{f.tag}")
+        await self.p.arrow(tag, f.ts, f.price, side, color=PAPER, label=f"~{f.tag}")
+
+    def _remember_arrow(self, tag, ts, px, side, color, label) -> None:
+        self._arrows[tag] = (ts, px, side, color, label)
+        while len(self._arrows) > ARROW_KEEP:          # keep the most recent N
+            self._arrows.pop(next(iter(self._arrows)))
+
+    async def _reassert_arrows(self, now_ts: int) -> None:
+        """Re-add fill arrows AFTER the zones each redraw cycle so they render on
+        top (NT appends re-added objects) — otherwise the zone fills wash them out."""
+        bucket = now_ts // (4 * 60 * NS)
+        if bucket == self._arrow_bucket or not self._arrows:
+            return
+        self._arrow_bucket = bucket
+        for tag, (ts, px, side, color, label) in list(self._arrows.items()):
+            await self.p.remove(tag)                   # remove+re-add -> moves to front
+            await self.p.arrow(tag, ts, px, side, color=color, label=label)
 
     # ── per-bar ───────────────────────────────────────────────────────────
     async def on_bar(self, bar, live: bool, backfill_bars: int = 0) -> None:
@@ -166,6 +189,7 @@ class PaintController:
             await self._paint_bracket(bar.c)
             await self._paint_gamma(bar.ts)
             await self._paint_risk()
+            await self._reassert_arrows(bar.ts)   # keep fill arrows above the zones
             await self._paint_status(True, backfill_bars, bar.c)
         else:
             self._warm_n += 1
