@@ -61,6 +61,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string lastDrawErr = "";
         private bool canaryDrawn = false;
         private DateTime lastDrawLog = DateTime.MinValue;
+        private DateTime lastRefresh = DateTime.MinValue;
         private static readonly string LogPath = System.IO.Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
             "NinjaTrader 8", "engine_relay.log");
@@ -142,11 +143,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 DrawCanary();
                 FlushDraws();
-                // repaint at most ONCE per bar update — the NT8-supported context.
-                // (Calling ForceRefresh from OnMarketData storms the render thread
-                // every tick and can freeze the whole chart.)
-                try { ForceRefresh(); }
-                catch (Exception ex) { lastDrawErr = "refresh:" + ex.Message; }
+                // Calculate.OnEachTick makes THIS fire on every tick, so RATE-LIMIT
+                // the repaint to ~2/sec. Calling ForceRefresh every tick storms the
+                // WPF render thread and freezes the whole chart (nothing renders,
+                // native execution markers included).
+                if ((DateTime.Now - lastRefresh).TotalMilliseconds >= 500)
+                {
+                    lastRefresh = DateTime.Now;
+                    try { ForceRefresh(); }
+                    catch (Exception ex) { lastDrawErr = "refresh:" + ex.Message; }
+                }
             }
         }
 
