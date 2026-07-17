@@ -61,7 +61,8 @@ class LiveEngine:
         self.last_px: float = 0.0
         # optional async callbacks for the chart painter
         self.on_live_order = None          # async (ts, side, qty, tag, px) — decision time
-        self.on_live_fill = None           # async (Fill) — ACTUAL fill ts+price (preferred)
+        self.on_live_fill = None           # async (Fill) — ACTUAL engine fill ts+price
+        self.on_manual_fill = None         # async (Fill) — unattributed (manual) fill
         self.on_bar_hook = None            # async (ts, close, live, backfill_bars)
         self.on_warmup_signal = None       # async (ts, side, qty, tag, px) — ghosts
         # ── per-strategy attribution ──────────────────────────────────────
@@ -249,12 +250,14 @@ class LiveEngine:
                     if isinstance(ev, Fill):
                         attributed = ev.order_id in self._owner
                         self._attribute_fill(ev)         # owner-only routing
-                        # paint the ACTUAL fill (real ts+price) so our marker
-                        # coincides with NT's native execution dot instead of the
-                        # (delayed) decision time. Only engine fills; manual fills
-                        # already show natively.
+                        # paint the ACTUAL fill (real ts+price). Engine fills ->
+                        # on_live_fill. MANUAL fills do NOT show natively once the
+                        # relay strategy is on the chart (NT hijacks the execution
+                        # display), so we re-draw them ourselves via on_manual_fill.
                         if attributed and self.on_live_fill is not None:
                             await self.on_live_fill(ev)
+                        elif not attributed and self.on_manual_fill is not None:
+                            await self.on_manual_fill(ev)
                     # account-level PositionUpdates are NOT broadcast to
                     # strategies: each sleeve sees only its own attributed book
         finally:

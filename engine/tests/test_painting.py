@@ -241,3 +241,19 @@ def test_fill_arrows_reasserted_on_top_after_zones():
 
     asyncio.run(go())
     assert "eng-fill-1" in pc._arrows                          # remembered
+
+
+def test_manual_fill_is_redrawn():
+    """Unattributed (manual) fills are surfaced via on_manual_fill and drawn
+    green/red, since the relay-on-chart suppresses NT's native markers."""
+    from engine.core.events import Fill
+    p = _painter()
+    pc = PaintController(p, [])
+
+    async def go():
+        await pc.manual_fill(Fill(7 * NS, "", "ES", 5010.0, -1, 0.0, 0.0, ""))
+
+    asyncio.run(go())
+    arrows = [m for m in p._w.lines if m.get("kind") == "arrow"]
+    assert arrows and arrows[-1]["dir"] == -1
+    assert "eng-manual-1" in pc._arrows          # remembered so it stays on top

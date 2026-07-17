@@ -108,6 +108,7 @@ class PaintController:
         self._n_live = 0
         self._n_ghost = 0
         self._n_paper = 0
+        self._n_manual = 0
         self._ghost_by_tag: dict[str, int] = {}
         self._paper_by_tag: dict[str, int] = {}
         self._arrows: dict[str, tuple] = {}   # fill arrows to re-assert above zones
@@ -148,6 +149,18 @@ class PaintController:
         await self.p.arrow(tag, f.ts, f.price, side,
                            color=LIVE_UP if side > 0 else LIVE_DN,
                            label=f"{f.tag} @{f.price:.2f}")
+
+    async def manual_fill(self, f) -> None:
+        """Re-draw a MANUAL (unattributed) fill. The relay strategy on the chart
+        suppresses NT's native execution markers, so we redraw the user's own
+        orders (green up / red down) to keep them visible."""
+        self._n_manual += 1
+        side = 1 if f.size > 0 else -1
+        tag = f"eng-manual-{self._n_manual}"
+        color = LIVE_UP if side > 0 else LIVE_DN
+        label = f"{f.price:.2f}"
+        self._remember_arrow(tag, f.ts, f.price, side, color, label)
+        await self.p.arrow(tag, f.ts, f.price, side, color=color, label=label)
 
     async def paper_fill(self, f) -> None:
         """Paint a PAPER (non-live) sleeve's fill in a distinct muted colour so
