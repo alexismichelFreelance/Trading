@@ -113,7 +113,7 @@ class PaintController:
         self._last_px = 0.0
         self._warm_n = 0
         self._gamma: dict | None = None       # prior-session gamma levels (ES terms)
-        self._gamma_painted = False
+        self._gamma_bucket = -1
 
     # ── signals ───────────────────────────────────────────────────────────
     async def ghost_one(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:
@@ -173,7 +173,9 @@ class PaintController:
                 await self._paint_status(False, backfill_bars, bar.c)
 
     async def _paint_zones(self, now_ts: int) -> None:
-        bucket = now_ts // (10 * 60 * NS)          # extend zone rects every 10m, not 2m
+        bucket = now_ts // (4 * 60 * NS)           # re-assert zone rects every 4m
+        # (fast enough to recover within minutes of a chart refresh, still ~2.5x
+        # fewer redraws than the original 2m to keep NT8 responsive)
         for tf in TF_ORDER:
             for z in self.zv.book[tf].zones:
                 tag = f"eng-zone-{tf}-{z.formed_ts}-{z.direction}"
@@ -213,13 +215,14 @@ class PaintController:
     def set_gamma_levels(self, levels: dict | None) -> None:
         """Store prior-session gamma levels (ES terms) to draw as S/R lines."""
         self._gamma = levels
-        self._gamma_painted = False
+        self._gamma_bucket = -1
 
     async def _paint_gamma(self, now_ts: int) -> None:
         g = self._gamma
-        if not g or self._gamma_painted:           # static prior-session levels:
-            return                                  # draw once, not every bar
-        self._gamma_painted = True
+        bucket = now_ts // (4 * 60 * NS)           # re-assert every 4m so the lines
+        if not g or bucket == self._gamma_bucket:  # recover after a chart refresh
+            return                                  # (static levels; cheap, 3 objects)
+        self._gamma_bucket = bucket
         reg = "long-gamma" if g["net_sign"] > 0 else "SHORT-gamma"
         rows = [("eng-gex-pw", g["put_wall"], GEX_PUT, "put wall"),
                 ("eng-gex-cw", g["call_wall"], GEX_CALL, "call wall")]
