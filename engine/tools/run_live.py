@@ -172,6 +172,10 @@ async def main() -> None:
                     help="DANGER: let strategies trade on backfill bars (debug only)")
     ap.add_argument("--no-paint", action="store_true",
                     help="disable NT8 chart drawing (ghost signals, zones, status box)")
+    ap.add_argument("--paper-paint", action="store_true",
+                    help="also PAINT paper-sleeve fills (cyan). Default OFF: 10 paper "
+                         "sleeves add many chart objects; they're always recorded to "
+                         "claude_paper_fills regardless (review via tools/scorecard.py)")
     ap.add_argument("--panel", default="bottomleft",
                     choices=["bottomleft", "topright", "bottomright", "topleft"],
                     help="corner for the engine info panel (default bottomleft)")
@@ -297,7 +301,7 @@ async def main() -> None:
     # paper fills: paint (muted cyan, if painting) AND persist to claude_paper_fills
     # (if recording), tagged with the owning sleeve label.
     async def _paper_sink(f):
-        if pc is not None:
+        if pc is not None and a.paper_paint:     # painting paper fills is opt-in (chart load)
             await pc.paper_fill(f)
         if paper_blot is not None:
             await paper_blot.record(f, label_by_id.get(id(eng._owner.get(f.order_id)), "?"))
