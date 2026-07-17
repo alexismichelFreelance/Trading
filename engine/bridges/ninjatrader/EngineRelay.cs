@@ -176,8 +176,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
             if (batch != null)
+            {
                 foreach (MiniJson m in batch)
                     HandleDraw(m);
+                // Draw.* only ADDS objects; the chart renders them on its own paint
+                // pass. Without this the overlays stay invisible until the user
+                // interacts with the chart (a mouse move / close forces a repaint).
+                // Only fires when a batch was actually drawn, so it stays cheap.
+                try { ForceRefresh(); }
+                catch (Exception ex) { lastDrawErr = "refresh:" + ex.Message; }
+            }
             if ((DateTime.Now - lastDrawLog).TotalSeconds >= 5 && (rxDraws > 0 || execDraws > 0))
             {
                 lastDrawLog = DateTime.Now;
