@@ -4,6 +4,18 @@ The engine is safe to run daily in paper (Sim101) alongside manual trading:
 per-strategy attribution, the RiskSupervisor (in-flight vetting, caps, rate
 limit, kill switch, EOD flatten), the GEX regime gate, and the one-chart overlay.
 
+## NT8 setup — TWO components (this is why you get orders AND overlays)
+A NinjaTrader **strategy** on a chart suppresses the native order/execution
+display; an **indicator** does not. So the bridge is split:
+- **EngineRelay** (strategy, `Strategies/EngineBridge.cs`): data + order routing.
+  Run it from **Control Center → Strategies** (OFF the chart) on Sim101,
+  Calculate = On each tick. Sockets: market 36001, broker 36002.
+- **EngineOverlay** (indicator, `Indicators/EngineOverlay.cs`): all chart drawing
+  (zones / gamma / S-R / signals / status). Add it **to your ES chart**. Socket:
+  draw 36004. Indicators don't hide orders, so your native markers stay visible.
+Compile both (F5). Result: native orders AND engine overlays on one chart.
+`run_live` connects feed→36001, broker→36002, painter→36004 (all defaults).
+
 ## Paper vs live model
 EVERY strategy + variant ALWAYS paper-trades (visible signals, own book, never
 sent to the broker, never risk/regime gated — you see the raw strategy). Only the

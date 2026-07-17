@@ -1,9 +1,12 @@
 // EngineRelay.cs — NinjaTrader 8 NinjaScript relay for the Python trading engine.
 //
-// REFERENCE IMPLEMENTATION — compile in NT8 (New > NinjaScript Editor > Strategy),
-// then add EngineRelay to an ES chart running on your SIM account with
-// "Calculate = On each tick". It exposes two local sockets speaking the engine's
-// line-delimited JSON protocol (engine/adapters/protocol.py):
+// RUN THIS FROM THE CONTROL CENTER (Control Center > Strategies tab), NOT on a
+// chart. A STRATEGY applied to a chart suppresses NT's native order/execution
+// display — so this data/order relay runs off-chart, and the CHART DRAWING lives
+// in the EngineOverlay INDICATOR (add THAT to your chart; indicators don't hide
+// orders). Both on the SIM account => native orders AND engine overlays together.
+// It exposes two local sockets speaking the engine's line-delimited JSON protocol
+// (engine/adapters/protocol.py):
 //
 //   market port 36001 (engine's NinjaTraderFeed connects): trade / quote / depth
 //   broker port 36002 (engine's NinjaTraderBroker connects): reads place/cancel/

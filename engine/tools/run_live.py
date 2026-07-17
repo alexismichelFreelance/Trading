@@ -168,6 +168,9 @@ async def main() -> None:
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = run until Ctrl-C)")
     ap.add_argument("--market-port", type=int, default=36001)
     ap.add_argument("--broker-port", type=int, default=36002)
+    ap.add_argument("--draw-port", type=int, default=36004,
+                    help="EngineOverlay INDICATOR's draw socket (drawing lives in an "
+                         "indicator, on the chart, so it never hides your orders)")
     ap.add_argument("--no-warmup-gate", action="store_true",
                     help="DANGER: let strategies trade on backfill bars (debug only)")
     ap.add_argument("--no-paint", action="store_true",
@@ -267,7 +270,7 @@ async def main() -> None:
     print(f"roster ({len(roster)}): LIVE->NT8 {live_lbls or '(none)'}  |  "
           f"PAPER {paper_lbls}")
 
-    painter = NTChartPainter("127.0.0.1", a.broker_port)
+    painter = NTChartPainter("127.0.0.1", a.draw_port)
     pc: PaintController | None = None
     if not a.no_paint:
         if await painter.connect():

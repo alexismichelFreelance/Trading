@@ -1,11 +1,12 @@
-"""NTChartPainter — draws on the NT8 chart through the relay's broker socket.
+"""NTChartPainter — draws on the NT8 chart through the EngineOverlay INDICATOR's
+socket (draw port 36004), NOT the strategy.
 
-The relay accepts any number of broker-socket clients; this one only ever SENDS
-"draw" messages (arrow / rect / hline / line / text / status / remove), so it
-never interferes with order flow. Same-tag redraw REPLACES the object on the
-chart (NT semantics) — movable lines and extending rectangles are one message
-each. Fire-and-forget: a dead socket disables painting with a warning rather
-than touching the trading path.
+The drawing lives in an indicator (EngineOverlay) so it coexists with NT's native
+order/execution display — a STRATEGY on a chart hides those, an indicator does
+not. This client only ever SENDS "draw" messages (arrow / rect / hline / line /
+text / status / remove). Same-tag redraw REPLACES the object on the chart (NT
+semantics). Fire-and-forget: a dead socket disables painting with a warning
+rather than touching the trading path.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ log = logging.getLogger("engine.painter")
 
 
 class NTChartPainter:
-    def __init__(self, host: str = "127.0.0.1", port: int = 36002) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 36004) -> None:
         self.host, self.port = host, port
         self._w: asyncio.StreamWriter | None = None
         self.enabled = False
