@@ -120,7 +120,8 @@ class PaintController:
         self._gamma_bucket = -1
 
     # ── signals ───────────────────────────────────────────────────────────
-    async def ghost_one(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:
+    async def ghost_one(self, ts: int, side: int, qty: int, tag: str, px: float,
+                        symbol: str = "") -> None:
         base = tag.split("-")[0] if tag else "sig"
         if self._ghost_by_tag.get(base, 0) >= GHOST_CAP_PER_TAG:
             return
@@ -130,7 +131,7 @@ class PaintController:
                            color=GHOST, label=f"[{tag}]")
 
     async def ghost_signals(self, signals: list) -> None:
-        for ts, side, qty, tag, px in signals[-200:]:
+        for ts, side, qty, tag, px, *_ in signals[-200:]:
             await self.ghost_one(ts, side, qty, tag, px)
 
     async def live_order(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:

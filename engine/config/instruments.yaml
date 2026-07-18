@@ -1,12 +1,23 @@
 # Per-instrument contract specs. Root symbols; contract months (ESM5/ESH5)
 # resolve to their root via engine.core.config.root_symbol().
+# Unknown keys land in InstrumentSpec.extra (options-ready escape hatch).
 instruments:
   ES:
     point_usd: 50.0
     tick: 0.25
+    asset_class: future
+    hmm_path: config/hmm_es_1h.json
+    round_step: 50.0
+    replay:
+      sec_tables:
+        ESM5: claude_sec_feat
+        ESH5: claude_sec_feat_esh5
+      bars_table: claude_bars_1m
   NQ:
     point_usd: 20.0
     tick: 0.25
+    asset_class: future
   GC:
     point_usd: 100.0
     tick: 0.10
+    asset_class: future

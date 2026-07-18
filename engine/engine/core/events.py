@@ -41,6 +41,7 @@ class Trade:
     price: float
     size: int         # contracts (>0)
     aggressor: int    # +1 buy, -1 sell
+    symbol: str = ""  # instrument lane; "" = unspecified (single-instrument feed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,7 @@ class Quote:
     ask: float
     bid_size: int
     ask_size: int
+    symbol: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +61,7 @@ class DepthUpdate:
     price: float
     size: int         # new resting size at this level (0 = level removed)
     level: int        # 0 = top of book
+    symbol: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +73,7 @@ class Bar:
     l: float
     c: float
     v: int
+    symbol: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +84,7 @@ class BookFlow:
     ask_cancel: int   # size of resting ASKs cancelled
     bid_add: int      # size of resting BIDs added
     ask_add: int      # size of resting ASKs added
+    symbol: str = ""
 
 
 # ── inbound (broker -> strategy) ─────────────────────────────────────────────

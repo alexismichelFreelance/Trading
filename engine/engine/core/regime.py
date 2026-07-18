@@ -35,19 +35,27 @@ def increases_exposure(base: int, side: int, qty: int) -> bool:
 
 class RegimeGate:
     def __init__(self, gamma, trend_sleeves=TREND_SLEEVES, mr_sleeves=MR_SLEEVES,
-                 max_pctl: float = 1.0 / 3.0, enabled: bool = True) -> None:
+                 max_pctl: float = 1.0 / 3.0, enabled: bool = True,
+                 symbols: set[str] | None = None) -> None:
         self.gamma = gamma                       # GammaRegime | None
         self.trend = set(trend_sleeves)
         self.mr = set(mr_sleeves)
         self.max_pctl = max_pctl                 # gexp_prev threshold; trend<=, MR>
         self.enabled = enabled
+        # SPX dealer-gamma is an ES/SPX signal: `symbols` limits the gate to
+        # those instrument lanes (None = all, the single-instrument legacy).
+        # An NQ/GC sleeve must never be gated by SPX gamma.
+        self.symbols = symbols
         self._logged_days: set[str] = set()      # log the day's regime once
 
-    def blocks(self, name: str, base: int, side: int, qty: int, ts: int) -> bool:
+    def blocks(self, name: str, base: int, side: int, qty: int, ts: int,
+               symbol: str = "") -> bool:
         """True -> suppress this ENTRY. Trend sleeves are blocked on non-short-gamma
         days; mean-reversion sleeves are blocked on short-gamma days (the exact
         complement). Exits/reduces and ungated sleeves are never blocked; fail-open
         on unknown regime."""
+        if self.symbols is not None and symbol not in self.symbols:
+            return False                          # out-of-scope instrument lane
         is_trend, is_mr = name in self.trend, name in self.mr
         if not self.enabled or not (is_trend or is_mr):
             return False

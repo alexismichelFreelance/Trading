@@ -1,0 +1,23 @@
+# Per-instrument LIVE lane config, consumed by tools/run_live.py --instruments.
+# Each lane needs its own EngineRelay (strategy on that instrument's minimized
+# chart, with matching MarketPort/BrokerPort properties) and its own
+# EngineOverlay indicator (DrawPort) on the chart you watch.
+#
+#   .venv/Scripts/python.exe tools/run_live.py --instruments ES        # same as default
+#   .venv/Scripts/python.exe tools/run_live.py --instruments ES,NQ    # two lanes
+#
+# paper: roster that always paper-trades ('all' or comma list of labels)
+# live:  subset that ALSO routes to the NT8 broker ('' = pure paper)
+instruments:
+  ES:
+    market_port: 36001
+    broker_port: 36002
+    draw_port: 36004
+    paper: all
+    live: ""
+  NQ:
+    market_port: 36011
+    broker_port: 36012
+    draw_port: 36014
+    paper: "zones,flow"          # start small: structure + flow only
+    live: ""

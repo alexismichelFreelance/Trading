@@ -23,7 +23,7 @@ class ReplayFeed:
     def __init__(self, qdb: AsyncQuestDB, table: str = "claude_sec_feat",
                  start: str | None = None, end: str | None = None,
                  days: list[str] | None = None, bars_symbol: str | None = None,
-                 bars_table: str = "claude_bars_1m") -> None:
+                 bars_table: str = "claude_bars_1m", symbol: str = "") -> None:
         self.qdb = qdb
         self.table = table
         self.start = start
@@ -31,6 +31,9 @@ class ReplayFeed:
         self._days = days
         self.bars_symbol = bars_symbol
         self.bars_table = bars_table
+        # instrument lane stamped on every emitted event (contract, e.g. 'ESM5');
+        # defaults to bars_symbol so existing callers get stamping for free.
+        self.symbol = symbol or (bars_symbol or "")
 
     def _range_where(self, col: str = "ts") -> str:
         cl = []
@@ -58,6 +61,7 @@ class ReplayFeed:
         ac = df["ask_cancel"].astype("int64").to_numpy()
         ba = df["bid_add"].astype("int64").to_numpy()
         aa = df["ask_add"].astype("int64").to_numpy()
+        sym = self.symbol
         out: list[tuple[int, int, MarketEvent]] = []
         for i in range(len(df)):
             t = int(ts[i])
@@ -66,10 +70,10 @@ class ReplayFeed:
                 buy = (av + ad) // 2
                 sell = (av - ad) // 2
                 if buy > 0:
-                    out.append((t, 1, Trade(t, float(px), int(buy), BUY)))
+                    out.append((t, 1, Trade(t, float(px), int(buy), BUY, sym)))
                 if sell > 0:
-                    out.append((t, 1, Trade(t, float(px), int(sell), SELL)))
-            out.append((t, 2, BookFlow(t, int(bc[i]), int(ac[i]), int(ba[i]), int(aa[i]))))
+                    out.append((t, 1, Trade(t, float(px), int(sell), SELL, sym)))
+            out.append((t, 2, BookFlow(t, int(bc[i]), int(ac[i]), int(ba[i]), int(aa[i]), sym)))
         return out
 
     async def _bar_events(self, day: str) -> list[tuple[int, int, MarketEvent]]:
@@ -80,12 +84,13 @@ class ReplayFeed:
             f"WHERE symbol = '{self.bars_symbol}' "
             f"AND ts >= '{day}T00:00:00.000000Z' AND ts < '{day}T23:59:59.999999Z' ORDER BY ts")
         ts = df["ts"].astype("int64").to_numpy()
+        sym = self.symbol
         out = []
         for i in range(len(df)):
             close_ts = int(ts[i]) + _MIN_NS    # emit at bar close (causal)
             out.append((close_ts, 0, Bar(close_ts, "1m", float(df["o"].iloc[i]),
                                          float(df["h"].iloc[i]), float(df["l"].iloc[i]),
-                                         float(df["c"].iloc[i]), int(df["vol"].iloc[i]))))
+                                         float(df["c"].iloc[i]), int(df["vol"].iloc[i]), sym)))
         return out
 
     async def stream(self) -> AsyncIterator[MarketEvent]:

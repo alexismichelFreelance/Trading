@@ -7,11 +7,12 @@
 //   - EngineOverlay (this indicator) lives ON the chart and only DRAWS. It opens
 //     one local socket (draw port 36004) that the engine's NTChartPainter connects
 //     to and sends draw messages.
-//   - EngineRelay (the strategy) runs from the CONTROL CENTER (off the chart) and
-//     does data + order routing. Off the chart, it can't hide your orders.
+//   - EngineRelay (the strategy) does data + order routing. It hides orders on
+//     its own chart, so put it on a SEPARATE minimized ES chart you never watch.
 //
-// Add EngineOverlay to your ES chart; run EngineRelay from Control Center. Both
-// on the SIM account. You get native orders AND engine overlays on one chart.
+// Add EngineOverlay to your MAIN ES chart; put EngineRelay on a second minimized
+// ES chart. Both on the SIM account. Your main chart then shows native orders AND
+// engine overlays together (the indicator never suppresses order display).
 #region Using declarations
 using System;
 using System.Collections.Generic;
@@ -21,6 +22,8 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Windows.Media;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
 using NinjaTrader.NinjaScript;

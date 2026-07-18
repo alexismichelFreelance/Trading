@@ -31,20 +31,23 @@ def encode(obj: dict) -> bytes:
     return (json.dumps(obj, separators=(",", ":")) + "\n").encode()
 
 
-def decode_market(m: dict) -> MarketEvent | None:
+def decode_market(m: dict, symbol: str = "") -> MarketEvent | None:
+    """`symbol` is the receiving adapter's instrument lane (one socket = one
+    instrument today). A "symbol" key in the wire message wins if present."""
     t = m.get("t")
     ts = int(m["ts"])
+    sym = m.get("symbol", symbol)
     if t == "trade":
-        return Trade(ts, float(m["price"]), int(m["size"]), int(m["aggressor"]))
+        return Trade(ts, float(m["price"]), int(m["size"]), int(m["aggressor"]), sym)
     if t == "quote":
-        return Quote(ts, float(m["bid"]), float(m["ask"]), int(m["bid_size"]), int(m["ask_size"]))
+        return Quote(ts, float(m["bid"]), float(m["ask"]), int(m["bid_size"]), int(m["ask_size"]), sym)
     if t == "depth":
-        return DepthUpdate(ts, int(m["side"]), float(m["price"]), int(m["size"]), int(m.get("level", 0)))
+        return DepthUpdate(ts, int(m["side"]), float(m["price"]), int(m["size"]), int(m.get("level", 0)), sym)
     if t == "bar":
-        return Bar(ts, m["tf"], float(m["o"]), float(m["h"]), float(m["l"]), float(m["c"]), int(m["v"]))
+        return Bar(ts, m["tf"], float(m["o"]), float(m["h"]), float(m["l"]), float(m["c"]), int(m["v"]), sym)
     if t == "bookflow":
         return BookFlow(ts, int(m["bid_cancel"]), int(m["ask_cancel"]),
-                        int(m["bid_add"]), int(m["ask_add"]))
+                        int(m["bid_add"]), int(m["ask_add"]), sym)
     return None
 
 

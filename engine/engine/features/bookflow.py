@@ -35,8 +35,8 @@ class BookFlowAggregator:
         elif delta < 0:                       # cancel
             self._acc[0 if du.side == BID else 1] += -delta
 
-    def snapshot(self, sec: int) -> BookFlow:
-        bf = BookFlow(sec * NS, self._acc[0], self._acc[1], self._acc[2], self._acc[3])
+    def snapshot(self, sec: int, symbol: str = "") -> BookFlow:
+        bf = BookFlow(sec * NS, self._acc[0], self._acc[1], self._acc[2], self._acc[3], symbol)
         self._acc = [0, 0, 0, 0]
         return bf
 

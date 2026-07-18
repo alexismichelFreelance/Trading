@@ -1,10 +1,12 @@
 // EngineRelay.cs — NinjaTrader 8 NinjaScript relay for the Python trading engine.
 //
-// RUN THIS FROM THE CONTROL CENTER (Control Center > Strategies tab), NOT on a
-// chart. A STRATEGY applied to a chart suppresses NT's native order/execution
-// display — so this data/order relay runs off-chart, and the CHART DRAWING lives
-// in the EngineOverlay INDICATOR (add THAT to your chart; indicators don't hide
-// orders). Both on the SIM account => native orders AND engine overlays together.
+// PUT THIS ON A SECOND, MINIMIZED ES CHART you never watch — NOT on your main
+// chart. A STRATEGY applied to a chart suppresses THAT chart's native order/
+// execution display, and NT8 can't run a strategy without a chart (the Control
+// Center Strategies tab only monitors, it can't start one). So the relay lives on
+// a throwaway chart, while the CHART DRAWING lives in the EngineOverlay INDICATOR
+// (add THAT to your MAIN chart; indicators don't hide orders). Both on the SIM
+// account => your main chart shows native orders AND engine overlays together.
 // It exposes two local sockets speaking the engine's line-delimited JSON protocol
 // (engine/adapters/protocol.py):
 //
@@ -24,6 +26,7 @@
 #region Using declarations
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -43,8 +46,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public class EngineRelay : Strategy
     {
-        private const int MarketPort = 36001;
-        private const int BrokerPort = 36002;
+        // Sockets are per-instrument lanes: run ONE EngineRelay per instrument
+        // chart, each with its own port pair (ES 36001/36002 defaults; NQ e.g.
+        // 36011/36012 — must match config/live.yaml on the Python side).
+        [NinjaScriptProperty]
+        [Display(Name = "MarketPort", GroupName = "Engine", Order = 1)]
+        public int MarketPort { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "BrokerPort", GroupName = "Engine", Order = 2)]
+        public int BrokerPort { get; set; }
 
         private TcpListener marketListener, brokerListener;
         private readonly List<TcpClient> marketClients = new List<TcpClient>();
@@ -93,6 +104,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsExitOnSessionCloseStrategy = false;   // never auto-flatten anything
                 IsAdoptAccountPositionAware = false;    // account/manual pos is NOT ours
                 StartBehavior = StartBehavior.ImmediatelySubmit;  // don't wait-until-flat
+                MarketPort = 36001;                     // per-instrument lane ports
+                BrokerPort = 36002;
             }
             else if (State == State.Realtime)
             {

@@ -53,8 +53,9 @@ class _Pos:
 
 
 class DipBuyStrategy(BaseStrategy):
-    def __init__(self, symbol: str) -> None:
+    def __init__(self, symbol: str, point_usd: float = 50.0) -> None:
         self.symbol = symbol
+        self.point_usd = point_usd     # $/pt for sizing (from InstrumentSpec)
         self.pos = 0
         self.trade: _Pos | None = None
         self._day: str | None = None
@@ -146,7 +147,7 @@ class DipBuyStrategy(BaseStrategy):
 
     def _enter(self, d: int, level: float, vwap: float, dset: str) -> list[Order]:
         stop = level - d * STOP_BUF
-        size = position_size(RISK, STOP_BUF, 50.0, SIZE_CAP)
+        size = position_size(RISK, STOP_BUF, self.point_usd, SIZE_CAP)
         if size <= 0:
             return []
         self.trade = _Pos(dir=d, entry=level, stop=stop, runner_tgt=vwap, size=size,

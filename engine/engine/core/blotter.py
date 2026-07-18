@@ -103,15 +103,42 @@ class TradeLedger:
 
 
 class Blotter:
-    """Logging + the ledger + parity-friendly summaries."""
+    """Logging + per-symbol ledgers + parity-friendly summaries.
+
+    Portfolio-capable: fills route to their symbol's TradeLedger (average-cost
+    accounting must never mix instruments). The single-symbol constructor is
+    unchanged and behaves exactly as before; `add_instrument` registers more.
+    A fill for an UNREGISTERED symbol auto-creates a ledger with the default
+    point_usd and logs loudly — that usually means a lane-key mismatch
+    (e.g. 'ESM5' feed vs 'ES' blotter), so make it visible, don't corrupt."""
 
     def __init__(self, symbol: str, point_usd: float, verbose: bool = False) -> None:
-        self.ledger = TradeLedger(symbol, point_usd)
-        self.point_usd = point_usd
+        self._ledgers: dict[str, TradeLedger] = {symbol: TradeLedger(symbol, point_usd)}
+        self._default_symbol = symbol
+        self.point_usd = point_usd            # default for auto-created ledgers
         self.verbose = verbose
         self.n_market = 0
         self.n_orders = 0
         self.n_fills = 0
+
+    # ── instruments ────────────────────────────────────────────────────────
+    def add_instrument(self, symbol: str, point_usd: float) -> None:
+        if symbol not in self._ledgers:
+            self._ledgers[symbol] = TradeLedger(symbol, point_usd)
+
+    @property
+    def ledger(self) -> TradeLedger:          # back-compat: the default ledger
+        return self._ledgers[self._default_symbol]
+
+    def ledger_for(self, symbol: str) -> TradeLedger:
+        led = self._ledgers.get(symbol)
+        if led is None:
+            log.warning("Blotter: fill for UNREGISTERED symbol %r (have %s) — "
+                        "auto-creating ledger with default point_usd %.2f. "
+                        "Check the lane key (contract vs root?).",
+                        symbol, sorted(self._ledgers), self.point_usd)
+            led = self._ledgers[symbol] = TradeLedger(symbol, self.point_usd)
+        return led
 
     # event hooks ----------------------------------------------------------
     def on_market_event(self, e) -> None:
@@ -125,7 +152,7 @@ class Blotter:
     def on_broker_event(self, be: BrokerEvent) -> None:
         if isinstance(be, Fill):
             self.n_fills += 1
-            self.ledger.on_fill(be)
+            self.ledger_for(be.symbol or self._default_symbol).on_fill(be)
             if self.verbose:
                 log.info("FILL %s", be)
         elif isinstance(be, (PositionUpdate, AccountUpdate)) and self.verbose:
@@ -134,24 +161,37 @@ class Blotter:
     # summaries ------------------------------------------------------------
     @property
     def trades(self) -> list[TradeRecord]:
-        return self.ledger.trades
+        if len(self._ledgers) == 1:
+            return self.ledger.trades
+        out: list[TradeRecord] = []
+        for led in self._ledgers.values():
+            out += led.trades
+        return sorted(out, key=lambda t: t.entry_ts)
+
+    def _pusd(self, symbol: str) -> float:
+        led = self._ledgers.get(symbol)
+        return led.point_usd if led is not None else self.point_usd
 
     def net_points(self, flat_cost_pts: float = 0.0) -> float:
         """Total net contract-points. `flat_cost_pts` subtracts a flat round-turn
-        cost per trade (used for the 0.517-pt ignition/flow parity)."""
+        cost per trade (used for the 0.517-pt ignition/flow parity). NOTE: points
+        are only comparable within one symbol; for portfolios use net_usd."""
         return sum(t.gross_points for t in self.trades) - flat_cost_pts * len(self.trades)
 
     def net_usd(self, flat_cost_pts: float = 0.0) -> float:
-        gross = sum(t.gross_points for t in self.trades) * self.point_usd
-        comm = sum(t.commission_usd for t in self.trades)
-        return gross - comm - flat_cost_pts * self.point_usd * len(self.trades)
+        out = 0.0
+        for t in self.trades:
+            pu = self._pusd(t.symbol)
+            out += t.gross_points * pu - t.commission_usd - flat_cost_pts * pu
+        return out
 
     def by_month(self, flat_cost_pts: float = 0.0) -> dict[str, dict]:
         out: dict[str, dict] = {}
         for t in self.trades:
+            pu = self._pusd(t.symbol)
             m = out.setdefault(t.month, {"n": 0, "pts": 0.0, "usd": 0.0, "wins": 0})
             net_pts = t.gross_points - flat_cost_pts
-            net_usd = t.gross_points * self.point_usd - t.commission_usd - flat_cost_pts * self.point_usd
+            net_usd = t.gross_points * pu - t.commission_usd - flat_cost_pts * pu
             m["n"] += 1
             m["pts"] += net_pts
             m["usd"] += net_usd
@@ -159,11 +199,20 @@ class Blotter:
         return dict(sorted(out.items()))
 
     def summary(self, flat_cost_pts: float = 0.0) -> str:
-        rows = self.by_month(flat_cost_pts)
         lines = [f"{'month':<9} {'n':>4} {'win%':>5} {'net_pts':>9} {'net_usd':>11}"]
-        for m, r in rows.items():
+        for m, r in self.by_month(flat_cost_pts).items():
             win = 100.0 * r["wins"] / r["n"] if r["n"] else 0.0
             lines.append(f"{m:<9} {r['n']:>4} {win:>5.0f} {r['pts']:>9.1f} {r['usd']:>11,.0f}")
+        if len(self._ledgers) > 1:                     # per-symbol sections
+            for sym in sorted(self._ledgers):
+                led = self._ledgers[sym]
+                if not led.trades:
+                    continue
+                pts = sum(t.gross_points for t in led.trades)
+                usd = sum(t.gross_points * led.point_usd - t.commission_usd
+                          for t in led.trades)
+                lines.append(f"  {sym:<7} {len(led.trades):>4} {'':>5} "
+                             f"{pts:>9.1f} {usd:>11,.0f}")
         lines.append(f"{'TOTAL':<9} {len(self.trades):>4} {'':>5} "
                      f"{self.net_points(flat_cost_pts):>9.1f} {self.net_usd(flat_cost_pts):>11,.0f}")
         return "\n".join(lines)

@@ -59,8 +59,9 @@ class _Trade:
 class ZoneLifecycleStrategy(BaseStrategy):
     def __init__(self, symbol: str,
                  gate_utc: tuple[int, int] | None = (13, 21),
-                 gap_thr: float = 0.0) -> None:
+                 gap_thr: float = 0.0, point_usd: float = 50.0) -> None:
         self.symbol = symbol
+        self.point_usd = point_usd     # $/pt for sizing (from InstrumentSpec)
         self.agg = BarAggregator(("30m",))
         # gap_thr>0: also detect RTH-open gap zones, faded only after a
         # leave-and-return (naive immediate-fade lost -$36k; see
@@ -128,7 +129,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
 
     def _enter(self, setup: str, d: int, entry: float, stop: float, target: float) -> list[Order]:
         risk = abs(entry - stop)
-        size = position_size(RISK, risk, 50.0, 30)
+        size = position_size(RISK, risk, self.point_usd, 30)
         if size <= 0:
             return []
         self.trade = _Trade(setup, d, entry, stop, target, size,

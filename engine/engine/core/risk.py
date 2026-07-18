@@ -46,9 +46,14 @@ def _sign(x) -> int:
 
 @dataclass
 class RiskConfig:
-    point_value: float = 50.0
+    point_value: float = 50.0                # fallback $/pt (single-instrument legacy)
+    point_usd: dict[str, float] | None = None   # per-symbol $/pt (multi-instrument)
     max_pos_per_sleeve: int | None = None    # cap on |attributed position| per strategy
-    max_account_gross: int | None = None     # cap on sum of |sleeve exposure|
+    max_account_gross: int | None = None     # cap on sum of |sleeve exposure| (contracts)
+    # dollar-notional caps — comparable across instruments (contracts x px x $/pt).
+    # Contract caps above stay enforceable IN ADDITION (belt and suspenders).
+    max_sleeve_notional_usd: float | None = None
+    max_gross_notional_usd: float | None = None
     rate_max_orders: int | None = None       # per strategy per rolling rate_window_s
     rate_window_s: float = 5.0
     daily_loss_halt: float | None = None     # USD (negative); marked = realized + open
@@ -76,6 +81,8 @@ class RiskSupervisor:
         # so the kill switch is self-contained and unit-testable)
         self._pos: dict[int, int] = {}
         self._avg: dict[int, float] = {}
+        self._sym: dict[int, str] = {}       # sid -> symbol (learned from orders/books)
+        self._px: dict[str, float] = {}      # symbol -> last mark (note_price)
         self._realized = 0.0
         self._day: str | None = None
         self.halted = False
@@ -116,6 +123,42 @@ class RiskSupervisor:
             expo[s] = expo.get(s, 0) + q
         return sum(abs(v) for v in expo.values())
 
+    # ── multi-instrument helpers ─────────────────────────────────────────
+    def _pv(self, symbol: str) -> float:
+        """$/pt for a symbol; falls back to the legacy scalar point_value."""
+        if self.cfg.point_usd:
+            v = self.cfg.point_usd.get(symbol)
+            if v is not None:
+                return v
+        return self.cfg.point_value
+
+    def note_price(self, symbol: str, px: float) -> None:
+        """Engine feeds every lane's last price (also during warmup) so dollar
+        caps always have a mark by the time the first live order is vetted."""
+        if px > 0:
+            self._px[symbol] = px
+
+    def _mark(self, symbol: str) -> float:
+        return self._px.get(symbol) or self._px.get("", 0.0)
+
+    def _gross_usd(self) -> float:
+        """Account gross in dollars: sum |confirmed + in-flight| x px x $/pt."""
+        expo: dict[int, int] = dict(self._pos)
+        for s, q, _ in self._pending.values():
+            expo[s] = expo.get(s, 0) + q
+        out = 0.0
+        for s, q in expo.items():
+            if q == 0:
+                continue
+            sym = self._sym.get(s, "")
+            px = self._mark(sym)
+            if px <= 0:
+                log.warning("risk: no mark for %r book (sid %d) — its notional "
+                            "reads as 0 in the gross cap", sym, s)
+                continue
+            out += abs(q) * px * self._pv(sym)
+        return out
+
     # ── the vet ──────────────────────────────────────────────────────────
     def vet(self, sid: int, name: str, o: Order, ts: int, pos: int) -> Order | None:
         """Returns the (possibly clamped) order, or None to drop. `pos` is the
@@ -123,6 +166,7 @@ class RiskSupervisor:
         self._roll_day(ts)
         self._expire_pending()
         c = self.cfg
+        self._sym[sid] = o.symbol            # learn the sleeve's instrument
 
         if self.halted:
             self._deny(name, o, "halted (daily loss)")
@@ -171,6 +215,33 @@ class RiskSupervisor:
                     log.warning("risk: clamped %s %s qty %d -> %d (account cap)",
                                 name, o.tag, o.qty, head)
                     o = dataclasses.replace(o, qty=head)
+            if increases and (c.max_sleeve_notional_usd is not None
+                              or c.max_gross_notional_usd is not None):
+                px = self._mark(o.symbol)
+                if px <= 0:                    # never let an unpriced lane bypass $ caps
+                    self._deny(name, o, f"no mark price for {o.symbol!r} (notional cap)")
+                    return None
+                unit = px * self._pv(o.symbol)             # $ per contract
+                if c.max_sleeve_notional_usd is not None:
+                    room = int((c.max_sleeve_notional_usd - abs(base) * unit) // unit)
+                    if room <= 0:
+                        self._deny(name, o, f"sleeve notional cap "
+                                            f"${c.max_sleeve_notional_usd:,.0f} (expo {base:+d})")
+                        return None
+                    if o.qty > room:
+                        log.warning("risk: clamped %s %s qty %d -> %d (sleeve $ cap)",
+                                    name, o.tag, o.qty, room)
+                        o = dataclasses.replace(o, qty=room)
+                if c.max_gross_notional_usd is not None:
+                    head = int((c.max_gross_notional_usd - self._gross_usd()) // unit)
+                    if head <= 0:
+                        self._deny(name, o, f"gross notional cap "
+                                            f"${c.max_gross_notional_usd:,.0f}")
+                        return None
+                    if o.qty > head:
+                        log.warning("risk: clamped %s %s qty %d -> %d (gross $ cap)",
+                                    name, o.tag, o.qty, head)
+                        o = dataclasses.replace(o, qty=head)
 
         if c.rate_max_orders is not None:
             now = self._now()
@@ -192,8 +263,13 @@ class RiskSupervisor:
                                      self._now() + self.cfg.inflight_ttl_s]
         self._stamps[sid].append(self._now())
 
-    def on_fill(self, sid: int, order_id: str, size: int, price: float) -> None:
-        """size is SIGNED filled qty."""
+    def on_fill(self, sid: int, order_id: str, size: int, price: float,
+                symbol: str = "") -> None:
+        """size is SIGNED filled qty. `symbol` keys the per-symbol $/pt; omitted
+        (legacy callers) falls back to the sleeve's learned symbol."""
+        if symbol:
+            self._sym[sid] = symbol
+        pv = self._pv(symbol or self._sym.get(sid, ""))
         p = self._pending.get(order_id)
         if p is not None:
             p[1] -= size
@@ -203,34 +279,54 @@ class RiskSupervisor:
         new = old + size
         if old == 0 or _sign(new) != _sign(old):
             if old != 0:                                   # crossed through flat
-                self._realized += (price - self._avg.get(sid, price)) * old \
-                    * self.cfg.point_value
+                self._realized += (price - self._avg.get(sid, price)) * old * pv
             self._avg[sid] = price
         elif _sign(size) == _sign(old):
             self._avg[sid] = (self._avg[sid] * abs(old) + price * abs(size)) \
                 / (abs(old) + abs(size))
         else:                                              # partial reduce
             self._realized += (price - self._avg.get(sid, price)) * _sign(old) \
-                * min(abs(size), abs(old)) * self.cfg.point_value
+                * min(abs(size), abs(old)) * pv
         self._pos[sid] = new
 
     # ── supervisor-owned actions (EOD flatten, kill switch) ──────────────
-    def marked_pnl(self, last_px: float) -> float:
-        unreal = sum((last_px - self._avg.get(s, last_px)) * p * self.cfg.point_value
-                     for s, p in self._pos.items() if p != 0)
+    def marked_pnl(self, last_px: float | dict[str, float]) -> float:
+        """`last_px` may be one price (legacy single-instrument) or a
+        {symbol: price} dict. A book with no usable mark is SKIPPED with an
+        error log (never silently mispriced with another symbol's price)."""
+        prices = last_px if isinstance(last_px, dict) else None
+        unreal = 0.0
+        for s, p in self._pos.items():
+            if p == 0:
+                continue
+            sym = self._sym.get(s, "")
+            px = (prices.get(sym) or prices.get("", 0.0)) if prices is not None \
+                else float(last_px)
+            if px <= 0:
+                log.error("risk: no mark price for %r book (sid %d) — skipped "
+                          "in marked P&L", sym, s)
+                continue
+            unreal += (px - self._avg.get(s, px)) * p * self._pv(sym)
         return self._realized + unreal
 
-    def on_market(self, ts: int, last_px: float,
+    def on_market(self, ts: int, last_px: float | dict[str, float],
                   books: list[tuple[int, str, str, int]]) -> list[tuple[int, Order]]:
-        """Called by the engine on market events (live only). `books` is
-        [(sid, name, symbol, confirmed_pos)]. Returns supervisor flatten
-        orders as (sid, Order) — the engine submits them owned by that
-        strategy so attribution stays consistent. Do NOT re-vet them."""
+        """Called by the engine on market events (live only). `last_px` is one
+        price (legacy) or {symbol: price}. `books` is [(sid, name, symbol,
+        confirmed_pos)]. Returns supervisor flatten orders as (sid, Order) —
+        the engine submits them owned by that strategy so attribution stays
+        consistent. Do NOT re-vet them."""
         self._roll_day(ts)
         self._expire_pending()
+        if isinstance(last_px, dict):
+            for sym, px in last_px.items():
+                self.note_price(sym, px)
+        for sid, _n, symbol, _p in books:                  # learn sid -> symbol
+            self._sym[sid] = symbol
         c = self.cfg
+        have_px = bool(last_px) if isinstance(last_px, dict) else last_px > 0
         tag = None
-        if c.daily_loss_halt is not None and not self.halted and last_px > 0 \
+        if c.daily_loss_halt is not None and not self.halted and have_px \
                 and self.marked_pnl(last_px) <= c.daily_loss_halt:
             self.halted = True
             tag = "risk_halt"

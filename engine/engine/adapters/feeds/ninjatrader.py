@@ -47,7 +47,7 @@ class NinjaTraderFeed:
                 if not line:
                     continue
                 try:
-                    ev = decode_market(json.loads(line))
+                    ev = decode_market(json.loads(line), self.symbol)
                 except (json.JSONDecodeError, KeyError, ValueError) as ex:
                     log.warning("bad market msg %r: %s", line[:80], ex)
                     continue
@@ -57,7 +57,7 @@ class NinjaTraderFeed:
                 if cur_sec is None:
                     cur_sec = sec
                 elif sec > cur_sec:                  # close the previous second
-                    yield agg.snapshot(cur_sec)
+                    yield agg.snapshot(cur_sec, self.symbol)
                     cur_sec = sec
                 if isinstance(ev, Trade):
                     minute = ev.ts // (60 * NS)
@@ -66,7 +66,8 @@ class NinjaTraderFeed:
                         b_o = b_h = b_l = b_c = ev.price
                         b_v = ev.size
                     elif minute > bar_min:           # emit closed 1m bar first
-                        yield Bar((bar_min + 1) * 60 * NS, "1m", b_o, b_h, b_l, b_c, b_v)
+                        yield Bar((bar_min + 1) * 60 * NS, "1m", b_o, b_h, b_l, b_c, b_v,
+                                  self.symbol)
                         bar_min = minute
                         b_o = b_h = b_l = b_c = ev.price
                         b_v = ev.size
@@ -83,7 +84,7 @@ class NinjaTraderFeed:
                 else:
                     yield ev                          # Quote / Bar / BookFlow
             if cur_sec is not None:                   # flush the final second
-                yield agg.snapshot(cur_sec)
+                yield agg.snapshot(cur_sec, self.symbol)
         finally:
             writer.close()
             try:

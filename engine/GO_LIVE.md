@@ -4,17 +4,46 @@ The engine is safe to run daily in paper (Sim101) alongside manual trading:
 per-strategy attribution, the RiskSupervisor (in-flight vetting, caps, rate
 limit, kill switch, EOD flatten), the GEX regime gate, and the one-chart overlay.
 
-## NT8 setup — TWO components (this is why you get orders AND overlays)
-A NinjaTrader **strategy** on a chart suppresses the native order/execution
-display; an **indicator** does not. So the bridge is split:
-- **EngineRelay** (strategy, `Strategies/EngineBridge.cs`): data + order routing.
-  Run it from **Control Center → Strategies** (OFF the chart) on Sim101,
-  Calculate = On each tick. Sockets: market 36001, broker 36002.
-- **EngineOverlay** (indicator, `Indicators/EngineOverlay.cs`): all chart drawing
-  (zones / gamma / S-R / signals / status). Add it **to your ES chart**. Socket:
-  draw 36004. Indicators don't hide orders, so your native markers stay visible.
-Compile both (F5). Result: native orders AND engine overlays on one chart.
+## NT8 setup — TWO charts (this is why you get orders AND overlays)
+A NinjaTrader **strategy** on a chart suppresses that chart's native
+order/execution display; an **indicator** does not. NT8 also can't run a
+strategy without a chart (Control Center's Strategies tab only *monitors*
+running strategies — it can't start one). So the bridge runs on two charts:
+
+- **Main ES chart (the one you watch):** add the **EngineOverlay** indicator
+  (`Indicators/EngineOverlay.cs`). It only draws (zones / gamma / S-R / signals /
+  status) over socket 36004. Indicators never hide orders, so your native
+  entry/exit markers, fills, and P&L stay visible here.
+- **Second ES chart (minimized, ignore it):** apply the **EngineRelay** strategy
+  (`Strategies/EngineBridge.cs`) on Sim101, Calculate = On each tick. It does
+  data + order routing (market 36001, broker 36002). It DOES hide orders on *its*
+  chart — that's fine, you never look at it. Same instrument/session as the main.
+
+Compile both (F5). Result: native orders AND engine overlays on your main chart.
 `run_live` connects feed→36001, broker→36002, painter→36004 (all defaults).
+
+## Multi-instrument lanes (ES + NQ + ...)
+The engine is multi-instrument: one process, N feeds + N brokers, strategies
+per lane, ONE RiskSupervisor (dollar-notional caps available) and one portfolio
+blotter. Per added instrument you need in NT8:
+- a second minimized chart of that instrument with **EngineRelay**, its
+  `MarketPort`/`BrokerPort` properties set to that lane's ports (e.g. NQ
+  36011/36012 — the relay exposes them in the strategy dialog now);
+- (optional) that instrument's watch chart with **EngineOverlay** on the lane's
+  draw port.
+Lane ports + rosters live in `config/live.yaml`; contract specs ($/pt, tick) in
+`config/instruments.yaml`. Then:
+```
+.venv/Scripts/python.exe tools/run_live.py --instruments ES,NQ --record
+```
+- No `--instruments` flag = the single-ES behavior above, unchanged.
+- Warmup is per lane: a silent NQ feed can never keep ES from going live.
+- The GEX gate/levels apply to the ES lane only (SPX gamma is an ES signal).
+- Dollar caps: `--max-sleeve-usd 600000 --max-gross-usd 1200000` (off by
+  default; contract caps still apply).
+- CAUTION: strategy thresholds (stops/targets in points) are ES-calibrated.
+  Running them on NQ is for OBSERVATION/paper first — retune before any live
+  routing on a new instrument.
 
 ## Paper vs live model
 EVERY strategy + variant ALWAYS paper-trades (visible signals, own book, never

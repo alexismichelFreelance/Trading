@@ -118,9 +118,10 @@ def test_warmup_signals_capture_ts_and_px_and_live_hook_fires():
 
     eng = asyncio.run(go())
     # two warmup bars -> two ghost signals at HISTORICAL ts with the bar close px
+    # (6th element = the order's symbol, for multi-instrument ghost routing)
     assert eng.warmup_signals == [
-        (100 * NS, 1, 1, "sig", 5000.5),
-        (160 * NS, 1, 1, "sig", 5001.5),
+        (100 * NS, 1, 1, "sig", 5000.5, "ES"),
+        (160 * NS, 1, 1, "sig", 5001.5, "ES"),
     ]
     assert painted == []          # no bar after the live flip -> no live signals
 
