@@ -13,10 +13,18 @@ instruments:
         ESM5: claude_sec_feat
         ESH5: claude_sec_feat_esh5
       bars_table: claude_bars_1m
+    gex:
+      underlying: SPX
+      basis: 52.0            # ES over SPX, measured 2026 (std 6); recalibrate
   NQ:
     point_usd: 20.0
     tick: 0.25
     asset_class: future
+    yahoo: NQ=F              # daily bars for the 1d zone view
+    gex:
+      underlying: NDX
+      basis: 0.0             # CALIBRATE: NQ_close - NDX_close on first sessions,
+                             # then set here (same procedure as the ES +52)
   GC:
     point_usd: 100.0
     tick: 0.10

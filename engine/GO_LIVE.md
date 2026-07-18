@@ -38,7 +38,12 @@ Lane ports + rosters live in `config/live.yaml`; contract specs ($/pt, tick) in
 ```
 - No `--instruments` flag = the single-ES behavior above, unchanged.
 - Warmup is per lane: a silent NQ feed can never keep ES from going live.
-- The GEX gate/levels apply to the ES lane only (SPX gamma is an ES signal).
+- GEX: `--gex-levels` draws each lane's own walls — ES from the SPX chain,
+  NQ from the NDX chain (both collected daily by the `Trading_GEX_Daily` task).
+  The NQ basis starts UNCALIBRATED (`instruments.yaml gex.basis: 0.0`) — measure
+  `NQ_close - NDX_close` over the first sessions and set it, same procedure as
+  the ES +52. The `--gex-gate` (percentile allocation gate) stays ES-only until
+  enough NDX history accumulates in claude_gex_levels to validate an NQ gate.
 - Dollar caps: `--max-sleeve-usd 600000 --max-gross-usd 1200000` (off by
   default; contract caps still apply).
 - CAUTION: strategy thresholds (stops/targets in points) are ES-calibrated.

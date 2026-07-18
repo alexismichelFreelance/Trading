@@ -371,23 +371,35 @@ async def main() -> None:
                     lane_pc.zv.seed_daily(daily)
                     print(f"seeded {len(daily)} daily bars for {sym} 1d zones")
             print(f"chart painting ON [{sym}] (zones, S/R, gamma, signals, panel)")
-            if a.gex_levels and sym == "ES":      # SPX gamma levels: ES chart only
+            # gamma S/R levels per lane: ES <- SPX chain, NQ <- NDX chain
+            # (instruments.yaml gex: {underlying, basis}); --gex-basis still
+            # overrides the ES basis for back-compat.
+            gexc = INSTRUMENTS[sym].extra.get("gex") if a.gex_levels else None
+            if gexc:
                 from datetime import datetime, timezone
 
                 from engine.features.gamma_levels import GammaLevels
                 try:
+                    und = gexc.get("underlying", "SPX")
+                    basis = a.gex_basis if sym == "ES" else float(gexc.get("basis", 0.0))
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    lv = GammaLevels().levels_prev(today, basis=a.gex_basis)
+                    lv = GammaLevels(underlying=und).levels_prev(today, basis=basis)
                     if lv:
                         lane_pc.set_gamma_levels(lv)
-                        print(f"gamma S/R levels ON ({lv['sess']}, +{a.gex_basis:.0f} ES basis): "
+                        print(f"gamma S/R levels ON [{sym}<-{und}] ({lv['sess']}, "
+                              f"+{basis:.0f} basis): "
                               f"putW {lv['put_wall']:.0f}  callW {lv['call_wall']:.0f}  "
                               f"flip {lv['flip'] and round(lv['flip'])}  "
                               f"{'long' if lv['net_sign']>0 else 'SHORT'}-gamma")
+                        if basis == 0.0 and sym != "ES":
+                            print(f"  ({sym}: basis UNCALIBRATED — eyeball wall vs price, "
+                                  f"then set gex.basis = {sym}_close - {und}_close "
+                                  f"in config/instruments.yaml)")
                     else:
-                        print("  (no prior gamma-levels row; run tools/fetch_cboe_gex.py)")
+                        print(f"  ({sym}: no prior {und} gamma-levels row; "
+                              f"run tools/fetch_cboe_gex.py)")
                 except Exception as ex:                  # noqa: BLE001
-                    print(f"  (gamma levels disabled: {ex})")
+                    print(f"  ({sym} gamma levels disabled: {ex})")
         if pcs:
             def _pc_of(sym: str) -> PaintController | None:
                 return pcs.get(sym) or (pc if len(pcs) == 1 else None)

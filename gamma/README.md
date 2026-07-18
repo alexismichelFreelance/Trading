@@ -1,7 +1,23 @@
-# Gamma-exposure (GEX) pipeline for ES
+# Gamma-exposure (GEX) pipeline for ES (and NQ)
 
-Goal: turn daily SPX option chains into per-day **gamma levels** (zero-gamma flip, call wall,
-put wall, long/short-gamma regime) and test whether ES price respects them intraday.
+Goal: turn daily index option chains into per-day **gamma levels** (zero-gamma flip, call wall,
+put wall, long/short-gamma regime) and test whether the future respects them intraday.
+
+## Live daily collection (the current pipeline)
+The scheduled task `Trading_GEX_Daily` (Mon-Fri 15:00 local, `engine/tools/daily_gex.cmd`) runs:
+1. `tools/fetch_gex.py` — SqueezeMetrics aggregate SPX GEX/DIX → `claude_gex`
+   (feeds the GammaRegime percentile gate, ES sleeves).
+2. `tools/fetch_cboe_gex.py` — CBOE delayed chains with TRUE OI for **SPX and NDX**
+   → flip / call wall / put wall per underlying → `claude_gex_levels`
+   (`underlying` column: SPX rows map to ES, NDX rows to NQ; pre-NDX rows are
+   NULL = SPX). Raw chains archived in `raw_cboe/`.
+
+`run_live --gex-levels` draws each lane's walls from its own underlying
+(`instruments.yaml gex:`). **NQ status:** levels are forward-collected from
+2026-07-20; the NDX→NQ basis is UNCALIBRATED (set `gex.basis` after measuring
+`NQ_close - NDX_close`), and there is NO validated NQ wall/regime history yet —
+observation only. A future NQ regime gate can be built from the accumulating
+`total_gex` history (underlying='NDX') exactly like the ES percentile gate.
 
 ## Step 1 — get the data (you)
 1. OptionsDX → SPX Option Chains → **End of Day** frequency → year **2025**.
