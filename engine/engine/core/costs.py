@@ -33,10 +33,7 @@ class CostModel:
         return self.round_turn_points() * self.point_usd
 
 
-# Presets (express execution STYLE, not magic numbers) -----------------------
-PASSIVE_BOTH = CostModel(entry_cross=0.0, exit_cross=0.0, slippage_ticks_rt=0.0)
-PASSIVE_ENTRY = CostModel(entry_cross=0.0, exit_cross=1.0, slippage_ticks_rt=0.25)
-AGGRESSIVE = CostModel(entry_cross=1.0, exit_cross=1.0, slippage_ticks_rt=0.5)
+# Presets ---------------------------------------------------------------------
 DEFAULT = CostModel()                       # 0.5175 pt — the project default
 NT_FREE = CostModel(commission_usd_rt=5.28)  # NinjaTrader-Free RT (sized sleeves)
 
@@ -53,6 +50,5 @@ def regime_slippage_points(vol_proxy_pts: float, mult: float,
 
 
 __all__ = [
-    "CostModel", "PASSIVE_BOTH", "PASSIVE_ENTRY", "AGGRESSIVE", "DEFAULT",
-    "NT_FREE", "regime_slippage_points",
+    "CostModel", "DEFAULT", "NT_FREE", "regime_slippage_points",
 ]

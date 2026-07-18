@@ -1,5 +1,5 @@
-"""JSON-line wire protocol shared by the platform bridges (NinjaTrader,
-Quantower). One JSON object per line. Three channels:
+"""JSON-line wire protocol spoken by the platform bridges (NinjaTrader
+relay). One JSON object per line. Three channels:
 
   market  (platform -> engine): trade / quote / depth / bar / bookflow
   order   (engine -> platform): place / cancel / modify

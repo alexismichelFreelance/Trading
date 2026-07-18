@@ -1,6 +1,6 @@
 """NinjaTraderBroker — routes orders to a NinjaTrader 8 SIM account via the
 NinjaScript relay socket, so fills/positions render natively in the NT8 UI.
-Only the connector on the other end differs from Quantower; the protocol is
+Only the C# connector on the other end is platform-specific; the protocol is
 shared (see SocketBroker + docs/PHASE2_BRIDGES.md)."""
 from __future__ import annotations
 

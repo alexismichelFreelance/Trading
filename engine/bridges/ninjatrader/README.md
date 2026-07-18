@@ -23,8 +23,9 @@ feed   = NinjaTraderFeed("127.0.0.1", 36001, symbol="ES")
 broker = NinjaTraderBroker("127.0.0.1", 36002, account="Sim101", symbol="ES")
 # LiveEngine(feed, broker, [IgnitionStrategy(...), ...], WallClock(), Blotter("ES", 50))
 ```
-Fills/positions render natively in the NT8 Control Center + chart. Route the same engine to
-`QuantowerBroker` (port 36003) to compare the two front-ends.
+Fills/positions render natively in the NT8 Control Center + chart. For a second
+instrument, run another relay on that instrument's chart with its own port pair
+(see `config/live.yaml` + `GO_LIVE.md`).
 
 ## Protocol (line-delimited JSON, epoch-ns timestamps)
 - market (relay→engine): `trade` / `quote` / `depth`  → engine aggregates per-second `BookFlow`

@@ -3,7 +3,7 @@
 One bidirectional local socket per broker: the engine writes place/cancel/modify
 orders; the platform add-on submits them to its SIM account and streams
 fill/position/account messages back, which become Fill/PositionUpdate/
-AccountUpdate. NinjaTrader and Quantower differ only in the connector on the
+AccountUpdate. Platform bridges differ only in the connector on the
 other end (and the default port), so both subclass this.
 """
 from __future__ import annotations

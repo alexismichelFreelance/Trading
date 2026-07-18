@@ -9,8 +9,6 @@ from typing import Iterable
 
 import yaml
 
-from .costs import CostModel, DEFAULT
-
 
 @dataclass(frozen=True)
 class InstrumentSpec:
@@ -61,19 +59,4 @@ def load_instruments(path: str | Path) -> dict[str, InstrumentSpec]:
     return out
 
 
-@dataclass(frozen=True)
-class RunConfig:
-    """One replay/live session."""
-    symbol: str                       # contract, e.g. 'ESM5'
-    instrument: InstrumentSpec
-    account: float = 100_000.0
-    risk_per_trade: float = 2_000.0   # 2% of account
-    max_contracts: int = 30
-    cost: CostModel = DEFAULT
-    start: str | None = None          # ISO date (inclusive)
-    end: str | None = None            # ISO date (exclusive)
-    speed: float = 0.0                # 0 = as-fast-as-possible; >0 = real-time * speed
-    extra: dict = field(default_factory=dict)
-
-
-__all__ = ["InstrumentSpec", "RunConfig", "root_symbol", "load_instruments"]
+__all__ = ["InstrumentSpec", "root_symbol", "load_instruments"]
