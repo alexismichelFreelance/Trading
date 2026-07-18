@@ -26,8 +26,11 @@ FLAT_MIN = 15 * 60 + 59      # flatten on the first tick in the 15:59 ET minute
 
 class OpenDriveStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, stop_mult: float = 1.0, trail_mult: float = 1.5,
-                 stop_floor: float = 5.0, trail_floor: float = 8.0) -> None:
+                 stop_floor: float = 5.0, trail_floor: float = 8.0,
+                 gamma=None) -> None:
         self.symbol = symbol
+        # optional GammaRegime: entries only on short-gamma days (strategy choice)
+        self.gamma = gamma
         self.stop_mult, self.trail_mult = stop_mult, trail_mult
         self.stop_floor, self.trail_floor = stop_floor, trail_floor
         self._day: str | None = None
@@ -96,6 +99,8 @@ class OpenDriveStrategy(BaseStrategy):
             self.entered = True
             if self.open_px is None:
                 return []
+            if not self.gamma_entry_ok(ts, "short"):
+                return []                # non-short-gamma day: stand down (opt-in)
             r30 = px - self.open_px
             if r30 == 0:
                 return []

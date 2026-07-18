@@ -6,7 +6,7 @@ put wall, long/short-gamma regime) and test whether the future respects them int
 ## Live daily collection (the current pipeline)
 The scheduled task `Trading_GEX_Daily` (Mon-Fri 15:00 local, `engine/tools/daily_gex.cmd`) runs:
 1. `tools/fetch_gex.py` — SqueezeMetrics aggregate SPX GEX/DIX → `claude_gex`
-   (feeds the GammaRegime percentile gate, ES sleeves).
+   (feeds GammaRegime, consumed per-strategy by the `*_gex` roster variants — ES).
 2. `tools/fetch_cboe_gex.py` — CBOE delayed chains with TRUE OI for **SPX and NDX**
    → flip / call wall / put wall per underlying → `claude_gex_levels`
    (`underlying` column: SPX rows map to ES, NDX rows to NQ; pre-NDX rows are

@@ -30,8 +30,11 @@ class FlowFollowingStrategy(BaseStrategy):
                  maxp: int = 50, add_band: int = 1, hold_band: int = 5,
                  gate_utc: tuple[int, int] | None = (13, 21),
                  adaptive: bool = False, adapt_k: float = 4.0,
-                 vol_win: int = 1800, warm: int = 300) -> None:
+                 vol_win: int = 1800, warm: int = 300, gamma=None) -> None:
         self.symbol = symbol
+        # optional GammaRegime: position INCREASES only on short-gamma days
+        # (reduces toward flat always pass) — a strategy choice, not an engine gate
+        self.gamma = gamma
         self.w, self.th, self.scale, self.maxp = w, th, scale, maxp
         self.add_band, self.hold_band = add_band, hold_band
         # ADAPTIVE (scale-invariant) threshold: th_t = rolling_mean + k*rolling_std
@@ -124,6 +127,8 @@ class FlowFollowingStrategy(BaseStrategy):
         if abs(delta) > band:
             step = _jsround(tgt) - held
             if step != 0:
+                if abs(held + step) > abs(held) and not self.gamma_entry_ok(bf.ts, "short"):
+                    return orders            # block INCREASES off-regime; reduces pass
                 orders.append(Order(self.symbol, 1 if step > 0 else -1, abs(step), tag="flow"))
         return orders
 

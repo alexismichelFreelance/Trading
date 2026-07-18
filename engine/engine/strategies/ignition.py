@@ -38,11 +38,15 @@ class IgnitionStrategy(BaseStrategy):
                  er_window_s: int = 7200, er_threshold: float = 0.70,
                  exit_mode: str = "fixed", trail_init: float = 6.0,
                  trail_width: float = 10.0,
-                 gate_utc: tuple[int, int] | None = (13, 21)) -> None:
+                 gate_utc: tuple[int, int] | None = (13, 21),
+                 gamma=None) -> None:
         self.symbol = symbol
         # NEW ENTRIES only inside the validated 13-21 UTC window (live feeds run
         # ~23h; the edge was researched on this window). Exits always run.
         self.gate_utc = gate_utc
+        # optional GammaRegime: entries only on short-gamma days (trend earns
+        # there — gamma/GEX_FINDINGS.md D). A strategy choice, not an engine gate.
+        self.gamma = gamma
         self.feats = IgnitionFeatures(trend_lag=trend_lag)
         self.agg = BarAggregator(("30m", "1h"))
         self.zdet = ZoneDetector()
@@ -133,6 +137,8 @@ class IgnitionStrategy(BaseStrategy):
     def _maybe_enter(self, px: float, ts: int) -> list[Order]:
         if self.gate_utc is not None and \
                 not (self.gate_utc[0] <= ns_to_utc(ts).hour < self.gate_utc[1]):
+            return []
+        if not self.gamma_entry_ok(ts, "short"):
             return []
         f = self.feats
         if f.strength is None:

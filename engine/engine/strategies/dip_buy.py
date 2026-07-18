@@ -6,10 +6,10 @@ lower VWAP band (VWAP-2σ) or a band-confluent prior-day close, scale half at +4
 run the rest to VWAP. Shorts are mirrored on the upper band. Causal: session VWAP
 and σ are cumulative from the RTH open; the flush window looks only backwards.
 
-Regime + selection are NOT in the strategy — they are the engine's RegimeGate
-(the dip-buy sleeve is gated to gexp_prev > 1/3, the complement of the trend
-gate; DAY_SELECTION.md) and the RiskSupervisor size cap. Kept here: entries,
-exits, and the intraday state. Consumes 1m bars directly (no aggregation).
+Regime is a STRATEGY choice: pass gamma=GammaRegime() (the dipbuy_gex variant)
+and entries stand down on short-gamma days (gexp_prev <= 1/3 — dips amplify
+there; DAY_SELECTION.md). Raw (gamma=None) fires regardless. Size caps stay in
+the RiskSupervisor. Consumes 1m bars directly (no aggregation).
 
 NOT a validated edge yet: the 2026 band-retest sample was small and contaminated
 by these very anchor days; this sleeve deploys OFF by default and rides the
@@ -53,9 +53,12 @@ class _Pos:
 
 
 class DipBuyStrategy(BaseStrategy):
-    def __init__(self, symbol: str, point_usd: float = 50.0) -> None:
+    def __init__(self, symbol: str, point_usd: float = 50.0, gamma=None) -> None:
         self.symbol = symbol
         self.point_usd = point_usd     # $/pt for sizing (from InstrumentSpec)
+        # optional GammaRegime: entries only on mid/LONG-gamma days (dealers pin,
+        # dips revert — the user's regime). A strategy choice, not an engine gate.
+        self.gamma = gamma
         self.pos = 0
         self.trade: _Pos | None = None
         self._day: str | None = None
@@ -114,6 +117,8 @@ class DipBuyStrategy(BaseStrategy):
     def _scan(self, bar: Bar, vwap: float, sigma: float, m: int) -> list[Order]:
         if len(self.his) < 40 or m >= MOC_MIN - TIME_STOP // 2:
             return []
+        if not self.gamma_entry_ok(bar.ts, "long"):
+            return []                    # short-gamma day: dips amplify, stand down
         highs = [h for h, _ in self.his]
         lows = [l for _, l in self.his]
         hh, ll = max(highs), min(lows)

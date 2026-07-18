@@ -20,7 +20,6 @@ import logging
 from .blotter import Blotter
 from .dispatch import dispatch_broker, dispatch_market
 from .events import Bar, Fill, PositionUpdate, Trade
-from .regime import RegimeGate
 from .risk import RiskSupervisor
 
 log = logging.getLogger("engine.live")
@@ -36,7 +35,6 @@ class LiveEngine:
     def __init__(self, feed, broker, strategies, clock, blotter: Blotter,
                  reconnect_delay: float = 1.0, drain_timeout: float = 0.5,
                  warmup_gate: bool = True, risk: RiskSupervisor | None = None,
-                 regime: RegimeGate | None = None,
                  live_owners: set | None = None) -> None:
         # Multi-instrument: `feed` may be one adapter or a list of them (one per
         # instrument lane); `broker` one adapter or {symbol: adapter}. The scalar
@@ -92,12 +90,10 @@ class LiveEngine:
         # every production limit OFF, but in-flight-aware reduce_only vetting
         # is always on — that closed the 2026-07-09 duplicate-flatten bug.
         self.risk = risk if risk is not None else RiskSupervisor()
-        # allocation gate (dealer-gamma regime). Default OFF (None) -> no gating.
-        self.regime = regime
         # PAPER vs LIVE routing. live_owners = set of id(strategy) that route to
         # the real broker (NT8); every other strategy ALWAYS paper-trades — its
         # orders fill inline at last_px, attributed to its own book, visible and
-        # usable as signals, but never sent to the broker and never risk/regime
+        # usable as signals, but never sent to the broker and never risk-
         # gated (we want to see the raw strategy). None = all strategies live
         # (backward compatible: tests + the pre-paper behavior).
         self.live_owners = live_owners
@@ -159,7 +155,7 @@ class LiveEngine:
     async def _paper_submit(self, s, o) -> None:
         """Fill a paper strategy's order inline at last_px (market model), against
         its OWN attributed book. reduce_only clamps/drops so the paper book stays
-        coherent; no broker, no risk/regime gate. Visible + recorded."""
+        coherent; no broker, no risk gate. Visible + recorded."""
         pid = id(s)
         pos = self._spos.get(pid, 0)
         qty = o.qty
@@ -272,11 +268,7 @@ class LiveEngine:
                                     await self.on_warmup_signal(*sig)   # ghost now
                             elif not self._is_live(s):   # PAPER: raw signal, inline fill
                                 await self._paper_submit(s, o)
-                            else:                        # LIVE: gated -> real broker
-                                if self.regime is not None and self.regime.blocks(
-                                        type(s).__name__, self._spos.get(id(s), 0),
-                                        o.side, o.qty, ev.ts, o.symbol):
-                                    continue         # trend sleeve off this regime
+                            else:                        # LIVE: vetted -> real broker
                                 o = self._vet(s, o, ev.ts)
                                 if o is None:
                                     continue

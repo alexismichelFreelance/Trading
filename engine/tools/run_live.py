@@ -107,9 +107,33 @@ class ObserveStrategy:
         print(f"  POSITION {e.qty} @ {e.avg_px}")
 
 
+_GAMMA_CACHE: dict = {}
+
+
+def _gamma_or_none(symbol: str):
+    """SPX dealer-gamma regime for the *_gex variants. ES only — SPX gamma is
+    not an NQ/GC signal. Fail-open: no GEX table / busy DB -> None (variant
+    trades raw). One shared instance; short timeout so a busy QuestDB never
+    stalls session startup."""
+    if symbol != "ES":
+        return None
+    if "ES" not in _GAMMA_CACHE:
+        from engine.adapters.questdb import QuestDB
+        from engine.features.gamma import GammaRegime
+        try:
+            _GAMMA_CACHE["ES"] = GammaRegime(QuestDB(timeout=10))
+        except Exception as ex:      # noqa: BLE001
+            print(f"  (*_gex variants trade RAW: GammaRegime unavailable: {ex})")
+            _GAMMA_CACHE["ES"] = None
+    return _GAMMA_CACHE["ES"]
+
+
 def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
           hmm_path: str = HMM_PATH):
-    """One strategy instance by roster label (includes every variant)."""
+    """One strategy instance by roster label (includes every variant).
+    Gamma-regime awareness is a STRATEGY choice (the *_gex variants), not an
+    engine gate: raw and gamma-aware variants paper-trade side by side and the
+    user picks which routes live."""
     from engine.strategies.dip_buy import DipBuyStrategy
     from engine.strategies.flow import FlowFollowingStrategy
     from engine.strategies.ibs_swing import IBSSwingStrategy
@@ -120,12 +144,20 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing", regime_states=None)
     if label == "ignition_fixed":    # variant: fixed/regime exits instead of trailing
         return IgnitionStrategy(symbol, hmm_path, exit_mode="fixed", regime_states=None)
+    if label == "ignition_gex":      # variant: entries only on short-gamma days
+        return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing",
+                                regime_states=None, gamma=_gamma_or_none(symbol))
     if label == "opendrive":
         return OpenDriveStrategy(symbol)
+    if label == "opendrive_gex":     # variant: entries only on short-gamma days
+        return OpenDriveStrategy(symbol, gamma=_gamma_or_none(symbol))
     if label == "flow":              # adaptive z-score threshold (scale-invariant)
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=4.0)
     if label == "flow_fixed":        # variant: fixed threshold (research default)
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=False, th=flow_th)
+    if label == "flow_gex":          # variant: increases only on short-gamma days
+        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=4.0,
+                                     gamma=_gamma_or_none(symbol))
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
         return ZoneLifecycleStrategy(symbol, point_usd=pu)
@@ -133,20 +165,19 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return ZoneLifecycleStrategy(symbol, gap_thr=5.0, point_usd=pu)
     if label == "dipbuy":
         return DipBuyStrategy(symbol, point_usd=pu)
+    if label == "dipbuy_gex":        # variant: entries only on mid/long-gamma days
+        return DipBuyStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
     if label == "ibs":
         return IBSSwingStrategy(symbol)
     if label == "ibs_gex":           # variant: size up in long-gamma
-        from engine.features.gamma import GammaRegime
-        try:
-            return IBSSwingStrategy(symbol, gamma=GammaRegime())
-        except Exception:            # noqa: BLE001 - no GEX table -> base IBS
-            return IBSSwingStrategy(symbol)
+        return IBSSwingStrategy(symbol, gamma=_gamma_or_none(symbol))
     raise SystemExit(f"unknown strategy '{label}'")
 
 
 # every strategy + variant — the full paper roster (--paper all)
-ALL_LABELS = ("ignition", "ignition_fixed", "opendrive", "flow", "flow_fixed",
-              "zones", "zones_gap", "dipbuy", "ibs", "ibs_gex")
+ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
+              "opendrive_gex", "flow", "flow_fixed", "flow_gex",
+              "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex")
 
 
 def build_roster(paper: str, flow_th: int = 30, symbol: str = SYMBOL,
@@ -214,10 +245,6 @@ async def main() -> None:
                     help="risk: daily marked-loss kill switch in USD (default -5000)")
     ap.add_argument("--no-risk", action="store_true",
                     help="DANGER: disable production risk limits (in-flight vetting stays on)")
-    ap.add_argument("--gex-gate", action="store_true",
-                    help="allocate by dealer-gamma regime: trend sleeves (ignition/opendrive/"
-                         "flow) take entries only on short-gamma days (gexp_prev<=1/3); "
-                         "zones/ibs always on. Validated on 2025 (gamma/GEX_FINDINGS.md D).")
     ap.add_argument("--gex-levels", action="store_true",
                     help="draw prior-session gamma strikes (put wall/call wall/flip) as S/R "
                          "lines on the chart (claude_gex_levels, CBOE true-OI).")
@@ -324,21 +351,8 @@ async def main() -> None:
         print(f"risk: sleeve cap {a.max_sleeve}, gross cap {a.max_gross}{usd_caps}, "
               f"4 orders/5s, halt at ${a.risk_halt:+,.0f}, "
               f"entry lockout 15:45 ET, EOD flatten 15:58 ET (IBS exempt: swing)")
-    regime = None
-    if a.gex_gate:
-        from engine.core.regime import RegimeGate
-        from engine.features.gamma import GammaRegime
-        try:
-            # SPX dealer-gamma is an ES signal: scope the gate to the ES lane
-            # so NQ/GC sleeves are never gated by it.
-            regime = RegimeGate(GammaRegime(), symbols={"ES"} if multi else None)
-            print("GEX allocation gate ON: trend sleeves only in short-gamma "
-                  "(gexp_prev<=1/3); zones/ibs always on"
-                  + (" [ES lane only]" if multi else ""))
-        except Exception as ex:                      # noqa: BLE001
-            print(f"  (GEX gate disabled: {ex})")
     eng = LiveEngine(feeds, brokers, strategies, WallClock(), blot,
-                     warmup_gate=not a.no_warmup_gate, risk=risk, regime=regime,
+                     warmup_gate=not a.no_warmup_gate, risk=risk,
                      live_owners=live_owners)
     live_lbls = sorted(lb for lb, s in roster if id(s) in live_owners)
     paper_lbls = sorted(lb for lb, s in roster if id(s) not in live_owners)

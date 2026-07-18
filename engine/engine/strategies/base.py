@@ -4,10 +4,25 @@ from __future__ import annotations
 
 from ..core.events import Bar, BookFlow, DepthUpdate, Fill, PositionUpdate, Quote, Trade
 from ..core.orders import Order
+from ..core.timeutil import et_session_date
 
 
 class BaseStrategy:
     symbol: str = ""
+    gamma = None          # optional GammaRegime — a STRATEGY choice, not an engine gate
+
+    def gamma_entry_ok(self, ts: int, want: str) -> bool:
+        """Dealer-gamma ENTRY filter, opt-in per strategy (set self.gamma).
+        want='short': enter only on short-gamma days (trend sleeves earn there —
+        gamma/GEX_FINDINGS.md D); want='long': only on mid/long-gamma days
+        (mean-reversion). Exits are never filtered (call this only on entries).
+        Fail-open: unknown regime (no GEX row) allows."""
+        if self.gamma is None:
+            return True
+        sg = self.gamma.is_short_gamma(et_session_date(ts))
+        if sg is None:
+            return True
+        return sg if want == "short" else not sg
 
     def on_trade(self, e: Trade) -> list[Order]:
         return []

@@ -1,5 +1,5 @@
 """DipBuyStrategy: RTH gate, session reset, entry on a flush->band touch, and
-scale/stop/vwap/moc management. Plus the RegimeGate mean-reversion complement."""
+scale/stop/vwap/moc management. Plus the strategy-level gamma entry filter."""
 import pandas as pd
 
 from engine.core.events import Bar
@@ -89,7 +89,7 @@ def test_manage_moc_flatten():
     assert s.trade is None
 
 
-# ── regime gate: dip-buy is the complement of the trend gate ──────────────
+# ── STRATEGY-level gamma filter (opt-in; replaced the engine RegimeGate) ──
 class FakeGamma:
     def __init__(self, m):
         self.m = m
@@ -102,15 +102,34 @@ class FakeGamma:
         return None if v is None else v <= max_pctl
 
 
-def test_regime_mr_complement():
-    from engine.core.regime import RegimeGate
-    SHORT, MID = "2026-03-02", "2026-03-03"
-    g = RegimeGate(FakeGamma({SHORT: 0.10, MID: 0.50}))
-    # dip-buy: BLOCKED in short gamma, ALLOWED in mid/long
-    assert g.blocks("DipBuyStrategy", 0, 1, 2, ts(SHORT, "10:00"))
-    assert not g.blocks("DipBuyStrategy", 0, 1, 2, ts(MID, "10:00"))
-    # trend: exact opposite
-    assert not g.blocks("IgnitionStrategy", 0, 1, 2, ts(SHORT, "10:00"))
-    assert g.blocks("IgnitionStrategy", 0, 1, 2, ts(MID, "10:00"))
-    # dip-buy exits always pass even in short gamma
-    assert not g.blocks("DipBuyStrategy", 3, -1, 3, ts(SHORT, "10:00"))
+def test_strategy_gamma_filter_complement():
+    SHORT, MID, UNK = "2026-03-02", "2026-03-03", "2026-03-04"
+    g = FakeGamma({SHORT: 0.10, MID: 0.50})
+    # dip-buy wants LONG/mid gamma: blocked short, allowed mid, fail-open unknown
+    dip = DipBuyStrategy("ES", gamma=g)
+    assert not dip.gamma_entry_ok(ts(SHORT, "10:00"), "long")
+    assert dip.gamma_entry_ok(ts(MID, "10:00"), "long")
+    assert dip.gamma_entry_ok(ts(UNK, "10:00"), "long")
+    # trend wants SHORT gamma: the exact complement
+    assert dip.gamma_entry_ok(ts(SHORT, "10:00"), "short")
+    assert not dip.gamma_entry_ok(ts(MID, "10:00"), "short")
+    # no gamma injected (the raw variant): everything passes
+    assert DipBuyStrategy("ES").gamma_entry_ok(ts(SHORT, "10:00"), "long")
+
+
+def test_dipbuy_gamma_blocks_scan_not_exits():
+    SHORT = "2026-03-02"
+    s = DipBuyStrategy("ES", gamma=FakeGamma({SHORT: 0.10}))
+    # warm 45 bars so _scan's history requirement is met, on a SHORT-gamma day
+    for i in range(45):
+        hh, mm = divmod(9 * 60 + 35 + i, 60)
+        s.on_bar(bar(SHORT, f"{hh:02d}:{mm:02d}", 5030 - i * 0.5, 5031 - i * 0.5,
+                     5029 - i * 0.5, 5030 - i * 0.5))
+    # a flush-sized touch that WOULD enter on a long-gamma day emits nothing
+    out = s.on_bar(bar(SHORT, "11:00", 5008, 5009, 5000, 5008))
+    assert out == [] and s.trade is None
+    # exits are NOT filtered: an open trade still manages on the same day
+    s.trade = _Pos(dir=1, entry=5000.0, stop=4994.0, runner_tgt=5020.0, size=2,
+                   remaining=2, scalp_px=5004.0)
+    out = s.on_bar(bar(SHORT, "11:01", 4995, 4995, 4990, 4993))   # below stop
+    assert out and out[0].reduce_only
