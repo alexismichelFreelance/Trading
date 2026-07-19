@@ -152,8 +152,31 @@ def main() -> None:
         print(f"wrote {a.json}")
 
 
+def _sleeve_ledgers(pf) -> dict:
+    """sleeve -> dict(daily={day: realized_pts}, fills, days, net). Avg-cost;
+    positions carry across days; realized books on the closing fill's day."""
+    out = {}
+    for sl, g in pf.groupby("sleeve"):
+        pos = 0; avg = 0.0
+        daily: dict[str, float] = {}
+        for r in g.sort_values("ts").itertuples():
+            q, px = r.sq, r.price
+            while q != 0:
+                if pos == 0 or (q > 0) == (pos > 0):
+                    avg = (avg * abs(pos) + px * abs(q)) / (abs(pos) + abs(q)) if pos + q else px
+                    pos += q; q = 0
+                else:
+                    c = min(abs(q), abs(pos))
+                    daily[r.day] = daily.get(r.day, 0.0) \
+                        + (px - avg) * (1 if pos > 0 else -1) * c
+                    pos += (1 if q > 0 else -1) * c; q -= (1 if q > 0 else -1) * c
+        out[sl] = dict(daily=daily, fills=len(g), days=g.day.nunique(), net=pos)
+    return out
+
+
 def _paper_section(days, sym):
-    """Per-sleeve paper P&L from claude_paper_fills (avg-cost, over the window)."""
+    """Per-sleeve paper P&L from claude_paper_fills (avg-cost, over the window),
+    plus the raw-vs-*_gex TWIN comparison split by dealer-gamma regime."""
     try:
         from engine.adapters.questdb import QuestDB
         pf = QuestDB().df(f"SELECT ts, sleeve, side, qty, price FROM claude_paper_fills "
@@ -166,20 +189,58 @@ def _paper_section(days, sym):
     pf["day"] = pf.ts.dt.tz_convert("America/New_York").dt.strftime("%Y-%m-%d")
     pf = pf[pf.day.isin(days)]
     pf["sq"] = np.where(pf.side > 0, pf.qty, -pf.qty)
+    led = _sleeve_ledgers(pf)
     print(f"\n=== PAPER sleeves ({sym}, {pf.day.nunique()} days, avg-cost pts) ===")
-    print(f"{'sleeve':<14}{'fills':>6}{'days':>6}{'realized_pt':>12}{'net':>5}")
-    for sl, g in pf.groupby("sleeve"):
-        pos = 0; avg = 0.0; real = 0.0
-        for r in g.sort_values("ts").itertuples():
-            q, px = r.sq, r.price
-            while q != 0:
-                if pos == 0 or (q > 0) == (pos > 0):
-                    avg = (avg * abs(pos) + px * abs(q)) / (abs(pos) + abs(q)) if pos + q else px
-                    pos += q; q = 0
-                else:
-                    c = min(abs(q), abs(pos)); real += (px - avg) * (1 if pos > 0 else -1) * c
-                    pos += (1 if q > 0 else -1) * c; q -= (1 if q > 0 else -1) * c
-        print(f"{sl:<14}{len(g):>6}{g.day.nunique():>6}{real:>+12.1f}{pos:>+5d}")
+    print(f"{'sleeve':<16}{'fills':>6}{'days':>6}{'realized_pt':>12}{'net':>5}")
+    for sl in sorted(led):
+        L = led[sl]
+        print(f"{sl:<16}{L['fills']:>6}{L['days']:>6}{sum(L['daily'].values()):>+12.1f}"
+              f"{L['net']:>+5d}")
+    _twin_section(led)
+
+
+def _twin_section(led: dict, gr=None) -> None:
+    """RAW vs *_gex head-to-head: same strategy, same days, the only difference
+    is the gamma-regime entry filter. Splitting realized by regime shows exactly
+    what the filter kept (skipped losses) and what it cost (skipped wins) —
+    the routing decision is the TOTAL delta over enough days."""
+    pairs = [(b, b + "_gex") for b in sorted(led) if b + "_gex" in led]
+    if not pairs:
+        return
+    if gr is None:
+        try:
+            gr = GammaRegime()
+        except Exception:                            # noqa: BLE001
+            gr = None
+
+    def _reg(day: str) -> str:
+        if gr is None:
+            return "unk"
+        sg = gr.is_short_gamma(day)
+        return "unk" if sg is None else ("SHORT" if sg else "long")
+
+    print("\n=== RAW vs _gex twins (realized pts by dealer-gamma regime) ===")
+    print(f"{'pair':<16}{'reg':>6}{'n':>4}{'raw_pt':>9}{'gex_pt':>9}{'delta':>8}")
+    for base, gx in pairs:
+        braw, bgex = led[base]["daily"], led[gx]["daily"]
+        days = sorted(set(braw) | set(bgex))
+        if not days:
+            continue
+        tot_raw = tot_gex = 0.0
+        for reg in ("SHORT", "long", "unk"):
+            dd = [d for d in days if _reg(d) == reg]
+            if not dd:
+                continue
+            r = sum(braw.get(d, 0.0) for d in dd)
+            g = sum(bgex.get(d, 0.0) for d in dd)
+            tot_raw += r; tot_gex += g
+            print(f"{base:<16}{reg:>6}{len(dd):>4}{r:>+9.1f}{g:>+9.1f}{g - r:>+8.1f}")
+        verdict = "filter EARNS" if tot_gex > tot_raw else \
+            ("filter costs" if tot_gex < tot_raw else "no difference")
+        print(f"{'  TOTAL':<16}{'':>6}{len(days):>4}{tot_raw:>+9.1f}{tot_gex:>+9.1f}"
+              f"{tot_gex - tot_raw:>+8.1f}  <- {verdict} (route the winner live)")
+    print("(few days = noise; judge pairs on 20+ traded days, and remember the")
+    print(" filter's edge is concentrated on the days it BLOCKS)")
 
 
 if __name__ == "__main__":
