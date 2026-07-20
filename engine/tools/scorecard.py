@@ -204,7 +204,16 @@ def _twin_section(led: dict, gr=None) -> None:
     is the gamma-regime entry filter. Splitting realized by regime shows exactly
     what the filter kept (skipped losses) and what it cost (skipped wins) —
     the routing decision is the TOTAL delta over enough days."""
-    pairs = [(b, b + "_gex") for b in sorted(led) if b + "_gex" in led]
+    # Pair even when one side has ZERO fills — a gamma variant standing down
+    # all day (no fills) is the filter's most important outcome, not a reason
+    # to drop the row. Gex-capable bases are the roster's *_gex variants.
+    GEX_CAPABLE = ("ignition", "opendrive", "flow", "dipbuy", "ibs")
+    EMPTY = {"daily": {}, "fills": 0, "days": 0, "net": 0}
+    bases = {b for b in led if not b.endswith("_gex")
+             and b.split(":")[-1] in GEX_CAPABLE}
+    bases |= {g[:-4] for g in led if g.endswith("_gex")}
+    pairs = [(b, b + "_gex") for b in sorted(bases)
+             if b in led or b + "_gex" in led]
     if not pairs:
         return
     if gr is None:
@@ -222,7 +231,8 @@ def _twin_section(led: dict, gr=None) -> None:
     print("\n=== RAW vs _gex twins (realized pts by dealer-gamma regime) ===")
     print(f"{'pair':<16}{'reg':>6}{'n':>4}{'raw_pt':>9}{'gex_pt':>9}{'delta':>8}")
     for base, gx in pairs:
-        braw, bgex = led[base]["daily"], led[gx]["daily"]
+        braw = led.get(base, EMPTY)["daily"]
+        bgex = led.get(gx, EMPTY)["daily"]
         days = sorted(set(braw) | set(bgex))
         if not days:
             continue

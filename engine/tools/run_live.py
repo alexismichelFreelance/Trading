@@ -248,8 +248,9 @@ async def main() -> None:
     ap.add_argument("--gex-levels", action="store_true",
                     help="draw prior-session gamma strikes (put wall/call wall/flip) as S/R "
                          "lines on the chart (claude_gex_levels, CBOE true-OI).")
-    ap.add_argument("--gex-basis", type=float, default=52.0,
-                    help="SPX->ES basis added to gamma strikes (measured ~+52pt; recalibrate)")
+    ap.add_argument("--gex-basis", type=float, default=None,
+                    help="override the ES lane's cash->future basis (default: "
+                         "instruments.yaml gex.basis, re-measured at each close)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
@@ -395,7 +396,8 @@ async def main() -> None:
                 from engine.features.gamma_levels import GammaLevels
                 try:
                     und = gexc.get("underlying", "SPX")
-                    basis = a.gex_basis if sym == "ES" else float(gexc.get("basis", 0.0))
+                    basis = a.gex_basis if (sym == "ES" and a.gex_basis is not None) \
+                        else float(gexc.get("basis", 0.0))
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     lv = GammaLevels(underlying=und).levels_prev(today, basis=basis)
                     if lv:

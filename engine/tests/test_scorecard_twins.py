@@ -64,3 +64,16 @@ def test_twin_section_regime_split(capsys):
 def test_twin_section_no_pairs_silent(capsys):
     _twin_section({"zones": {"daily": {}, "fills": 0, "days": 0, "net": 0}})
     assert "twins" not in capsys.readouterr().out
+
+
+def test_twin_pair_shows_when_gex_stood_down_all_days(capsys):
+    # the filter's most important outcome: raw lost, gex NEVER filled -> the
+    # pair must still appear, gex side reading 0
+    led = {
+        "ES:dipbuy": {"daily": {"2026-07-20": -10.5}, "fills": 3, "days": 1, "net": 0},
+    }
+    g = FakeGamma({"2026-07-20": True})                    # SHORT day
+    _twin_section(led, gr=g)
+    out = capsys.readouterr().out
+    assert "ES:dipbuy" in out and "SHORT" in out
+    assert "-10.5" in out and "+10.5" in out              # delta = what the filter saved

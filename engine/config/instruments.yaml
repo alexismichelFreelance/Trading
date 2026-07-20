@@ -15,7 +15,8 @@ instruments:
       bars_table: claude_bars_1m
     gex:
       underlying: SPX
-      basis: 52.0            # ES over SPX, measured 2026 (std 6); recalibrate
+      basis: 42.0            # ES over SPX at 16:00 ET 2026-07-20 (Sep contract;
+                             # was 52 on Jun) — re-measure over the week
   NQ:
     point_usd: 20.0
     tick: 0.25
@@ -23,8 +24,8 @@ instruments:
     yahoo: NQ=F              # daily bars for the 1d zone view
     gex:
       underlying: NDX
-      basis: 0.0             # CALIBRATE: NQ_close - NDX_close on first sessions,
-                             # then set here (same procedure as the ES +52)
+      basis: 181.0           # NQ over NDX at 16:00 ET 2026-07-20 (first sample;
+                             # re-measure over the week, same as ES)
   GC:
     point_usd: 100.0
     tick: 0.10
