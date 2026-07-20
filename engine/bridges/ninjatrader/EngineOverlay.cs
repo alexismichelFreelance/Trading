@@ -16,6 +16,7 @@
 #region Using declarations
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -34,7 +35,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 {
     public class EngineOverlay : Indicator
     {
-        private const int DrawPort = 36004;         // NTChartPainter connects here
+        // one overlay per instrument chart, each with its own draw socket
+        // (ES 36004 default; NQ e.g. 36014 — must match config/live.yaml)
+        [NinjaScriptProperty]
+        [Display(Name = "DrawPort", GroupName = "Engine", Order = 1)]
+        public int DrawPort { get; set; }           // NTChartPainter connects here
 
         private TcpListener drawListener;
         private readonly List<TcpClient> drawClients = new List<TcpClient>();
@@ -68,6 +73,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Calculate = Calculate.OnEachTick;
                 IsSuspendedWhileInactive = false;
                 DrawOnPricePanel = true;
+                DrawPort = 36004;                   // per-instrument lane port
             }
             else if (State == State.Realtime)
             {
