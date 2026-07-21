@@ -180,6 +180,41 @@ ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex")
 
 
+def load_open_paper_positions(qdb, symbols) -> dict:
+    """{sleeve_label: (pos, avg_px)} for paper sleeves currently holding an open
+    position, avg-cost-reconstructed from the full claude_paper_fills history
+    (closed round-trips net to zero and drop out). Empty on any read failure."""
+    out: dict = {}
+    for sym in symbols:
+        try:
+            pf = qdb.df(f"SELECT sleeve, side, qty, price FROM claude_paper_fills "
+                        f"WHERE symbol='{sym}' ORDER BY ts")
+        except Exception:                            # noqa: BLE001
+            continue
+        if not len(pf):
+            continue
+        for sl in pf["sleeve"].unique():
+            g = pf[pf["sleeve"] == sl]
+            pos = 0
+            avg = 0.0
+            for r in g.itertuples():
+                q = int(r.qty) if r.side > 0 else -int(r.qty)
+                px = float(r.price)
+                if pos == 0:
+                    pos, avg = q, px
+                elif (q > 0) == (pos > 0):            # add: weighted average
+                    avg = (avg * abs(pos) + px * abs(q)) / (abs(pos) + abs(q))
+                    pos += q
+                elif abs(q) >= abs(pos):             # close through flat / flip
+                    pos += q
+                    avg = px if pos != 0 else 0.0
+                else:                                # partial reduce: avg unchanged
+                    pos += q
+            if pos != 0:
+                out[str(sl)] = (pos, avg)
+    return out
+
+
 def build_roster(paper: str, flow_th: int = 30, symbol: str = SYMBOL,
                  hmm_path: str = HMM_PATH, prefix: str = ""):
     """Roster for one instrument lane. `prefix` namespaces labels in multi-
@@ -359,6 +394,23 @@ async def main() -> None:
     paper_lbls = sorted(lb for lb, s in roster if id(s) not in live_owners)
     print(f"roster ({len(roster)}): LIVE->NT8 {live_lbls or '(none)'}  |  "
           f"PAPER {paper_lbls}")
+
+    # resume open paper positions carried across a restart (e.g. IBS held
+    # overnight) so they get managed/exited instead of orphaned. Rebuilt from
+    # claude_paper_fills; applied at each lane's warmup->live flip.
+    by_label = {lb: s for lb, s in roster}
+    try:
+        from engine.adapters.questdb import QuestDB as _RQDB
+        open_pos = load_open_paper_positions(_RQDB(timeout=10), list(lanes_cfg))
+    except Exception as ex:                          # noqa: BLE001
+        open_pos = {}
+        print(f"  (paper-position restore skipped: {ex})")
+    for sl, (pos, avg) in open_pos.items():
+        s = by_label.get(sl)
+        if s is not None and id(s) not in live_owners:
+            eng.restore_paper_position(s, pos, avg)
+            print(f"resuming paper position: {sl} {pos:+d} @ {avg:.2f} "
+                  f"(at warmup->live flip)")
 
     # ── chart painting: ONE painter + PaintController PER LANE (each lane's
     # EngineOverlay indicator has its own draw socket). Engine hooks fan out,

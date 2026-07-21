@@ -81,6 +81,13 @@ class IBSSwingStrategy(BaseStrategy):
         # time-gated — don't re-decide stale if it passed in the backfill)
         self.pos = 0
 
+    def restore_state(self, pos: int, avg_px: float) -> bool:
+        # IBS holds overnight by design and its exit is IBS-threshold based
+        # (not price-based), so the net position is all it needs to resume
+        # managing a position carried across a restart. avg_px is unused here.
+        self.pos = pos
+        return True
+
     def on_fill(self, f: Fill) -> None:
         return None
 

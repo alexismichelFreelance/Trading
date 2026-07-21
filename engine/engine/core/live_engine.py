@@ -86,6 +86,11 @@ class LiveEngine:
         self._owner: dict[str, object] = {}         # order_id -> strategy
         self._spos: dict[int, int] = {}              # id(strategy) -> signed qty
         self._savg: dict[int, float] = {}            # id(strategy) -> avg px
+        # paper positions carried across a restart (e.g. IBS held overnight),
+        # rebuilt from claude_paper_fills by the runner. id(strategy)->(pos,avg);
+        # applied at that lane's warmup->live flip so overnight sleeves resume
+        # managing their position instead of orphaning it.
+        self._restore: dict[int, tuple[int, float]] = {}
         # central risk supervisor (see core/risk.py). The default config has
         # every production limit OFF, but in-flight-aware reduce_only vetting
         # is always on — that closed the 2026-07-09 duplicate-flatten bug.
@@ -133,6 +138,13 @@ class LiveEngine:
                            f"(have {sorted(self.brokers)})")
         return b
 
+    def restore_paper_position(self, strategy, pos: int, avg_px: float) -> None:
+        """Register an open paper position to resume at the warmup->live flip
+        (from claude_paper_fills). No-op for pos==0. Paper sleeves only — live
+        positions live in the broker/account, not here."""
+        if pos:
+            self._restore[id(strategy)] = (pos, float(avg_px))
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -145,6 +157,25 @@ class LiveEngine:
         limits, lockouts, halt."""
         return self.risk.vet(id(s), type(s).__name__, o, ts,
                              self._spos.get(id(s), 0))
+
+    def _apply_restore(self, s) -> None:
+        """At the live flip, hand a registered open position back to the sleeve.
+        Only reseed the engine's attributed book if the sleeve confirms it can
+        manage from (pos, avg) — otherwise the position would be held but never
+        exited (worse than flat), so we drop it and log loudly."""
+        r = self._restore.pop(id(s), None)
+        if r is None or self._is_live(s):            # live positions aren't ours
+            return
+        pos, avg = r
+        if getattr(s, "restore_state", None) and s.restore_state(pos, avg):
+            self._spos[id(s)] = pos
+            self._savg[id(s)] = avg
+            log.info("restored paper position: %s %+d @ %.2f",
+                     type(s).__name__, pos, avg)
+        else:
+            log.warning("open paper position for %s (%+d @ %.2f) NOT restorable "
+                        "(sleeve needs richer state) — left flat, orphaned in "
+                        "claude_paper_fills", type(s).__name__, pos, avg)
 
     async def _submit_owned(self, s, o) -> None:
         self._owner[o.order_id] = s
@@ -252,6 +283,7 @@ class LiveEngine:
                             reset = getattr(s, "reset_for_live", None)
                             if callable(reset):
                                 reset()
+                            self._apply_restore(s)       # resume overnight position
                         log.info("warmup complete [%s]: %d backfill bars consumed, %d "
                                  "warmup orders suppressed; lane strategies reset; now LIVE",
                                  sym or "-", self._bf_bars.get(sym, 0), self._suppressed_orders)

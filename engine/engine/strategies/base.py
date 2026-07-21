@@ -55,5 +55,17 @@ class BaseStrategy:
         never called in replay, so parity is unaffected."""
         return None
 
+    def restore_state(self, pos: int, avg_px: float) -> bool:
+        """Resume managing an ALREADY-OPEN position after an engine restart
+        (rebuilt from claude_paper_fills). Called at the warmup->live flip,
+        AFTER reset_for_live. Return True only if this sleeve can correctly
+        manage the position from just (pos, avg_px) — the engine then reseeds
+        its attributed book so exits/reduce_only work. Default False: the sleeve
+        needs richer entry state (stop/target/scalp) that (pos, avg_px) can't
+        supply, so the open position is left flat and logged rather than held
+        unmanaged. Only overnight-holding, price-stateless sleeves (IBS) opt in.
+        Never called in replay."""
+        return False
+
 
 __all__ = ["BaseStrategy"]
