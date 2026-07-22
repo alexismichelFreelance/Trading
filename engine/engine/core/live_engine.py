@@ -21,6 +21,7 @@ from .blotter import Blotter
 from .dispatch import dispatch_broker, dispatch_market
 from .events import Bar, Fill, PositionUpdate, Trade
 from .risk import RiskSupervisor
+from .timeutil import et_session_date
 
 log = logging.getLogger("engine.live")
 
@@ -74,6 +75,11 @@ class LiveEngine:
         self.on_manual_fill = None         # async (Fill) — unattributed (manual) fill
         self.on_bar_hook = None            # async (ts, close, live, backfill_bars)
         self.on_warmup_signal = None       # async (ts, side, qty, tag, px) — ghosts
+        # fires (once, live only) when the ET session date advances — lets the
+        # runner refresh day-keyed snapshots (gamma regime + wall lines) so a
+        # multi-day run stays correct without a restart.
+        self.on_session_rollover = None    # async (new_day: str)
+        self._session_day: str | None = None
         # ── per-strategy attribution ──────────────────────────────────────
         # Multiple sleeves share one ACCOUNT, so the account net position must
         # never be broadcast to strategies (each sleeve would mis-attribute the
@@ -289,6 +295,16 @@ class LiveEngine:
                                  sym or "-", self._bf_bars.get(sym, 0), self._suppressed_orders)
                     if not lane_live and isinstance(ev, Bar):
                         self._bf_bars[sym] = self._bf_bars.get(sym, 0) + 1
+                    # ET session rollover (live only, once per change): refresh
+                    # day-keyed snapshots. Warmup backfill (pre-live) is skipped
+                    # so replayed historical days don't fire it.
+                    if self._live and self.on_session_rollover is not None:
+                        d = et_session_date(ev.ts)
+                        if self._session_day is None:
+                            self._session_day = d
+                        elif d != self._session_day:
+                            self._session_day = d
+                            await self.on_session_rollover(d)
                     px = self.px_for(sym)
                     for s in self.strategies:            # per-strategy: orders are OWNED
                         for o in dispatch_market([s], ev):

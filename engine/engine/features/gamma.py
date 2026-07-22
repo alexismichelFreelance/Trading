@@ -21,10 +21,22 @@ TREND_MAX_PCTL = 1.0 / 3.0     # gexp_prev at/below this -> short-gamma regime
 
 class GammaRegime:
     def __init__(self, q: QuestDB | None = None, table: str = "claude_gex") -> None:
-        q = q or QuestDB()
-        df = q.df(f"SELECT ts, gexp FROM {table} WHERE gexp IS NOT NULL ORDER BY ts")
+        self._q = q or QuestDB()
+        self._table = table
+        self._load()
+
+    def _load(self) -> None:
+        df = self._q.df(f"SELECT ts, gexp FROM {self._table} "
+                        f"WHERE gexp IS NOT NULL ORDER BY ts")
         self._dates = df["ts"].dt.strftime("%Y-%m-%d").tolist()
         self._vals = df["gexp"].astype(float).tolist()
+
+    def reload(self) -> None:
+        """Re-read the table IN PLACE so long-running holders (the *_gex
+        strategies keep one shared instance) pick up sessions written since
+        construction — without this, gexp_prev freezes at the startup snapshot
+        and drifts one session staler per day the engine runs."""
+        self._load()
 
     def gexp_prev(self, day: str) -> float | None:
         """CAUSAL prior-session GEX percentile for trading day 'YYYY-MM-DD':

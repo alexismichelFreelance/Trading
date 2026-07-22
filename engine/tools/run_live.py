@@ -180,6 +180,23 @@ ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex")
 
 
+def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
+    """(lv, underlying, basis) — prior-session gamma walls for a lane's
+    instrument on `day`, from its configured underlying+basis. lv is None if the
+    lane has no gex config or no prior row. FRESH DB read each call, so a
+    long-running engine picks up rows written since startup (the 15:00 fetch)."""
+    gexc = INSTRUMENTS[sym].extra.get("gex")
+    if not gexc:
+        return None, None, None
+    from engine.adapters.questdb import QuestDB as _Q
+    from engine.features.gamma_levels import GammaLevels
+    und = gexc.get("underlying", "SPX")
+    basis = gex_basis_override if (sym == "ES" and gex_basis_override is not None) \
+        else float(gexc.get("basis", 0.0))
+    lv = GammaLevels(_Q(timeout=10), underlying=und).levels_prev(day, basis=basis)
+    return lv, und, basis
+
+
 def load_open_paper_positions(qdb, symbols) -> dict:
     """{sleeve_label: (pos, avg_px)} for paper sleeves currently holding an open
     position, avg-cost-reconstructed from the full claude_paper_fills history
@@ -441,17 +458,11 @@ async def main() -> None:
             # gamma S/R levels per lane: ES <- SPX chain, NQ <- NDX chain
             # (instruments.yaml gex: {underlying, basis}); --gex-basis still
             # overrides the ES basis for back-compat.
-            gexc = INSTRUMENTS[sym].extra.get("gex") if a.gex_levels else None
-            if gexc:
+            if a.gex_levels and INSTRUMENTS[sym].extra.get("gex"):
                 from datetime import datetime, timezone
-
-                from engine.features.gamma_levels import GammaLevels
                 try:
-                    und = gexc.get("underlying", "SPX")
-                    basis = a.gex_basis if (sym == "ES" and a.gex_basis is not None) \
-                        else float(gexc.get("basis", 0.0))
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    lv = GammaLevels(underlying=und).levels_prev(today, basis=basis)
+                    lv, und, basis = lane_gamma_levels(sym, today, a.gex_basis)
                     if lv:
                         lane_pc.set_gamma_levels(lv)
                         print(f"gamma S/R levels ON [{sym}<-{und}] ({lv['sess']}, "
@@ -499,6 +510,31 @@ async def main() -> None:
         if paper_blot is not None:
             await paper_blot.record(f, label_by_id.get(id(eng._owner.get(f.order_id)), "?"))
     eng.on_paper_fill = _paper_sink
+
+    # ET session rollover: refresh the day-keyed snapshots so a multi-day run
+    # stays correct without a restart. (1) reload the shared GammaRegime in
+    # place -> every *_gex sleeve's filter sees the new prior session; (2)
+    # re-fetch each painting lane's prior-session walls at the current basis.
+    async def _on_rollover(new_day):
+        gr = _GAMMA_CACHE.get("ES")
+        if gr is not None:
+            try:
+                gr.reload()
+                print(f"[{new_day}] gamma regime reloaded (*_gex filters refreshed)")
+            except Exception as ex:                  # noqa: BLE001
+                print(f"[{new_day}] gamma regime reload failed: {ex}")
+        if a.gex_levels:
+            for sym, lane_pc in pcs.items():
+                try:
+                    lv, und, _basis = lane_gamma_levels(sym, new_day, a.gex_basis)
+                    if lv:
+                        lane_pc.set_gamma_levels(lv)
+                        print(f"[{new_day}] {sym}<-{und} walls -> putW "
+                              f"{lv['put_wall']:.0f} callW {lv['call_wall']:.0f} "
+                              f"({'long' if lv['net_sign']>0 else 'SHORT'}-gamma)")
+                except Exception as ex:              # noqa: BLE001
+                    print(f"[{new_day}] {sym} walls refresh failed: {ex}")
+    eng.on_session_rollover = _on_rollover
 
     # DayScore morning read (co-pilot: fade-friendliness lean + VWAP posture).
     # A moderate-tilt SIZING input, not a switch; Crabel prior-range is the most
