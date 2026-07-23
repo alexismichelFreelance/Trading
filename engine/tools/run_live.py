@@ -258,9 +258,8 @@ async def main() -> None:
                     help="DEPRECATED alias for --live (kept for old commands)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = run until Ctrl-C)")
     ap.add_argument("--instruments", default="",
-                    help="comma list of instrument lanes (e.g. ES,NQ) read from "
-                         "--live-config; each lane = its own relay ports + roster. "
-                         "Empty (default) = single-ES from the flat args below.")
+                    help="subset of instrument lanes to run (e.g. ES or ES,NQ). "
+                         "DEFAULT (empty) = every lane in --live-config (config/live.yaml).")
     ap.add_argument("--live-config", default=str(ROOT / "config" / "live.yaml"),
                     help="per-instrument lane config (ports, paper/live rosters)")
     ap.add_argument("--market-port", type=int, default=36001)
@@ -279,8 +278,9 @@ async def main() -> None:
     ap.add_argument("--panel", default="bottomleft",
                     choices=["bottomleft", "topright", "bottomright", "topleft"],
                     help="corner for the engine info panel (default bottomleft)")
-    ap.add_argument("--record", action="store_true",
-                    help="record 1m bars to QuestDB claude_bars_live (grow the library)")
+    ap.add_argument("--record", action=argparse.BooleanOptionalAction, default=True,
+                    help="record 1m bars + per-second features to QuestDB (default ON; "
+                         "--no-record to disable)")
     ap.add_argument("--flow-th", type=int, default=30,
                     help="flow threshold for THIS feed (validated=200 but the live feed's "
                          "|adelta| tops ~66; default 30 lets flow respond here)")
@@ -297,13 +297,13 @@ async def main() -> None:
                     help="risk: daily marked-loss kill switch in USD (default -5000)")
     ap.add_argument("--no-risk", action="store_true",
                     help="DANGER: disable production risk limits (in-flight vetting stays on)")
-    ap.add_argument("--raw-capture", action="store_true",
-                    help="record the FULL raw feed (every trade + all 10 L2 book "
-                         "levels) to claude_ticks_live/claude_depth_live via a "
-                         "buffered ILP writer thread (off the hot path, never lags NT8)")
-    ap.add_argument("--gex-levels", action="store_true",
-                    help="draw prior-session gamma strikes (put wall/call wall/flip) as S/R "
-                         "lines on the chart (claude_gex_levels, CBOE true-OI).")
+    ap.add_argument("--raw-capture", action=argparse.BooleanOptionalAction, default=True,
+                    help="record the FULL raw feed (every trade + all 10 L2 book levels) "
+                         "to claude_ticks_live/claude_depth_live via a buffered ILP writer "
+                         "thread, off the hot path (default ON; --no-raw-capture to disable)")
+    ap.add_argument("--gex-levels", action=argparse.BooleanOptionalAction, default=True,
+                    help="draw prior-session gamma walls (put/call/flip) as S/R lines "
+                         "(default ON; --no-gex-levels to disable)")
     ap.add_argument("--gex-basis", type=float, default=None,
                     help="override the ES lane's cash->future basis (default: "
                          "instruments.yaml gex.basis, re-measured at each close)")
@@ -316,23 +316,29 @@ async def main() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # ── instrument lanes ──────────────────────────────────────────────────
-    # Default (no --instruments): ONE ES lane from the flat CLI args — exactly
-    # the pre-multi behavior. --instruments ES,NQ reads per-lane ports+rosters
-    # from config/live.yaml; every lane gets its own relay (chart) + sockets.
-    if a.instruments:
+    # config/live.yaml is the standing config. The BARE command runs every lane
+    # defined there (ES + NQ today) — no flags needed. --instruments ES,NQ picks
+    # a subset. If live.yaml is absent, fall back to one ES lane from the flat
+    # CLI args (ports/paper/live).
+    cfg_path = Path(a.live_config)
+    if cfg_path.exists():
         import yaml as _yaml
-        _cfg = _yaml.safe_load(Path(a.live_config).read_text(encoding="utf-8"))
-        _all = _cfg.get("instruments") or {}
+        _all = (_yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}).get("instruments") or {}
+        if not _all:
+            raise SystemExit(f"no instruments defined in {a.live_config}")
+        want = [s.strip() for s in a.instruments.split(",") if s.strip()] or list(_all)
         lanes_cfg = {}
-        for sym in [s.strip() for s in a.instruments.split(",") if s.strip()]:
+        for sym in want:
             if sym not in _all:
-                raise SystemExit(f"--instruments {sym}: no entry in {a.live_config}")
+                raise SystemExit(f"instrument {sym}: no entry in {a.live_config} "
+                                 f"(have {sorted(_all)})")
             lanes_cfg[sym] = _all[sym]
+        multi = True                                 # live.yaml labels stay prefixed (ES:zones)
     else:
         lanes_cfg = {SYMBOL: {"market_port": a.market_port, "broker_port": a.broker_port,
                               "draw_port": a.draw_port, "paper": a.paper,
                               "live": (a.live or a.strategies)}}
-    multi = bool(a.instruments)
+        multi = False
 
     roster: list = []            # (label, strategy) across all lanes
     live_names: set = set()

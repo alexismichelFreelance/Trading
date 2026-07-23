@@ -63,24 +63,25 @@ long-gamma) run alongside their raw twins, so the paper record shows both and
 you route whichever earns. ES only — SPX gamma is not an NQ signal.
 
 ## Daily session command
+The standing config lives in `config/live.yaml` (instruments, ports, rosters).
+The **bare command runs the full session** — every lane in live.yaml (ES+NQ),
+with recording, raw L2/tick capture, gamma walls, risk, and the panel all ON by
+default. No flags to remember:
 ```
 cd D:/Trading/engine
-.venv/Scripts/python.exe tools/run_live.py \
-    --paper all \
-    --live zones,dipbuy \
-    --gex-levels \
-    --record \
-    --panel bottomleft
+.venv/Scripts/python.exe tools/run_live.py
 ```
-- `--paper all` — the full roster paper-trades: ignition, ignition_fixed,
-  ignition_gex, opendrive, opendrive_gex, flow, flow_fixed, flow_gex, zones,
-  zones_gap, dipbuy, dipbuy_gex, ibs, ibs_gex. Every signal is visible.
-- `--live zones,dipbuy` — only these route to NT8. Empty = pure paper/observation.
-  Risk limits apply to the LIVE subset only.
-- End-of-session prints per-paper-sleeve realized pts + net position.
-- `--gex-levels` — draw put wall / call wall / flip as S/R lines (eyeball the
-  put-wall line vs price on the first session; recalibrate `--gex-basis` if off).
-- `--record` — grow claude_bars_live (feeds every frozen forward test).
+That's it. Everything else is an override you rarely need:
+- `--instruments ES` — run a subset instead of every live.yaml lane.
+- `--live zones,dipbuy` — route these sleeves to the NT8 broker (default: pure
+  paper/observation, nothing live). Risk limits apply to the LIVE subset.
+- `--no-record` / `--no-raw-capture` / `--no-gex-levels` — turn off a default-on
+  feature. `--no-paint` disables chart drawing.
+- `--panel topright|...` — move the info panel (default bottomleft).
+- Full roster paper-trades every session: ignition(_fixed/_gex), opendrive(_gex),
+  flow(_fixed/_gex), zones, zones_gap, dipbuy(_gex), ibs(_gex).
+- End-of-session prints per-paper-sleeve realized pts + net position + raw-capture
+  row counts.
 - Risk limits are ON by default: sleeve cap 10, gross cap 15, 4 orders/5s,
   halt at -$5,000, entry lockout 15:45 ET, EOD flatten 15:58 ET.
 
