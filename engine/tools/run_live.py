@@ -139,6 +139,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     from engine.strategies.ibs_swing import IBSSwingStrategy
     from engine.strategies.ignition import IgnitionStrategy
     from engine.strategies.open_drive import OpenDriveStrategy
+    from engine.strategies.pivot import PivotStrategy
     from engine.strategies.zones_strategy import ZoneLifecycleStrategy
     if label == "ignition":
         return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing", regime_states=None)
@@ -171,13 +172,16 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return IBSSwingStrategy(symbol)
     if label == "ibs_gex":           # variant: size up in long-gamma
         return IBSSwingStrategy(symbol, gamma=_gamma_or_none(symbol))
+    if label == "pivot":             # user-modeled: overnight bias + pivot fades
+        return PivotStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
     raise SystemExit(f"unknown strategy '{label}'")
 
 
 # every strategy + variant — the full paper roster (--paper all)
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "opendrive_gex", "flow", "flow_fixed", "flow_gex",
-              "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex")
+              "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex",
+              "pivot")
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):

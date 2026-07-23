@@ -1,0 +1,230 @@
+"""PivotStrategy — a mechanical copy of the user's discretionary pivot trading
+(decoded from the 2026-07-23 session, +$4,375):
+
+  1. Grid: classic floor pivots (PP, R1-R3, S1-S3) off the prior RTH session.
+  2. A DIRECTIONAL BIAS for the day, computed at the US open from the overnight
+     (Asia+London) action — the fuzzy part the user reads by eye:
+        - VWAP posture: how much of the overnight price sat BELOW session VWAP
+          (below-VWAP persistence was the strongest intraday-momentum signal in
+          the earlier research, ~+0.45), and whether VWAP acted as resistance.
+        - Character: Kaufman efficiency of the overnight move (trend vs "wiggle").
+        - Short gamma amplifies conviction.
+     -> bias in {-1 short, 0 neutral, +1 long}.
+  3. Execution = resting limit-style entries at pivots, in the bias direction:
+        short bias -> fade retraces UP into the nearest pivot above; cover at the
+        next pivot down. Plus a DEEP-pivot reversal (buy S3 / sell R3 as "far
+        enough for a bounce"), target back toward VWAP. Flat by 15:59 ET.
+  (long bias mirrors.) Single position at a time; set-and-forget within the day.
+
+NOT a validated edge — the bias read especially is a first cut to be tuned by
+comparing its daily call to the user's actual trades (paper only). The execution
+(pivots + limit touches + EOD flat) is the crisp, low-risk part.
+"""
+from __future__ import annotations
+
+from ..core.events import Bar
+from ..core.orders import Order
+from ..core.timeutil import et_minute_of_day, et_session_date
+from ..features.pivots import daily_pivots
+from .base import BaseStrategy
+
+# ── session windows (ET minutes) ─────────────────────────────────────────────
+RTH_START = 9 * 60 + 30      # 09:30 — US open; bias is frozen here
+RTH_END = 16 * 60           # 16:00
+EOD_FLAT = 15 * 60 + 59     # 15:59 — flat everything
+
+# ── bias thresholds (TUNABLE — the research/fuzzy knobs) ─────────────────────
+ER_MIN = 0.30               # below this the overnight is "wiggle" -> neutral
+BELOW_HI = 0.55             # >= this fraction below VWAP -> bearish lean
+BELOW_LO = 0.45             # <= this -> bullish lean
+STOP_BUF = 3.0              # pts beyond the guard pivot for the stop
+MAX_DIR_ENTRIES = 2         # directional pivot entries per day (avoid overtrading)
+
+
+class PivotStrategy(BaseStrategy):
+    def __init__(self, symbol: str, point_usd: float = 50.0, gamma=None,
+                 base_size: int = 1) -> None:
+        self.symbol = symbol
+        self.point_usd = point_usd
+        self.gamma = gamma                 # optional GammaRegime (conviction only)
+        # fixed size: pivot-to-pivot stops are far too wide to risk-size against
+        # a small budget, and the user trades a fixed lot (loose stop, covers at
+        # the target pivot / EOD). conviction can scale this later.
+        self.base_size = base_size
+        self.pos = 0
+        self._day: str | None = None
+        self._prior: tuple[float, float, float] | None = None
+        self._reset_session()
+
+    # ── per-session state ────────────────────────────────────────────────────
+    def _reset_session(self) -> None:
+        self._h = self._l = self._c = None      # this session's developing H/L/C
+        self.pivots: dict[str, float] = {}
+        self.grid: list[float] = []             # sorted PP,R1-3,S1-3
+        # overnight bias accumulators (session start -> US open)
+        self._on_closes: list[float] = []
+        self._cum_pv = 0.0
+        self._cum_v = 0.0
+        self._below = 0
+        self._on_n = 0
+        self.bias = 0                            # -1/0/+1, set at US open
+        self.conviction = 0.0
+        self._bias_done = False
+        # trade state
+        self.trade: dict | None = None           # {dir, entry, target, stop, tag}
+        self._used: set[float] = set()           # pivots already entered from
+        self._dir_entries = 0
+        self._reversal_used = False
+
+    def on_position(self, p) -> None:
+        self.pos = p.qty
+
+    def reset_for_live(self) -> None:
+        self.trade = None
+        self.pos = 0
+
+    # ── the fuzzy part: the overnight directional read ──────────────────────
+    def _compute_bias(self) -> None:
+        self._bias_done = True
+        n = self._on_n
+        if n < 30 or self._cum_v <= 0:           # not enough overnight -> stand down
+            self.bias, self.conviction = 0, 0.0
+            return
+        closes = self._on_closes
+        net = closes[-1] - closes[0]
+        churn = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+        er = abs(net) / churn if churn > 0 else 0.0      # Kaufman ER of the night
+        below_frac = self._below / n
+        if er < ER_MIN:                          # choppy night = "just wiggle"
+            self.bias, self.conviction = 0, er
+            return
+        if below_frac >= BELOW_HI and net < 0:
+            self.bias = -1                       # mostly below VWAP + trending down
+        elif below_frac <= BELOW_LO and net > 0:
+            self.bias = +1
+        else:
+            self.bias = 0
+        self.conviction = er
+        # short gamma amplifies conviction (dealers add to the move)
+        if self.bias != 0 and self.gamma is not None:
+            try:
+                if self.gamma.is_short_gamma(self._day):
+                    self.conviction = min(1.0, er * 1.5)
+            except Exception:                    # noqa: BLE001
+                pass
+
+    # ── main ────────────────────────────────────────────────────────────────
+    def on_bar(self, bar: Bar) -> list[Order]:
+        if bar.tf != "1m":
+            return []
+        day = et_session_date(bar.ts)
+        if day != self._day:                     # roll session
+            if self._h is not None:
+                self._prior = (self._h, self._l, self._c)
+            self._day = day
+            self._reset_session()
+            self.pivots = (daily_pivots(*self._prior) if self._prior else {})
+            self.grid = sorted(self.pivots[k] for k in
+                               ("PP", "R1", "R2", "R3", "S1", "S2", "S3")
+                               if k in self.pivots)
+        # develop this session's H/L/C for tomorrow's pivots
+        self._h = bar.h if self._h is None else max(self._h, bar.h)
+        self._l = bar.l if self._l is None else min(self._l, bar.l)
+        self._c = bar.c
+
+        m = et_minute_of_day(bar.ts)
+        if m < RTH_START:                        # overnight: accumulate the bias read
+            v = float(bar.v) if bar.v else 0.0
+            self._cum_v += v
+            self._cum_pv += bar.c * v
+            vwap = self._cum_pv / self._cum_v if self._cum_v > 0 else bar.c
+            self._on_closes.append(bar.c)
+            self._on_n += 1
+            if bar.c < vwap:
+                self._below += 1
+            return []
+        if not self._bias_done:                  # first RTH bar -> freeze the bias
+            self._compute_bias()
+        if not self.grid:
+            return []
+        if m >= EOD_FLAT:                         # flat by the close
+            return self._flatten("eod")
+        if self.pos != 0 and self.trade is not None:
+            return self._manage(bar)
+        if self.pos == 0 and self.bias != 0:
+            return self._scan(bar)
+        return []
+
+    # ── entries ──────────────────────────────────────────────────────────────
+    def _scan(self, bar: Bar) -> list[Order]:
+        d = self.bias
+        # DEEP-pivot reversal: bias short -> buy the lowest pivot (S3) as "far
+        # enough down for a bounce"; bias long -> sell the highest (R3).
+        rev_lvl = self.pivots.get("S3") if d < 0 else self.pivots.get("R3")
+        if rev_lvl is not None and not self._reversal_used:
+            touched = bar.l <= rev_lvl if d < 0 else bar.h >= rev_lvl
+            if touched:
+                self._reversal_used = True
+                rdir = -d                        # reversal trades AGAINST the bias
+                tgt = self._cum_pv / self._cum_v if self._cum_v > 0 else \
+                    self.pivots.get("PP", rev_lvl)   # back toward VWAP/PP
+                stop = rev_lvl - rdir * (2 * STOP_BUF)   # just beyond the deep pivot
+                return self._enter(rdir, rev_lvl, tgt, stop, "pivrev")
+        # DIRECTIONAL fade: price retraces INTO the nearest pivot against the
+        # move (short bias -> nearest pivot ABOVE; long bias -> nearest BELOW).
+        if self._dir_entries >= MAX_DIR_ENTRIES:
+            return []
+        if d < 0:
+            cands = [p for p in self.grid if p >= bar.c and p not in self._used]
+            piv = min(cands) if cands else None
+            hit = piv is not None and bar.h >= piv
+        else:
+            cands = [p for p in self.grid if p <= bar.c and p not in self._used]
+            piv = max(cands) if cands else None
+            hit = piv is not None and bar.l <= piv
+        if hit:
+            self._used.add(piv)
+            self._dir_entries += 1
+            below = [p for p in self.grid if p < piv]
+            above = [p for p in self.grid if p > piv]
+            if d < 0:                            # short: target next pivot down
+                tgt = max(below) if below else piv - 2 * STOP_BUF
+                stop = (min(above) if above else piv + 2 * STOP_BUF) + STOP_BUF
+            else:                                # long: target next pivot up
+                tgt = min(above) if above else piv + 2 * STOP_BUF
+                stop = (max(below) if below else piv - 2 * STOP_BUF) - STOP_BUF
+            return self._enter(d, piv, tgt, stop, "piv")
+        return []
+
+    def _enter(self, d: int, entry: float, target: float, stop: float,
+               tag: str) -> list[Order]:
+        size = self.base_size
+        if size <= 0:
+            return []
+        self.trade = {"dir": d, "entry": entry, "target": target, "stop": stop,
+                      "size": size, "tag": tag}
+        return [Order(self.symbol, d, size, tag=f"{tag}-entry")]
+
+    # ── management ───────────────────────────────────────────────────────────
+    def _manage(self, bar: Bar) -> list[Order]:
+        t = self.trade
+        d = t["dir"]
+        target_hit = bar.h >= t["target"] if d > 0 else bar.l <= t["target"]
+        stop_hit = bar.l <= t["stop"] if d > 0 else bar.h >= t["stop"]
+        if target_hit:
+            return self._flatten("target")
+        if stop_hit:
+            return self._flatten("stop")
+        return []
+
+    def _flatten(self, why: str) -> list[Order]:
+        if self.pos == 0 or self.trade is None:
+            self.trade = None
+            return []
+        d = self.trade["dir"]
+        qty = abs(self.pos)
+        self.trade = None
+        return [Order(self.symbol, -d, qty, tag=f"piv-{why}", reduce_only=True)]
+
+
+__all__ = ["PivotStrategy"]
