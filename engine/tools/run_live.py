@@ -121,7 +121,7 @@ def _gamma_or_none(symbol: str):
         from engine.adapters.questdb import QuestDB
         from engine.features.gamma import GammaRegime
         try:
-            _GAMMA_CACHE["ES"] = GammaRegime(QuestDB(timeout=10))
+            _GAMMA_CACHE["ES"] = GammaRegime(QuestDB(timeout=30))
         except Exception as ex:      # noqa: BLE001
             print(f"  (*_gex variants trade RAW: GammaRegime unavailable: {ex})")
             _GAMMA_CACHE["ES"] = None
@@ -193,7 +193,7 @@ def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
     und = gexc.get("underlying", "SPX")
     basis = gex_basis_override if (sym == "ES" and gex_basis_override is not None) \
         else float(gexc.get("basis", 0.0))
-    lv = GammaLevels(_Q(timeout=10), underlying=und).levels_prev(day, basis=basis)
+    lv = GammaLevels(_Q(timeout=30), underlying=und).levels_prev(day, basis=basis)
     return lv, und, basis
 
 
@@ -533,25 +533,42 @@ async def main() -> None:
     # stays correct without a restart. (1) reload the shared GammaRegime in
     # place -> every *_gex sleeve's filter sees the new prior session; (2)
     # re-fetch each painting lane's prior-session walls at the current basis.
-    async def _on_rollover(new_day):
+    # RESILIENT: runs in a worker thread (never blocks the engine loop) and
+    # RETRIES with backoff — a slow/laggy QuestDB read then can't silently leave
+    # the regime stale for the day (the 2026-07-23 timeout).
+    import time as _time
+
+    def _retry(fn, label, tries=6):
+        for i in range(tries):
+            try:
+                return fn(), True
+            except Exception as ex:              # noqa: BLE001
+                if i == tries - 1:
+                    print(f"{label} GAVE UP after {tries} tries: {ex}")
+                    return None, False
+                _time.sleep(min(30.0, 2.0 ** i))     # 1,2,4,8,16,30s
+        return None, False
+
+    def _refresh_gamma_blocking(new_day):
         gr = _GAMMA_CACHE.get("ES")
         if gr is not None:
-            try:
-                gr.reload()
+            _, ok = _retry(gr.reload, f"[{new_day}] gamma regime reload")
+            if ok:
                 print(f"[{new_day}] gamma regime reloaded (*_gex filters refreshed)")
-            except Exception as ex:                  # noqa: BLE001
-                print(f"[{new_day}] gamma regime reload failed: {ex}")
         if a.gex_levels:
             for sym, lane_pc in pcs.items():
-                try:
-                    lv, und, _basis = lane_gamma_levels(sym, new_day, a.gex_basis)
-                    if lv:
-                        lane_pc.set_gamma_levels(lv)
-                        print(f"[{new_day}] {sym}<-{und} walls -> putW "
-                              f"{lv['put_wall']:.0f} callW {lv['call_wall']:.0f} "
-                              f"({'long' if lv['net_sign']>0 else 'SHORT'}-gamma)")
-                except Exception as ex:              # noqa: BLE001
-                    print(f"[{new_day}] {sym} walls refresh failed: {ex}")
+                lv3, ok = _retry(lambda: lane_gamma_levels(sym, new_day, a.gex_basis),
+                                 f"[{new_day}] {sym} walls refresh")
+                if ok and lv3 and lv3[0]:
+                    lv, und, _basis = lv3
+                    lane_pc.set_gamma_levels(lv)
+                    print(f"[{new_day}] {sym}<-{und} walls -> putW "
+                          f"{lv['put_wall']:.0f} callW {lv['call_wall']:.0f} "
+                          f"({'long' if lv['net_sign']>0 else 'SHORT'}-gamma)")
+
+    async def _on_rollover(new_day):
+        # off the event loop; retries in the background until QuestDB answers
+        asyncio.create_task(asyncio.to_thread(_refresh_gamma_blocking, new_day))
     eng.on_session_rollover = _on_rollover
 
     # DayScore morning read (co-pilot: fade-friendliness lean + VWAP posture).

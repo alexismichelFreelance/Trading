@@ -23,27 +23,34 @@ class GammaRegime:
     def __init__(self, q: QuestDB | None = None, table: str = "claude_gex") -> None:
         self._q = q or QuestDB()
         self._table = table
+        self._snap: tuple[list, list] = ([], [])   # (dates, vals), swapped atomically
         self._load()
 
     def _load(self) -> None:
         df = self._q.df(f"SELECT ts, gexp FROM {self._table} "
                         f"WHERE gexp IS NOT NULL ORDER BY ts")
-        self._dates = df["ts"].dt.strftime("%Y-%m-%d").tolist()
-        self._vals = df["gexp"].astype(float).tolist()
+        dates = df["ts"].dt.strftime("%Y-%m-%d").tolist()
+        vals = df["gexp"].astype(float).tolist()
+        # single atomic rebind: a concurrent reader (a *_gex strategy in the
+        # engine loop, while reload() runs in a worker thread) never sees a
+        # half-updated dates/vals pair.
+        self._snap = (dates, vals)
 
     def reload(self) -> None:
         """Re-read the table IN PLACE so long-running holders (the *_gex
         strategies keep one shared instance) pick up sessions written since
         construction — without this, gexp_prev freezes at the startup snapshot
-        and drifts one session staler per day the engine runs."""
+        and drifts one session staler per day the engine runs. May raise on a
+        slow/unreachable DB — the caller retries."""
         self._load()
 
     def gexp_prev(self, day: str) -> float | None:
         """CAUSAL prior-session GEX percentile for trading day 'YYYY-MM-DD':
         the gexp of the latest session STRICTLY BEFORE `day`."""
         import bisect
-        i = bisect.bisect_left(self._dates, day)
-        return self._vals[i - 1] if i > 0 else None
+        dates, vals = self._snap          # consistent snapshot even mid-reload
+        i = bisect.bisect_left(dates, day)
+        return vals[i - 1] if i > 0 else None
 
     def is_short_gamma(self, day: str, max_pctl: float = TREND_MAX_PCTL) -> bool | None:
         """True = short-gamma regime (trend sleeves on). None = no data."""
