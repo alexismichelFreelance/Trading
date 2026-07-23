@@ -12,7 +12,7 @@ import math
 
 import numpy as np
 
-from ..core.timeutil import et_session_date, is_rth
+from ..core.timeutil import et, et_session_date, is_rth
 
 
 def daily_pivots(prior_high: float, prior_low: float, prior_close: float) -> dict[str, float]:
@@ -93,4 +93,58 @@ class SessionLevels:
         return nearest_beyond(self.pivots, price, -direction, min_dist)
 
 
-__all__ = ["daily_pivots", "level_set", "nearest_beyond", "SessionLevels"]
+_PIVOT_NAMES = ("PP", "R1", "R2", "R3", "S1", "S2", "S3")
+
+
+class MultiPivots:
+    """Floor pivots across DAY + WEEK + MONTH from the bar stream — the full
+    picture (daily alone is a small window). Tracks each period's H/L/C and
+    exposes the merged PRIOR-period pivots, each labelled TF-name (e.g. 'D-S2',
+    'W-PP', 'M-R1'). Prior periods are fixed intraday, so the grid is stable
+    within a session and only shifts at a day/week/month boundary."""
+
+    _TFS = ("D", "W", "M")
+
+    def __init__(self) -> None:
+        self._cur: dict[str, list] = {}      # tf -> [key, h, l, c]
+        self.prior: dict[str, tuple] = {}    # tf -> (h, l, c) of last completed period
+
+    @staticmethod
+    def _key(tf: str, ts: int) -> str:
+        if tf == "D":
+            return et_session_date(ts)
+        t = et(ts)
+        if tf == "W":
+            iso = t.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        return t.strftime("%Y-%m")
+
+    def update(self, ts: int, h: float, l: float, c: float) -> None:
+        for tf in self._TFS:
+            key = self._key(tf, ts)
+            cur = self._cur.get(tf)
+            if cur is None or cur[0] != key:     # period rolled
+                if cur is not None:
+                    self.prior[tf] = (cur[1], cur[2], cur[3])
+                self._cur[tf] = [key, h, l, c]
+            else:
+                cur[1] = max(cur[1], h)
+                cur[2] = min(cur[2], l)
+                cur[3] = c
+
+    def grid(self) -> dict[float, str]:
+        """{price: 'TF-name'} — the 7 floor pivots of each available prior period,
+        merged (a shared price keeps the finest-timeframe label)."""
+        out: dict[float, str] = {}
+        for tf in self._TFS:                     # D first so W/M don't overwrite its label
+            hlc = self.prior.get(tf)
+            if hlc is None:
+                continue
+            for name, px in daily_pivots(*hlc).items():
+                if name in _PIVOT_NAMES:
+                    out.setdefault(round(px, 2), f"{tf}-{name}")
+        return out
+
+
+__all__ = ["daily_pivots", "level_set", "nearest_beyond", "SessionLevels",
+           "MultiPivots"]

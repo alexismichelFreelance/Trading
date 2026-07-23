@@ -88,3 +88,20 @@ def test_short_entry_cover_reversal_and_eod_flat():
     rev = next(o for o in orders if o.tag == "pivrev-entry")
     assert entry.side == -1 and rev.side == 1
     assert pos == 0                                            # flat by the close
+
+
+def test_multipivots_merges_day_week_month():
+    from engine.features.pivots import MultiPivots
+    mp = MultiPivots()
+
+    def u(et_str, h, l, c):
+        mp.update(int(pd.Timestamp(et_str, tz="America/New_York").value), h, l, c)
+
+    u("2026-06-15 12:00", 7000, 6900, 6950)   # June
+    u("2026-07-01 12:00", 7100, 7050, 7080)   # new month -> June completes
+    u("2026-07-20 12:00", 7500, 7450, 7460)   # new week -> a July week completes
+    u("2026-07-23 09:30", 7460, 7458, 7459)   # new day -> 07-20 completes
+    g = mp.grid()
+    assert {lbl.split("-")[0] for lbl in g.values()} == {"D", "W", "M"}
+    dpp = next(px for px, lbl in g.items() if lbl == "D-PP")
+    assert abs(dpp - (7500 + 7450 + 7460) / 3) < 0.01     # daily PP from 07-20

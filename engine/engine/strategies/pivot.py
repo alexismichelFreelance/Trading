@@ -25,7 +25,7 @@ from __future__ import annotations
 from ..core.events import Bar
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
-from ..features.pivots import daily_pivots
+from ..features.pivots import MultiPivots
 from .base import BaseStrategy
 
 # ── session windows (ET minutes) ─────────────────────────────────────────────
@@ -53,14 +53,15 @@ class PivotStrategy(BaseStrategy):
         self.base_size = base_size
         self.pos = 0
         self._day: str | None = None
-        self._prior: tuple[float, float, float] | None = None
+        self.mp = MultiPivots()                 # day + week + month floor pivots
         self._reset_session()
 
     # ── per-session state ────────────────────────────────────────────────────
     def _reset_session(self) -> None:
-        self._h = self._l = self._c = None      # this session's developing H/L/C
-        self.pivots: dict[str, float] = {}
-        self.grid: list[float] = []             # sorted PP,R1-3,S1-3
+        self.grid: list[float] = []             # merged D/W/M pivot prices, sorted
+        self.labels: dict[float, str] = {}      # price -> 'D-S2' / 'W-PP' / 'M-R1'
+        self._open: float | None = None         # session open (first RTH bar)
+        self._prior_range = 0.0                 # prior-DAY range (deep-reversal scale)
         # overnight bias accumulators (session start -> US open)
         self._on_closes: list[float] = []
         self._cum_pv = 0.0
@@ -118,19 +119,14 @@ class PivotStrategy(BaseStrategy):
         if bar.tf != "1m":
             return []
         day = et_session_date(bar.ts)
-        if day != self._day:                     # roll session
-            if self._h is not None:
-                self._prior = (self._h, self._l, self._c)
+        self.mp.update(bar.ts, bar.h, bar.l, bar.c)     # track D/W/M H/L/C
+        if day != self._day:                     # roll session -> refresh the grid
             self._day = day
             self._reset_session()
-            self.pivots = (daily_pivots(*self._prior) if self._prior else {})
-            self.grid = sorted(self.pivots[k] for k in
-                               ("PP", "R1", "R2", "R3", "S1", "S2", "S3")
-                               if k in self.pivots)
-        # develop this session's H/L/C for tomorrow's pivots
-        self._h = bar.h if self._h is None else max(self._h, bar.h)
-        self._l = bar.l if self._l is None else min(self._l, bar.l)
-        self._c = bar.c
+            self.labels = self.mp.grid()
+            self.grid = sorted(self.labels)
+            pd = self.mp.prior.get("D")
+            self._prior_range = (pd[0] - pd[1]) if pd else 0.0
 
         m = et_minute_of_day(bar.ts)
         if m < RTH_START:                        # overnight: accumulate the bias read
@@ -145,6 +141,8 @@ class PivotStrategy(BaseStrategy):
             return []
         if not self._bias_done:                  # first RTH bar -> freeze the bias
             self._compute_bias()
+        if self._open is None:
+            self._open = bar.o
         if not self.grid:
             return []
         if m >= EOD_FLAT:                         # flat by the close
@@ -158,16 +156,23 @@ class PivotStrategy(BaseStrategy):
     # ── entries ──────────────────────────────────────────────────────────────
     def _scan(self, bar: Bar) -> list[Order]:
         d = self.bias
-        # DEEP-pivot reversal: bias short -> buy the lowest pivot (S3) as "far
-        # enough down for a bounce"; bias long -> sell the highest (R3).
-        rev_lvl = self.pivots.get("S3") if d < 0 else self.pivots.get("R3")
-        if rev_lvl is not None and not self._reversal_used:
-            touched = bar.l <= rev_lvl if d < 0 else bar.h >= rev_lvl
+        # DEEP-pivot reversal: the deepest grid pivot beyond the open by >= a
+        # volatility margin — "far enough down for a bounce" — from ANY timeframe
+        # (a weekly/monthly support is often the real floor, not the daily one).
+        margin = max(10.0, 0.3 * self._prior_range)
+        if self._open is not None and not self._reversal_used:
+            if d < 0:
+                deep = [p for p in self.grid if p <= self._open - margin]
+                rev_lvl = max(deep) if deep else None    # first deep level reached
+                touched = rev_lvl is not None and bar.l <= rev_lvl
+            else:
+                deep = [p for p in self.grid if p >= self._open + margin]
+                rev_lvl = min(deep) if deep else None
+                touched = rev_lvl is not None and bar.h >= rev_lvl
             if touched:
                 self._reversal_used = True
                 rdir = -d                        # reversal trades AGAINST the bias
-                tgt = self._cum_pv / self._cum_v if self._cum_v > 0 else \
-                    self.pivots.get("PP", rev_lvl)   # back toward VWAP/PP
+                tgt = self._cum_pv / self._cum_v if self._cum_v > 0 else self._open
                 stop = rev_lvl - rdir * (2 * STOP_BUF)   # just beyond the deep pivot
                 return self._enter(rdir, rev_lvl, tgt, stop, "pivrev")
         # DIRECTIONAL fade: price retraces INTO the nearest pivot against the
