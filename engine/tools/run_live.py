@@ -152,6 +152,9 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return OpenDriveStrategy(symbol)
     if label == "opendrive_gex":     # variant: entries only on short-gamma days
         return OpenDriveStrategy(symbol, gamma=_gamma_or_none(symbol))
+    if label == "opendrive_orb":     # cleverer: opening-range break, refuses the
+        return OpenDriveStrategy(symbol, mode="orb", gamma=_gamma_or_none(symbol))
+        # counter-gamma break (short gamma -> won't buy the up-fakeout)
     if label == "flow":              # adaptive z-score threshold (scale-invariant)
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=4.0)
     if label == "flow_fixed":        # variant: fixed threshold (research default)
@@ -179,7 +182,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
 
 # every strategy + variant — the full paper roster (--paper all)
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
-              "opendrive_gex", "flow", "flow_fixed", "flow_gex",
+              "opendrive_gex", "opendrive_orb", "flow", "flow_fixed", "flow_gex",
               "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex",
               "pivot")
 

@@ -27,10 +27,17 @@ FLAT_MIN = 15 * 60 + 59      # flatten on the first tick in the 15:59 ET minute
 class OpenDriveStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, stop_mult: float = 1.0, trail_mult: float = 1.5,
                  stop_floor: float = 5.0, trail_floor: float = 8.0,
-                 gamma=None) -> None:
+                 gamma=None, mode: str = "drive") -> None:
         self.symbol = symbol
         # optional GammaRegime: entries only on short-gamma days (strategy choice)
         self.gamma = gamma
+        # mode="drive" (default, PARITY): blind 10:00 entry in the 9:30->10:00
+        #   direction — the validated but naive rule (ravaged on a fakeout open).
+        # mode="orb": wait past 10:00 for a real breakout of the 9:30-10:00 range,
+        #   and with gamma, REFUSE the counter-gamma break (short gamma => don't
+        #   buy the up-fakeout; take the resumed down-break). Directly fixes the
+        #   2026-07-23 -41pt: it would have shorted the resume, not bought the poke.
+        self.mode = mode
         self.stop_mult, self.trail_mult = stop_mult, trail_mult
         self.stop_floor, self.trail_floor = stop_floor, trail_floor
         self._day: str | None = None
@@ -47,6 +54,7 @@ class OpenDriveStrategy(BaseStrategy):
         self.stop = 0.0
         self.trail = 0.0
         self.peak_fe = 0.0
+        self._or_hi = self._or_lo = None       # opening range, frozen at 10:00 (orb)
 
     # price ticks arrive as per-second trades (replay/live) — drive on pxc
     def on_trade(self, t: Trade) -> list[Order]:
@@ -94,8 +102,11 @@ class OpenDriveStrategy(BaseStrategy):
                 self.side = 0
                 return [Order(self.symbol, -side, abs(self.pos), tag="moc", reduce_only=True)]
             return []
-        # entry at the first tick >= 10:00
+        # entry
         if not self.entered:
+            if self.mode == "orb":
+                return self._orb_entry(ts, px)
+            # --- drive mode (default, PARITY): blind 10:00 entry ---
             self.entered = True
             if self.open_px is None:
                 return []
@@ -120,6 +131,33 @@ class OpenDriveStrategy(BaseStrategy):
                 self.side = 0
                 return [Order(self.symbol, -side, abs(self.pos), tag="trail", reduce_only=True)]
         return []
+
+    # ── ORB entry (mode="orb"): break of the 9:30-10:00 range, gamma-biased ──
+    def _orb_entry(self, ts: int, px: float) -> list[Order]:
+        if self._or_hi is None:                 # freeze the opening range at 10:00
+            if self.open_px is None:
+                self.entered = True             # no open data -> no trade today
+                return []
+            self._or_hi, self._or_lo = self.hi, self.lo
+        allow_long = allow_short = True
+        if self.gamma is not None:
+            sg = self.gamma.is_short_gamma(et_session_date(ts))
+            if sg is True:                      # short gamma: fade up-pokes, take downs
+                allow_long = False
+            elif sg is False:                   # long gamma: take ups only
+                allow_short = False
+        d = 1 if (px >= self._or_hi and allow_long) else \
+            (-1 if (px <= self._or_lo and allow_short) else 0)
+        if d == 0:
+            return []                           # keep waiting for an allowed break
+        self.entered = True
+        self.side = d
+        self.entry_px = px
+        rng = max(1e-9, self._or_hi - self._or_lo)
+        self.stop = max(self.stop_floor, self.stop_mult * rng)
+        self.trail = max(self.trail_floor, self.trail_mult * rng)
+        self.peak_fe = 0.0
+        return [Order(self.symbol, d, 1, tag="entry-orb")]
 
 
 __all__ = ["OpenDriveStrategy"]
