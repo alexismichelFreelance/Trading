@@ -297,6 +297,10 @@ async def main() -> None:
                     help="risk: daily marked-loss kill switch in USD (default -5000)")
     ap.add_argument("--no-risk", action="store_true",
                     help="DANGER: disable production risk limits (in-flight vetting stays on)")
+    ap.add_argument("--raw-capture", action="store_true",
+                    help="record the FULL raw feed (every trade + all 10 L2 book "
+                         "levels) to claude_ticks_live/claude_depth_live via a "
+                         "buffered ILP writer thread (off the hot path, never lags NT8)")
     ap.add_argument("--gex-levels", action="store_true",
                     help="draw prior-session gamma strikes (put wall/call wall/flip) as S/R "
                          "lines on the chart (claude_gex_levels, CBOE true-OI).")
@@ -335,6 +339,7 @@ async def main() -> None:
     feeds: list = []
     brokers: dict = {}
     recorders: list = []
+    rawcaps: list = []
     lane_meta: dict = {}         # sym -> {draw_port, roster, lc}
     blot: Blotter | None = None
     for sym, lc in lanes_cfg.items():
@@ -351,7 +356,14 @@ async def main() -> None:
             raise SystemExit(f"--live names not in the {sym} roster: {sorted(unknown)}")
         # lane discipline: feed stamp == strategy symbols == broker key
         assert all(s.symbol == sym for _, s in lane_roster), f"symbol mismatch in {sym} lane"
-        feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)), symbol=sym)
+        # emit_depth only when raw-capturing (the engine itself needs BookFlow,
+        # not raw depth — RawCaptureTee records the depth and drops it onward).
+        feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),
+                               symbol=sym, emit_depth=a.raw_capture)
+        if a.raw_capture:                            # innermost: sees raw depth first
+            from engine.adapters.feeds.raw_capture import RawCaptureTee
+            feed = RawCaptureTee(feed, symbol=sym)
+            rawcaps.append(feed)
         if a.record:
             rec = RecorderTee(feed, AsyncQuestDB(), symbol=sym)
             recorders.append(rec)
@@ -600,6 +612,10 @@ async def main() -> None:
         print(f"recorded [{rec.symbol}] {rec.n_recorded} 1m bars -> claude_bars_live, "
               f"{rec.n_sec} per-second rows -> claude_sec_live"
               + (f", {paper_blot.n} paper fills -> claude_paper_fills" if paper_blot else ""))
+    for rc in rawcaps:
+        print(f"raw capture [{rc.symbol}]: {rc.n_written} rows -> "
+              f"claude_ticks_live/claude_depth_live"
+              + (f"  (DROPPED {rc.n_dropped} — DB couldn't keep up!)" if rc.n_dropped else ""))
     print(f"\nsession summary: {obs.trades} trades, {obs.flows} bookflow-seconds, "
           f"{obs.bars} 1m bars ({eng._backfill_bars} backfill), last px {obs.last_px}")
     print(f"warmup orders suppressed: {eng._suppressed_orders}  |  live orders {blot.n_orders}, fills {blot.n_fills}")
