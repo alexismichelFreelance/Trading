@@ -152,6 +152,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     from engine.strategies.ignition import IgnitionStrategy
     from engine.strategies.open_drive import OpenDriveStrategy
     from engine.strategies.pivot import PivotStrategy
+    from engine.strategies.vwap_break import VwapBreakStrategy
     from engine.strategies.zones_strategy import ZoneLifecycleStrategy
     if label == "ignition":
         return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing", regime_states=None)
@@ -189,6 +190,10 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return IBSSwingStrategy(symbol, gamma=_gamma_or_none(symbol))
     if label == "pivot":             # user-modeled: overnight bias + pivot fades
         return PivotStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
+    if label == "vwapbreak":         # study-motivated: trade the session-VWAP band break
+        return VwapBreakStrategy(symbol)
+    if label == "vwapbreak_gex":     # variant: breaks only on short-gamma days
+        return VwapBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
     raise SystemExit(f"unknown strategy '{label}'")
 
 
@@ -196,7 +201,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "opendrive_gex", "opendrive_orb", "flow", "flow_fixed", "flow_gex",
               "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex",
-              "pivot")
+              "pivot", "vwapbreak", "vwapbreak_gex")
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
