@@ -19,5 +19,14 @@ instruments:
     market_port: 36011
     broker_port: 36012
     draw_port: 36014
-    paper: "zones,flow"          # start small: structure + flow only
+    # Everything whose levels/stops derive from NQ's OWN price action, so it
+    # ports without retuning. EXCLUDED on purpose:
+    #   ignition / ignition_fixed / ignition_gex -- would silently borrow ES's
+    #     fitted HMM (NQ has no hmm_path), and carry hard ES-point thresholds
+    #     (chop_stop 4.0, trend_cap 12.0, trail 6/10, pivot_min_dist 2.0) that
+    #     are meaningless where a session ranges ~400pt instead of ~65pt.
+    #   flow_fixed -- absolute adelta threshold (th=200) is ES-scaled; the
+    #     adaptive `flow` variant is a z-score, so it ports fine.
+    # Re-add ignition once an NQ HMM is fitted and its points are re-scaled.
+    paper: "zones,zones_gap,dipbuy,dipbuy_gex,ibs,ibs_gex,pivot,opendrive,opendrive_gex,opendrive_orb,flow,flow_gex,vwapbreak,vwapbreak_gex,onbreak,onbreak_gex"
     live: ""
