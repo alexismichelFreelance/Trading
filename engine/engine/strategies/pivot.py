@@ -80,6 +80,14 @@ class PivotStrategy(BaseStrategy):
     def on_position(self, p) -> None:
         self.pos = p.qty
 
+    def seed_history(self, bars) -> None:
+        """Prime the D/W/M pivot periods from historical (e.g. daily) bars so the
+        weekly/monthly grid is correct from the FIRST live session, instead of
+        taking a week/month of live bars to fill. Feeds the period tracker only;
+        emits nothing. Call once, before the engine runs."""
+        for b in bars:
+            self.mp.update(b.ts, b.h, b.l, b.c)
+
     def reset_for_live(self) -> None:
         self.trade = None
         self.pos = 0

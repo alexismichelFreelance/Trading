@@ -71,6 +71,18 @@ def fetch_daily_bars(symbol: str = "ES=F", days: int = 320) -> list:
         return []
 
 
+_DAILY_CACHE: dict = {}
+
+
+def daily_bars_for(sym: str) -> list:
+    """~320 daily bars for `sym` (Yahoo continuous), fetched once and cached —
+    used to seed both the 1d zone view and the pivot sleeve's D/W/M grid."""
+    if sym not in _DAILY_CACHE:
+        yahoo = INSTRUMENTS[sym].extra.get("yahoo", "ES=F" if sym == "ES" else None)
+        _DAILY_CACHE[sym] = fetch_daily_bars(yahoo) if yahoo else []
+    return _DAILY_CACHE[sym]
+
+
 class ObserveStrategy:
     """Counts events; places no orders. Used to validate the live pipe.
     symbol='' = observer role: sees EVERY lane's events (dispatch broadcast)."""
@@ -393,6 +405,17 @@ async def main() -> None:
         lane_meta[sym] = {"draw_port": int(lc.get("draw_port", 36004)),
                           "roster": lane_roster, "lc": lc}
 
+    # seed the pivot sleeve's day/week/month grid from daily-bar history so the
+    # weekly/monthly pivots are correct on day one (not filled in over weeks).
+    for sym, meta in lane_meta.items():
+        pivs = [s for _, s in meta["roster"] if hasattr(s, "seed_history")]
+        if pivs:
+            hist = daily_bars_for(sym)
+            for s in pivs:
+                s.seed_history(hist)
+            if hist:
+                print(f"seeded {len(hist)} daily bars -> {sym} pivot D/W/M grid")
+
     paper_blot = None
     if a.record:
         from engine.adapters.paper_blotter import PaperBlotter
@@ -472,13 +495,10 @@ async def main() -> None:
             pcs[sym] = lane_pc
             if pc is None:
                 pc = lane_pc
-            yahoo = INSTRUMENTS[sym].extra.get("yahoo",
-                                               "ES=F" if sym == "ES" else None)
-            if yahoo:
-                daily = fetch_daily_bars(yahoo)
-                if daily:
-                    lane_pc.zv.seed_daily(daily)
-                    print(f"seeded {len(daily)} daily bars for {sym} 1d zones")
+            daily = daily_bars_for(sym)          # cached (also seeds pivot grid)
+            if daily:
+                lane_pc.zv.seed_daily(daily)
+                print(f"seeded {len(daily)} daily bars for {sym} 1d zones")
             print(f"chart painting ON [{sym}] (zones, S/R, gamma, signals, panel)")
             # gamma S/R levels per lane: ES <- SPX chain, NQ <- NDX chain
             # (instruments.yaml gex: {underlying, basis}); --gex-basis still
