@@ -34,7 +34,20 @@ RTH_END = 16 * 60           # 16:00
 EOD_FLAT = 15 * 60 + 59     # 15:59 — flat everything
 
 # ── bias thresholds (TUNABLE — the research/fuzzy knobs) ─────────────────────
-ER_MIN = 0.30               # below this the overnight is "wiggle" -> neutral
+# Kaufman ER is NOT comparable across bar counts: for a random walk of N bars
+# ER ~ RW_C/sqrt(N) (~0.05 at the N~570 one-minute bars of an overnight). The
+# original absolute ER_MIN=0.30 was therefore unreachable and the sleeve never
+# took a trade in 34 live sessions. Normalize by the random-walk baseline
+# instead, so the knob means "how many times more directional than noise" and
+# is invariant to bar count AND instrument.
+RW_C = 1.25                 # E|net| / E(sum|steps|) * sqrt(N) for a random walk
+ER_MIN_NORM = 1.10          # 1.0 == random walk. Calibrated on 28 live ES
+                            # sessions (tools/pivot_bias_calib.py): fires on
+                            # 6/28 (~21%) — the clearly-directional nights.
+                            # Sanity: 2026-07-23, the user's +$4,375 pivot day,
+                            # scores 2.28 (the sample MAX) and reads short;
+                            # 2026-07-24's bear-trap chop scores 0.43 -> stand
+                            # down. Re-run the calibrator before changing this.
 BELOW_HI = 0.55             # >= this fraction below VWAP -> bearish lean
 BELOW_LO = 0.45             # <= this -> bullish lean
 STOP_BUF = 3.0              # pts beyond the guard pivot for the stop
@@ -103,8 +116,11 @@ class PivotStrategy(BaseStrategy):
         net = closes[-1] - closes[0]
         churn = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
         er = abs(net) / churn if churn > 0 else 0.0      # Kaufman ER of the night
+        # normalize against the random-walk baseline for THIS bar count, so the
+        # threshold means "x times more directional than noise" (see RW_C above)
+        er = er * (len(closes) ** 0.5) / RW_C
         below_frac = self._below / n
-        if er < ER_MIN:                          # choppy night = "just wiggle"
+        if er < ER_MIN_NORM:                     # choppy night = "just wiggle"
             self.bias, self.conviction = 0, er
             return
         if below_frac >= BELOW_HI and net < 0:
@@ -118,7 +134,7 @@ class PivotStrategy(BaseStrategy):
         if self.bias != 0 and self.gamma is not None:
             try:
                 if self.gamma.is_short_gamma(self._day):
-                    self.conviction = min(1.0, er * 1.5)
+                    self.conviction = er * 1.5   # normalized scale: no 1.0 cap
             except Exception:                    # noqa: BLE001
                 pass
 
