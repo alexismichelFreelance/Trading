@@ -29,6 +29,27 @@ Features (all causal -- only data up to t is used):
 
     .venv/Scripts/python.exe tools/flow_panel.py
     .venv/Scripts/python.exe tools/flow_panel.py --source live --horizon 880
+
+RESULT (ES, 65 research sessions, both Layer-1 scales) -- a clean negative:
+
+  horizon   best sign%        best tail ratio      unconditional
+    250s    66% (fsum120)     1.15 (bpz300 lo)         ~1.00
+    880s    63% (div300)      1.18 (bpz120 lo)         ~1.00
+
+32 feature/horizon combinations, NONE reach sign% >= 75. Most sit at 53-63%,
+i.e. the feature's direction flips on a third to a half of all sessions, and
+the per-session IC scatter runs 3-7x the median IC. The tails are weakly
+informative (1.15-1.18 against 1.00) but nowhere near stable enough to trade.
+
+Conclusion: per-second aggressor flow and L2 add/cancel pressure, AS DELIVERED
+BY THIS FEED, do not reliably predict multi-point ES moves at 4-15 minute
+horizons. Note the qualifier -- the aggressor side here is INFERRED via a
+Lee-Ready quote rule over a delayed bridge feed, not a true CME MBO aggressor
+flag, so this bounds the feed as much as the hypothesis.
+
+What did survive: swing STRUCTURE. Layer 1's causal directional-change entry
+scores 1.29-1.36 with no signal at all, better than anything conditioned on
+flow here. Structure carries more than flow does.
 """
 from __future__ import annotations
 
