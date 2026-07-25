@@ -170,11 +170,18 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return OpenDriveStrategy(symbol, mode="orb", gamma=_gamma_or_none(symbol))
         # counter-gamma break (short gamma -> won't buy the up-fakeout)
     if label == "flow":              # adaptive z-score threshold (scale-invariant)
-        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=4.0)
+        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K)
     if label == "flow_fixed":        # variant: fixed threshold (research default)
+        # KNOWN-RARE (audit: 2 orders / 34 sessions) and NOT a threshold bug:
+        # th=30 already sits at p95 of live |adelta| (p50=4, p95=29, p99=59), so
+        # it is correctly scaled to this feed. Together with the flat k=1..3
+        # plateau in tools/flow_calib.py this says the threshold is NOT the
+        # binding gate -- the other entry conditions (trend_lag / book / hold
+        # bands) are. Retuning th or adapt_k cannot fix that; diagnosing which
+        # condition starves the sleeve is its own piece of work.
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=False, th=flow_th)
     if label == "flow_gex":          # variant: increases only on short-gamma days
-        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=4.0,
+        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
                                      gamma=_gamma_or_none(symbol))
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
@@ -201,6 +208,16 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return OvernightBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
     raise SystemExit(f"unknown strategy '{label}'")
 
+
+# Adaptive-flow threshold: th = rolling_mean(|adelta|) + FLOW_K * rolling_std.
+# Was 4.0, which fired ZERO orders in 34 captured sessions (tools/sleeve_audit.py
+# verdict DEAD). tools/flow_calib.py measured the real fire rate per k over that
+# capture: k=1.0..3.0 all sit on a FLAT plateau (~1-2 entries/day, 23.5% of
+# sessions) and it collapses to 0 at k=4.0 -- i.e. below k~3 the threshold is not
+# even the binding gate, and 4.0 sat just past a cliff. 2.0 is the middle of the
+# plateau (robust to the exact value) and the conventional 2-sigma.
+# Re-run tools/flow_calib.py before changing this.
+FLOW_K = 2.0
 
 # every strategy + variant — the full paper roster (--paper all)
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
