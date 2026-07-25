@@ -28,5 +28,11 @@ instruments:
     #   flow_fixed -- absolute adelta threshold (th=200) is ES-scaled; the
     #     adaptive `flow` variant is a z-score, so it ports fine.
     # Re-add ignition once an NQ HMM is fitted and its points are re-scaled.
-    paper: "zones,zones_gap,dipbuy,dipbuy_gex,ibs,ibs_gex,pivot,opendrive,opendrive_gex,opendrive_orb,flow,flow_gex,vwapbreak,vwapbreak_gex,onbreak,onbreak_gex"
+    # Also NO *_gex variants here: _gamma_or_none() returns None for anything
+    # but ES (SPX dealer gamma is not an NDX signal), so on NQ every *_gex
+    # sleeve is a byte-identical DUPLICATE of its raw twin -- confirmed by
+    # tools/sleeve_audit.py, where all 6 pairs matched exactly. Duplicates burn
+    # compute and, worse, look like independent agreement in a twin comparison.
+    # Re-add them only once an NDX-based GammaRegime exists.
+    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,opendrive_orb,flow,vwapbreak,onbreak"
     live: ""

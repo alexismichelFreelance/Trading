@@ -87,7 +87,8 @@ def drive_all(strats: dict, events) -> dict:
     """ONE pass over the stream feeding every sleeve (20 separate passes over
     ~1M events is needlessly slow). Simulates immediate fills so position-aware
     sleeves can manage and exit. Returns per-label activity counts."""
-    acc = {lb: {"orders": 0, "entries": 0, "days": set(), "errs": 0, "pos": 0}
+    acc = {lb: {"orders": 0, "entries": 0, "days": set(), "errs": 0, "pos": 0,
+                "cost": 0.0, "real": 0.0, "byday": {}}
            for lb in strats}
     last_px = None
     total = len(events)
@@ -113,10 +114,32 @@ def drive_all(strats: dict, events) -> dict:
                 a["orders"] += 1
                 if not getattr(o, "reduce_only", False):
                     a["entries"] += 1
-                a["days"].add(et_session_date(ts))
-                a["pos"] += o.side * o.qty
-                s.on_position(PositionUpdate(ts, s.symbol, a["pos"], last_px or 0.0))
+                day = et_session_date(ts)
+                a["days"].add(day)
+                px = last_px or 0.0
+                _apply_fill(a, day, o.side * o.qty, px)
+                s.on_position(PositionUpdate(ts, s.symbol, a["pos"], px))
     return acc
+
+
+def _apply_fill(a: dict, day: str, qd: int, px: float) -> None:
+    """Average-cost realized P&L, in points. Closing quantity realizes against
+    the running average cost; same-direction quantity re-averages it."""
+    while qd != 0:
+        pos = a["pos"]
+        if pos != 0 and (pos > 0) != (qd > 0):          # reduce/close
+            n = min(abs(qd), abs(pos))
+            sgn = 1 if pos > 0 else -1
+            gain = n * (px - a["cost"]) * sgn
+            a["real"] += gain
+            a["byday"][day] = a["byday"].get(day, 0.0) + gain
+            a["pos"] = pos - n * sgn
+            qd -= n * (1 if qd > 0 else -1)
+        else:                                            # open/add
+            tot = abs(pos) + abs(qd)
+            a["cost"] = (a["cost"] * abs(pos) + px * abs(qd)) / tot if tot else 0.0
+            a["pos"] = pos + qd
+            qd = 0
 
 
 def run(symbol: str, only: list[str] | None) -> None:
@@ -141,8 +164,9 @@ def run(symbol: str, only: list[str] | None) -> None:
     print("DEAD = never fired (a BUG until argued otherwise); "
           f"RARE = < {RARE_PCT:.0f}% of sessions")
     print("=" * 78)
-    print(f"\n{'sleeve':18s} {'orders':>7} {'entries':>8} {'days':>5} "
-          f"{'fire%':>6} {'err':>4}  verdict")
+    pu = spec.point_usd if spec else 50.0
+    print(f"\n{'sleeve':18s} {'ord':>5} {'ent':>4} {'days':>5} {'fire%':>6} "
+          f"{'tot pt':>9} {'$/day':>9} {'win%':>6} {'best':>8} {'worst':>8}  verdict")
 
     strats = {}
     for lb in labels:
@@ -158,9 +182,18 @@ def run(symbol: str, only: list[str] | None) -> None:
         pct = 100.0 * len(a["days"]) / len(all_days)
         verdict = ("DEAD" if a["orders"] == 0
                    else "RARE" if pct < RARE_PCT else "OK")
-        flag = "  <-- investigate" if verdict != "OK" else ""
-        print(f"{lb:18s} {a['orders']:7d} {a['entries']:8d} {len(a['days']):5d} "
-              f"{pct:5.1f}% {a['errs']:4d}  {verdict}{flag}", flush=True)
+        flag = "  <--" if verdict != "OK" else ""
+        vals = list(a["byday"].values())
+        nd = len(vals)
+        win = 100.0 * sum(1 for v in vals if v > 0) / nd if nd else 0.0
+        best = max(vals) if vals else 0.0
+        worst = min(vals) if vals else 0.0
+        perday = a["real"] * pu / len(all_days)          # $ per CALENDAR session
+        if a["pos"] != 0:
+            flag += f" open_pos={a['pos']}"
+        print(f"{lb:18s} {a['orders']:5d} {a['entries']:4d} {len(a['days']):5d} "
+              f"{pct:5.1f}% {a['real']:+9.2f} {perday:+9.0f} {win:5.1f}% "
+              f"{best:+8.2f} {worst:+8.2f}  {verdict}{flag}", flush=True)
         rows.append((lb, verdict, a))
 
     dead = [lb for lb, v, _ in rows if v == "DEAD"]
@@ -172,6 +205,17 @@ def run(symbol: str, only: list[str] | None) -> None:
     errs = [lb for lb, _, a in rows if a["errs"]]
     if errs:
         print(f"RAISED EXCEPTIONS: {', '.join(errs)}")
+    tot = sum(a["real"] for _, _, a in rows)
+    print(f"roster total: {tot:+.1f}pt  ({tot*pu:+,.0f} @ 1 lot each, "
+          f"{tot*pu/len(all_days):+,.0f}/session)")
+    print("\nP&L HEALTH WARNING -- do not treat these as expected returns:")
+    print("  * frictionless: fills at the event price, no spread/slippage/queue,")
+    print("    no commission. Sleeves that trade often are flattered the most.")
+    print("  * IN-SAMPLE for anything calibrated on this same capture --")
+    print("    pivot (ER_MIN_NORM) and flow (FLOW_K) had their gates chosen here,")
+    print("    so their numbers are optimistic by construction.")
+    print(f"  * {len(all_days)} sessions of one regime. Nowhere near enough to rank")
+    print("    sleeves, and blind to the loss tail of any short-vol behaviour.")
     print("-" * 78 + "\n")
 
 
