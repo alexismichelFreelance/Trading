@@ -1,0 +1,85 @@
+# Per-sleeve promotion evidence (see PROMOTION_GATE.md).
+#
+# G2/G3/G4 cannot be derived from the paper record -- they are facts about how a
+# sleeve was BUILT. They are declared here and checked for presence and internal
+# consistency by tools/promotion_check.py. An undeclared sleeve FAILS; silence is
+# not a pass. Lying here is possible, which is why each entry names the tool and
+# data range that produced it, so a claim can be re-run.
+#
+# tier: current size tier (t0 paper / t1 / t2 / t3) -- see the size ladder.
+
+sleeves:
+  sweepfade:
+    tier: t0
+    # G2 -- was anything tuned, and on what?
+    calibration:
+      tool: tools/sweep_backtest.py
+      window: "ESM5 2025-05-05..2025-05-30"
+      params_chosen: [min_span_ticks, hold_s]
+    # G3 -- independent replication
+    out_of_sample:
+      window: "ESH5 2025-02-18..2025-03-19"
+      same_sign: true
+      median_ratio: 1.0        # ESM5 +0.50pt vs ESH5 +0.50pt at span>=6/15s
+    # G4 -- what execution was assumed
+    costs:
+      entry: cross
+      exit: cross              # pessimistic: both sides aggressive
+      needs_passive_fills: false
+    control_twin: sweepfollow
+    notes: >
+      Evaluation window OVERLAPS the calibration window (both ESM5 May), so G2
+      FAILS as recorded. The forward paper record is what will supply a clean
+      evaluation window; replay cannot.
+
+  sweepfade_deep:
+    tier: t0
+    calibration:
+      tool: tools/sweep_backtest.py
+      window: "ESM5 2025-05-05..2025-05-30"
+      params_chosen: [min_span_ticks, hold_s]
+    out_of_sample:
+      window: "ESH5 2025-02-18..2025-03-19"
+      same_sign: true
+      median_ratio: 1.0        # +0.75pt on both contracts at span>=8/15s
+    costs:
+      entry: cross
+      exit: cross
+      needs_passive_fills: false
+    control_twin: sweepfollow
+    notes: Same G2 overlap caveat as sweepfade.
+
+  pivot:
+    tier: t0
+    calibration:
+      tool: tools/pivot_bias_calib.py
+      window: "ES live capture 2026-06-16..2026-07-24"
+      params_chosen: [ER_MIN_NORM]
+    out_of_sample: null        # none yet -- G3 FAILS
+    costs:
+      entry: cross
+      exit: cross
+      needs_passive_fills: false
+    control_twin: null
+    notes: >
+      ER_MIN_NORM was chosen on the SAME capture used to score it, so every
+      replay number for this sleeve is in-sample by construction. Needs a clean
+      forward window before any of it counts.
+
+  flow:
+    tier: t0
+    calibration:
+      tool: tools/flow_calib.py
+      window: "ES live capture 2026-06-16..2026-07-24"
+      params_chosen: [FLOW_K]
+    out_of_sample: null
+    costs:
+      entry: cross
+      exit: cross
+      needs_passive_fills: false
+    control_twin: flow_fixed
+    notes: >
+      In-sample like pivot. Separately, tools/flow_stability.py showed the
+      netted per-second adelta this sleeve consumes points at the COMPLETED
+      move, and tools/sweep_replication.py showed that netting destroys the
+      sweep structure that does carry information. Not a promotion candidate.
