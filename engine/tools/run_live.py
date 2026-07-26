@@ -153,6 +153,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     from engine.strategies.open_drive import OpenDriveStrategy
     from engine.strategies.overnight_break import OvernightBreakStrategy
     from engine.strategies.pivot import PivotStrategy
+    from engine.strategies.sweep_follow import SweepFollowStrategy
     from engine.strategies.vwap_break import VwapBreakStrategy
     from engine.strategies.zones_strategy import ZoneLifecycleStrategy
     if label == "ignition":
@@ -206,6 +207,13 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return OvernightBreakStrategy(symbol)
     if label == "onbreak_gex":       # variant: breaks only on short-gamma days
         return OvernightBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
+    if label == "sweepfade":         # MBO-derived: fade deep aggressive sweeps
+        return SweepFollowStrategy(symbol, min_span_ticks=6, hold_s=15.0)
+    if label == "sweepfade_deep":    # higher conviction, fewer signals
+        return SweepFollowStrategy(symbol, min_span_ticks=8, hold_s=15.0)
+    if label == "sweepfollow":       # measured LOSER; paper twin as the control
+        return SweepFollowStrategy(symbol, min_span_ticks=6, hold_s=15.0,
+                                   mode="follow")
     raise SystemExit(f"unknown strategy '{label}'")
 
 
@@ -223,7 +231,8 @@ FLOW_K = 2.0
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "opendrive_gex", "opendrive_orb", "flow", "flow_fixed", "flow_gex",
               "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex",
-              "pivot", "vwapbreak", "vwapbreak_gex", "onbreak", "onbreak_gex")
+              "pivot", "vwapbreak", "vwapbreak_gex", "onbreak", "onbreak_gex",
+              "sweepfade", "sweepfade_deep", "sweepfollow")
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
