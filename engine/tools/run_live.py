@@ -171,7 +171,8 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return OpenDriveStrategy(symbol, mode="orb", gamma=_gamma_or_none(symbol))
         # counter-gamma break (short gamma -> won't buy the up-fakeout)
     if label == "flow":              # adaptive z-score threshold (scale-invariant)
-        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K)
+        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
+                                     gate_utc=FLOW_GATE)
     if label == "flow_fixed":        # variant: fixed threshold (research default)
         # KNOWN-RARE (audit: 2 orders / 34 sessions) and NOT a threshold bug:
         # th=30 already sits at p95 of live |adelta| (p50=4, p95=29, p99=59), so
@@ -183,7 +184,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=False, th=flow_th)
     if label == "flow_gex":          # variant: increases only on short-gamma days
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
-                                     gamma=_gamma_or_none(symbol))
+                                     gate_utc=FLOW_GATE, gamma=_gamma_or_none(symbol))
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
         return ZoneLifecycleStrategy(symbol, point_usd=pu)
@@ -226,6 +227,18 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
 # plateau (robust to the exact value) and the conventional 2-sigma.
 # Re-run tools/flow_calib.py before changing this.
 FLOW_K = 2.0
+
+# Flow's trading window, UTC hours. The CLASS default is (13, 21) = 09:00-17:00
+# ET, which is the research window flow_oracle.py is parity-checked against --
+# so it is NOT changed there. LIVE overrides it to close at 16:00 ET instead.
+#
+# Why: on 2026-07-27 flow entered at 09:40 ET and its only exit was the 17:00 ET
+# window edge. The CME session ends 17:00 ET, so the flatten could not fire
+# until the feed resumed after the maintenance halt -- it went through at
+# 17:30:55 ET, meaning the position was carried across the settlement break with
+# no way to act on it. Closing at 16:00 ET keeps flow inside the session it was
+# measured in and inside RTH, where every other sleeve flattens.
+FLOW_GATE = (13, 20)          # 09:00 -> 16:00 ET
 
 # every strategy + variant — the full paper roster (--paper all)
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
