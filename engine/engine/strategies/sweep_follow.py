@@ -28,7 +28,7 @@ tools/sweep_backtest.py). Paper only until its own forward record says otherwise
 """
 from __future__ import annotations
 
-from ..core.events import Trade
+from ..core.events import Signal, Trade
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
 from .base import BaseStrategy
@@ -43,7 +43,9 @@ class SweepFollowStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, min_span_ticks: int = 6,
                  gap_ms: int = 1, hold_s: float = 15.0,
                  stop_ticks: float = 8.0, max_entries: int = 40,
-                 tick: float = TICK, mode: str = "fade", gamma=None) -> None:
+                 tick: float = TICK, mode: str = "fade",
+                 retrace_frac: float = 1.0, peer_exit: tuple[str, ...] = (),
+                 gamma=None) -> None:
         self.symbol = symbol
         self.gamma = gamma
         # mode="fade" (DEFAULT): trade AGAINST the sweep. Following it loses on
@@ -59,6 +61,15 @@ class SweepFollowStrategy(BaseStrategy):
         self.stop = stop_ticks * tick
         self.tick = tick
         self.max_entries = max_entries
+        # ── REAL exit signals, as opposed to the stop/timeout insurance ──
+        # T (thesis complete): the fade predicts price RETURNS across the span
+        #   the sweep just covered, so the target is the sweep's own ORIGIN.
+        #   Scaled by the signal itself -- not a tick count I picked.
+        self.retrace_frac = retrace_frac
+        # I (thesis invalidated) is handled in on_trade: a NEW sweep in the same
+        #   direction as the one we faded means it was ignition, not exhaustion.
+        # O (opposing peer): roster labels whose entry signals close us out.
+        self.peer_exit = tuple(peer_exit)
         self.pos = 0
         self._day: str | None = None
         self._reset_session()
@@ -110,7 +121,12 @@ class SweepFollowStrategy(BaseStrategy):
         return orders
 
     def _on_cluster_end(self, t: Trade) -> list[Order]:
-        if self._c_dir == 0 or self.pos != 0 or self.trade is not None:
+        if self._c_dir == 0:
+            return []
+        span_now = round((self._c_hi - self._c_lo) / self.tick)
+        if self.pos != 0 or self.trade is not None:
+            if self._invalidated(span_now, self._c_dir):
+                return self._flatten("resweep")
             return []
         if self.entries >= self.max_entries:
             return []
@@ -125,18 +141,52 @@ class SweepFollowStrategy(BaseStrategy):
         self.entries += 1
         # entry price is where the tape is NOW, after the sweep -- we were never
         # inside it, so the move through the book is not ours to book
-        self.trade = {"dir": d, "entry": t.price, "t0": t.ts}
+        # T: the sweep ran hi->lo (or lo->hi); target the fraction of that span
+        # we expect price to give back. This is the exit THESIS.
+        span_px = self._c_hi - self._c_lo
+        target = t.price + d * self.retrace_frac * span_px
+        self.trade = {"dir": d, "entry": t.price, "t0": t.ts,
+                      "target": target, "sweep_dir": self._c_dir}
         return [Order(self.symbol, d, 1, tag="entry-sweep")]
 
-    # ── management: time-boxed, because the edge decays ─────────────────────
+    # ── management ──────────────────────────────────────────────────────────
+    # Ordered by KIND, not by convenience: the thesis is checked first, then
+    # invalidation, and only then the insurance. A stop firing means we were
+    # wrong; a target or an invalidation means we were RIGHT to be watching.
     def _manage(self, t: Trade) -> list[Order]:
         tr = self.trade
         d = tr["dir"]
+        # T -- thesis complete: price gave back the sweep's span
+        if (t.price - tr["target"]) * d >= 0:
+            return self._flatten("target")
+        # insurance, not a decision
         if (t.price - tr["entry"]) * d <= -self.stop:
             return self._flatten("stop")
         if t.ts - tr["t0"] >= self.hold_ns:
             return self._flatten("timeout")
         return []
+
+    # ── I: a fresh sweep the SAME way as the one we faded ────────────────────
+    def _invalidated(self, span: int, sweep_dir: int) -> bool:
+        """We faded an exhaustion. Another deep sweep in that same direction
+        says it was ignition instead -- the reason we are in the trade is gone,
+        so leave now rather than wait for the stop to tell us."""
+        tr = self.trade
+        return (tr is not None and span >= self.min_span
+                and sweep_dir == tr["sweep_dir"])
+
+    # ── O: a peer signalled against us ───────────────────────────────────────
+    def on_signal(self, e: Signal) -> list[Order]:
+        """Exit when a watched peer OPENS against our position. Their entry is
+        information we do not have: no single sleeve can see that another has
+        just committed the other way."""
+        if self.pos == 0 or self.trade is None or not self.peer_exit:
+            return []
+        if e.reduce_only or e.source not in self.peer_exit:
+            return []                       # peers CLOSING tell us nothing
+        if e.side == self.trade["dir"]:
+            return []                       # agrees with us
+        return self._flatten(f"peer-{e.source.split(':')[-1]}")
 
     def _flatten(self, why: str) -> list[Order]:
         if self.pos == 0 or self.trade is None:

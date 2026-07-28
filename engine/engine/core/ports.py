@@ -17,6 +17,7 @@ from .events import (
     MarketEvent,
     PositionUpdate,
     Quote,
+    Signal,
     Trade,
 )
 from .orders import Order
@@ -59,6 +60,9 @@ class Strategy(Protocol):
     def on_bookflow(self, e: BookFlow) -> list[Order]: ...
     def on_fill(self, e: Fill) -> None: ...
     def on_position(self, e: PositionUpdate) -> None: ...
+    # peer channel: another strategy's INTENT. Advisory only -- returning
+    # orders here is how a sleeve exits on someone else's signal.
+    def on_signal(self, e: Signal) -> list[Order]: ...
 
 
 __all__ = ["Clock", "FeedAdapter", "BrokerAdapter", "Strategy"]

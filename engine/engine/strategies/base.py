@@ -2,7 +2,8 @@
 use. Satisfies the core.ports.Strategy protocol structurally."""
 from __future__ import annotations
 
-from ..core.events import Bar, BookFlow, DepthUpdate, Fill, PositionUpdate, Quote, Trade
+from ..core.events import (Bar, BookFlow, DepthUpdate, Fill, PositionUpdate,
+                           Quote, Signal, Trade)
 from ..core.orders import Order
 from ..core.timeutil import et_session_date
 
@@ -37,6 +38,14 @@ class BaseStrategy:
         return []
 
     def on_bookflow(self, e: BookFlow) -> list[Order]:
+        return []
+
+    def on_signal(self, e: Signal) -> list[Order]:
+        """Another strategy just signalled. ADVISORY: this carries intent, never
+        position state -- peers can never mutate this sleeve's book. Override to
+        exit (or stand down) when a peer signals against you; the default
+        ignores peers entirely, so every existing sleeve is unaffected and
+        replay parity is untouched."""
         return []
 
     def on_fill(self, e: Fill) -> None:

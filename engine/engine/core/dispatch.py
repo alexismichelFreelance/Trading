@@ -7,7 +7,8 @@ keeps single-instrument feeds, synthetic tests, and the parity suite exactly
 as they were before multi-instrument support."""
 from __future__ import annotations
 
-from .events import Bar, BookFlow, DepthUpdate, Fill, PositionUpdate, Quote, Trade
+from .events import (Bar, BookFlow, DepthUpdate, Fill, PositionUpdate, Quote,
+                     Signal, Trade)
 from .orders import Order
 
 
@@ -49,4 +50,27 @@ def dispatch_broker(strategies, be) -> None:
             s.on_position(be)
 
 
-__all__ = ["dispatch_market", "dispatch_broker"]
+def dispatch_signal(strategies, sig: Signal, emitter=None) -> list[Order]:
+    """Broadcast one strategy's intent to its PEERS on the same lane.
+
+    The emitter is excluded -- a sleeve must never react to its own signal, or
+    a single order becomes a feedback loop. Same symbol routing as market
+    events. Unlike dispatch_broker this carries no position state, so it cannot
+    reintroduce the cross-sleeve duplicate-flatten bug that owner-only fill
+    attribution was built to fix."""
+    out: list[Order] = []
+    for s in strategies:
+        if s is emitter or not _wants(s, sig.symbol):
+            continue
+        # Strategy is a STRUCTURAL protocol -- a duck-typed strategy that never
+        # opted into the peer channel simply has no on_signal. Skipping it keeps
+        # this purely additive; requiring the method would break every existing
+        # implementer that does not inherit BaseStrategy.
+        fn = getattr(s, "on_signal", None)
+        if fn is None:
+            continue
+        out += fn(sig) or []
+    return out
+
+
+__all__ = ["dispatch_market", "dispatch_broker", "dispatch_signal"]

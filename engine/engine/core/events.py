@@ -116,12 +116,40 @@ class AccountUpdate:
     unrealized: float
 
 
+@dataclass(frozen=True, slots=True)
+class Signal:
+    """One strategy's INTENT, broadcast to every other strategy on the lane.
+
+    This is the peer channel: it lets a sleeve answer "has anything else just
+    signalled against me?" -- an exit reason that no single sleeve can see on
+    its own. Emitted for every order any strategy produces, paper or live.
+
+    It is deliberately ADVISORY and strictly separate from Fill /
+    PositionUpdate. Broker events stay owner-only (LiveEngine attributes fills
+    via `_owner`), because sleeves seeing each other's POSITION state is what
+    caused the 2026-07-09 duplicate-flatten runaway. A Signal carries no
+    accounting: acting on one is a strategy's own choice, and it can never
+    mutate another sleeve's book.
+
+    `source` is the roster label of the emitter ('ES:onbreak'), so a strategy
+    can react to specific peers rather than to anything that moves.
+    """
+    ts: int
+    symbol: str
+    source: str       # roster label of the emitting strategy
+    side: int         # +1 buy / -1 sell
+    qty: int
+    tag: str          # the emitter's order tag ('entry-sweep', 'moc', ...)
+    price: float      # reference price at emission (last trade)
+    reduce_only: bool = False   # True = the peer is EXITING, not initiating
+
+
 MarketEvent = Trade | Quote | DepthUpdate | Bar | BookFlow
 BrokerEvent = Fill | PositionUpdate | AccountUpdate
 
 __all__ = [
     "BUY", "SELL", "BID", "ASK",
     "Trade", "Quote", "DepthUpdate", "Bar", "BookFlow",
-    "Fill", "PositionUpdate", "AccountUpdate",
+    "Fill", "PositionUpdate", "AccountUpdate", "Signal",
     "MarketEvent", "BrokerEvent",
 ]

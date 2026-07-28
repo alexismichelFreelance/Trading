@@ -18,8 +18,8 @@ import asyncio
 import logging
 
 from .blotter import Blotter
-from .dispatch import dispatch_broker, dispatch_market
-from .events import Bar, Fill, PositionUpdate, Trade
+from .dispatch import _wants, dispatch_broker, dispatch_market
+from .events import Bar, Fill, PositionUpdate, Signal, Trade
 from .risk import RiskSupervisor
 from .timeutil import et_session_date
 
@@ -103,13 +103,20 @@ class LiveEngine:
         self.risk = risk if risk is not None else RiskSupervisor()
         # PAPER vs LIVE routing. live_owners = set of id(strategy) that route to
         # the real broker (NT8); every other strategy ALWAYS paper-trades — its
-        # orders fill inline at last_px, attributed to its own book, visible and
-        # usable as signals, but never sent to the broker and never risk-
-        # gated (we want to see the raw strategy). None = all strategies live
+        # orders fill inline at last_px, attributed to its own book, recorded
+        # and painted, but never sent to the broker and never risk-gated (we
+        # want to see the raw strategy). Peers see the INTENT via the Signal
+        # channel, not via these fills. None = all strategies live
         # (backward compatible: tests + the pre-paper behavior).
         self.live_owners = live_owners
         self.on_paper_fill = None                   # async (Fill) for the painter
         self.paper_fills: list[Fill] = []
+        # peer channel: every strategy's intent, broadcast to the others.
+        # Advisory only -- carries NO position state, so it cannot reintroduce
+        # the cross-sleeve duplicate-flatten bug that owner-only fill
+        # attribution fixed. See dispatch_signal / BaseStrategy.on_signal.
+        self.signals: list[Signal] = []
+        self._peer_exits = 0                        # orders caused BY a peer
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
 
@@ -188,6 +195,37 @@ class LiveEngine:
         self.blotter.on_order(o)
         await self._broker_for(o.symbol).submit(o)
         self.risk.on_submit(id(s), o)
+
+    async def _emit_signal(self, emitter, o, ts: int, px: float) -> None:
+        """Broadcast `emitter`'s intent to its peers and route any replies.
+
+        Replies go through the same paper/live path as ordinary orders but are
+        NOT re-broadcast -- one level deep only. That bound is what keeps a
+        single order from cascading: A signals, B may exit, and it stops there.
+        """
+        sig = Signal(ts, o.symbol, self.label_of(emitter), o.side, o.qty,
+                     o.tag, px, bool(getattr(o, "reduce_only", False)))
+        self.signals.append(sig)
+        for peer in self.strategies:
+            if peer is emitter or not _wants(peer, o.symbol):
+                continue
+            fn = getattr(peer, "on_signal", None)   # structural protocol:
+            if fn is None:                          # opting in is optional
+                continue
+            for reply in fn(sig) or []:
+                self._peer_exits += 1
+                if not self._is_live(peer):
+                    await self._paper_submit(peer, reply)
+                else:
+                    r = self._vet(peer, reply, ts)
+                    if r is not None:
+                        await self._submit_owned(peer, r)
+
+    def label_of(self, s) -> str:
+        """Roster label of a strategy ('ES:onbreak'), so peers can react to a
+        NAMED source rather than to anything that moves. Falls back to the
+        class name when the runner did not set one."""
+        return getattr(s, "label", None) or type(s).__name__
 
     async def _paper_submit(self, s, o) -> None:
         """Fill a paper strategy's order inline at last_px (market model), against
@@ -308,6 +346,17 @@ class LiveEngine:
                     px = self.px_for(sym)
                     for s in self.strategies:            # per-strategy: orders are OWNED
                         for o in dispatch_market([s], ev):
+                            # PEER CHANNEL: broadcast this intent to the other
+                            # sleeves BEFORE routing it, so a peer can react in
+                            # the same tick. Advisory only -- no position state
+                            # crosses, so this cannot reintroduce the
+                            # 2026-07-09 cross-sleeve duplicate-flatten bug.
+                            # Peer replies are routed through the SAME paper/
+                            # live path below, one level deep only: a reply
+                            # never re-broadcasts, so one order can never
+                            # cascade into a feedback loop.
+                            if lane_live:
+                                await self._emit_signal(s, o, ev.ts, px)
                             if not lane_live:            # warmup: state only, no orders
                                 self._suppressed_orders += 1
                                 sig = (ev.ts, o.side, o.qty, o.tag, px, o.symbol)
