@@ -19,6 +19,7 @@ NS = 1_000_000_000
 
 
 class ListFeed:
+    finite = True      # bounded fake: stream-end is DONE, not a disconnect
     def __init__(self, events):
         self.events = list(events)
 

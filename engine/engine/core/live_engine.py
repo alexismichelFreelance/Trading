@@ -117,8 +117,66 @@ class LiveEngine:
         # attribution fixed. See dispatch_signal / BaseStrategy.on_signal.
         self.signals: list[Signal] = []
         self._peer_exits = 0                        # orders caused BY a peer
+        # ── liveness: a lane going quiet must never be silent ──────────────
+        self._lane_seen: dict[str, int] = {}         # lane -> ts of last event
+        self._disconnects = 0
+        self.on_feed_disconnect = None               # async (name, attempt, got)
+        self.on_lane_stale = None                    # async (lane, seconds)
+        self.stale_after_s = 120.0                   # warn if a lane goes quiet
+        self._processed = 0                          # market events dispatched
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
+
+    async def wait_processed(self, n: int, timeout: float = 10.0,
+                             poll: float = 0.005) -> int:
+        """Block until the engine has DISPATCHED at least `n` market events.
+
+        Tests drive a real feed adapter over a loopback socket, and a real feed
+        is never `finite` -- a clean close is a disconnect now, so run() does not
+        return on its own. The wrong way to end such a test is to sleep for a
+        guessed duration: that is a race, it passes when nothing was processed,
+        and it fails spuriously on a loaded machine. This waits on the engine's
+        OWN progress instead, and raises if that progress never arrives.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._processed < n:
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"engine dispatched {self._processed}/{n} market events "
+                    f"in {timeout}s")
+            await asyncio.sleep(poll)
+        return self._processed
+
+    async def wait_idle(self, quiet: float = 0.15, timeout: float = 10.0,
+                        poll: float = 0.005) -> int:
+        """Block until the engine has processed events AND then gone quiet.
+
+        Tests drive a real feed over a loopback socket. A real feed is never
+        `finite` -- a clean close is a DISCONNECT now -- so run() never returns
+        on its own and the test must decide when the tape is drained.
+
+        This is NOT a sleep. It requires observed PROGRESS (at least one event
+        dispatched) and then waits for that progress to stop changing, so a run
+        that processes nothing raises instead of quietly "passing" -- which is
+        exactly how a timing-based wait hides a dead engine. Counting expected
+        events would be unreliable here because the feed also emits derived
+        BookFlow/Bar events the caller cannot know about.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        seen, last_change = -1, loop.time()
+        while True:
+            await asyncio.sleep(poll)
+            now = loop.time()
+            if self._processed != seen:
+                seen, last_change = self._processed, now
+            elif seen > 0 and now - last_change >= quiet:
+                return seen
+            if now >= deadline:
+                raise TimeoutError(
+                    f"engine never went idle: dispatched {self._processed} "
+                    f"events in {timeout}s (0 means it processed NOTHING)")
 
     def _is_live(self, s) -> bool:
         return self.live_owners is None or id(s) in self.live_owners
@@ -267,32 +325,109 @@ class LiveEngine:
                                             self._savg.get(pid, f.price)))
 
     async def _pump_feed(self, feed) -> None:
+        """Pump one feed forever, reconnecting on ANY end of stream.
+
+        A live socket usually dies CLEANLY, not with an exception: NT8's relay
+        stops (chart closed, strategy reset by the DOM close button, connection
+        dropped) and asyncio's StreamReader simply ends its iteration. The old
+        code treated that as "the feed is finished", emitted _END and RETURNED,
+        so the reconnect path below was unreachable for the most common failure.
+        On 2026-07-28 the ES lane died at 11:47:40 ET that way and never came
+        back: every ES stream (ticks/depth/sec/bars) stopped in the same second
+        while NQ kept running, so the engine looked healthy and silently traded
+        one instrument for the rest of the session. 4h15m of ES capture lost.
+
+        A clean end is now a DISCONNECT and is retried, loudly. Only a feed that
+        declares `finite = True` (bounded test feeds) is allowed to end the
+        stream for good -- termination is something the adapter states, never
+        something inferred from how the iteration happened to stop.
+        """
+        name = getattr(feed, "symbol", "") or type(feed).__name__
+        finite = bool(getattr(feed, "finite", False))
+        attempt = 0
         while not self._stop.is_set():
             try:
+                got = 0
                 async for e in feed.stream():
+                    got += 1
+                    self._lane_seen[getattr(e, "symbol", "") or name] = self.clock.now()
                     await self._q.put(("market", e))
-                await self._q.put(_END)          # stream ended cleanly
-                return
+                if finite:
+                    await self._q.put(_END)      # bounded feed: genuinely done
+                    return
+                attempt += 1
+                self._disconnects += 1
+                log.warning("FEED %s ended cleanly after %d events (disconnect "
+                            "#%d) -- reconnecting in %.1fs", name, got, attempt,
+                            self.reconnect_delay)
+                if self.on_feed_disconnect is not None:
+                    await self.on_feed_disconnect(name, attempt, got)
+                await asyncio.sleep(self.reconnect_delay)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:              # noqa: BLE001 - resilient live loop
-                log.warning("feed error: %s; reconnecting in %.1fs", ex, self.reconnect_delay)
+                attempt += 1
+                self._disconnects += 1
+                log.warning("FEED %s error: %s (disconnect #%d); reconnecting "
+                            "in %.1fs", name, ex, attempt, self.reconnect_delay)
+                if self.on_feed_disconnect is not None:
+                    await self.on_feed_disconnect(name, attempt, -1)
                 await asyncio.sleep(self.reconnect_delay)
 
+    async def _watchdog(self) -> None:
+        """A lane that has gone quiet must be LOUD about it.
+
+        Reconnecting is not enough on its own: if the relay stays down, the pump
+        retries forever and the engine still looks healthy. This is the second
+        line -- it reports any lane that has produced no events for
+        `stale_after_s`, and keeps reporting until it comes back. Silence is the
+        one thing a live system must never do.
+        """
+        warned: set[str] = set()
+        while not self._stop.is_set():
+            await asyncio.sleep(min(self.stale_after_s / 4.0, 15.0))
+            now = self.clock.now()
+            for lane, seen in list(self._lane_seen.items()):
+                quiet = (now - seen) / 1e9
+                if quiet >= self.stale_after_s:
+                    log.warning("LANE %s SILENT for %.0fs (last event %.0fs ago)",
+                                lane, quiet, quiet)
+                    warned.add(lane)
+                    if self.on_lane_stale is not None:
+                        await self.on_lane_stale(lane, quiet)
+                elif lane in warned:
+                    log.warning("LANE %s recovered after silence", lane)
+                    warned.discard(lane)
+
     async def _pump_broker(self, broker) -> None:
+        """Same contract as _pump_feed: a clean end is a DISCONNECT, not the end
+        of the world. A broker socket dying quietly would otherwise stop order
+        routing while the engine happily kept trading against a dead pipe."""
+        name = type(broker).__name__
+        finite = bool(getattr(broker, "finite", False))
         while not self._stop.is_set():
             try:
                 async for be in broker.events():
                     await self._q.put(("broker", be))
-                return
+                if finite:
+                    return
+                self._disconnects += 1
+                log.warning("BROKER %s ended cleanly -- reconnecting in %.1fs",
+                            name, self.reconnect_delay)
+                await asyncio.sleep(self.reconnect_delay)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:              # noqa: BLE001
-                log.warning("broker error: %s; reconnecting in %.1fs", ex, self.reconnect_delay)
+                self._disconnects += 1
+                log.warning("BROKER %s error: %s; reconnecting in %.1fs",
+                            name, ex, self.reconnect_delay)
                 await asyncio.sleep(self.reconnect_delay)
 
     async def run(self) -> Blotter:
         feeders = [asyncio.create_task(self._pump_feed(f)) for f in self.feeds]
+        # liveness watchdog: only meaningful for an unbounded (live) feed set
+        dog = (asyncio.create_task(self._watchdog())
+               if any(not getattr(f, "finite", False) for f in self.feeds) else None)
         # distinct broker objects only (a symbol->broker dict may share one)
         uniq_brokers = list({id(b): b for b in self.brokers.values()}.values())
         brokerers = [asyncio.create_task(self._pump_broker(b)) for b in uniq_brokers]
@@ -309,6 +444,7 @@ class LiveEngine:
                     feeds_done += 1
                     continue
                 if kind == "market":
+                    self._processed += 1          # progress, for wait_processed
                     sym = getattr(ev, "symbol", "")
                     self.clock.set(ev.ts)
                     if isinstance(ev, Trade):
@@ -403,6 +539,8 @@ class LiveEngine:
             for t in feeders + brokerers:
                 t.cancel()
             await asyncio.gather(*feeders, *brokerers, return_exceptions=True)
+            if dog is not None:
+                dog.cancel()
         return self.blotter
 
 

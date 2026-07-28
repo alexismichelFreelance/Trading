@@ -6,6 +6,7 @@ from engine.core.orders import Order, OrderType
 
 
 class FakeFeed:
+    finite = True      # bounded fake: stream-end is DONE, not a disconnect
     """Async-yields a fixed list of pre-built events (strict ts order assumed)."""
 
     def __init__(self, events) -> None:

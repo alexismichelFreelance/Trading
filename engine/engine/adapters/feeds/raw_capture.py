@@ -135,6 +135,11 @@ class RawCaptureTee:
                 pass
 
     # ── stream: capture + forward (drop raw depth onward) ─────────────────
+    @property
+    def finite(self) -> bool:
+        """Transparent tee: a bounded inner feed stays bounded."""
+        return bool(getattr(self.inner, "finite", False))
+
     async def stream(self) -> AsyncIterator[MarketEvent]:
         try:
             self._ensure_tables()

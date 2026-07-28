@@ -100,7 +100,13 @@ def test_two_lanes_route_and_warmup_independently():
         eng = LiveEngine([es_feed, nq_feed], {"ES": es_broker, "NQ": nq_broker},
                          [s_es, s_nq], WallClock(), Blotter("ES", 50.0),
                          drain_timeout=0.3, warmup_gate=True)
-        await asyncio.wait_for(eng.run(), timeout=10)
+        # A real feed is never `finite`: a clean socket close is a
+        # DISCONNECT now (2026-07-28 ES outage), so run() does not return
+        # on its own. Wait on the engine's OWN progress, never on a clock.
+        _t = asyncio.create_task(eng.run())
+        await eng.wait_idle(timeout=10)
+        eng._stop.set()
+        await asyncio.wait_for(_t, timeout=10)
         for srv in (msrv_es, msrv_nq, bsrv):
             srv.close()
         return s_es, s_nq, eng, fills

@@ -89,7 +89,13 @@ def test_live_loopback_round_trip():
         eng = LiveEngine(NinjaTraderFeed("127.0.0.1", mport),
                          NinjaTraderBroker("127.0.0.1", bport),
                          [strat], WallClock(), blot, drain_timeout=0.3)
-        await asyncio.wait_for(eng.run(), timeout=10)
+        # A real feed is never `finite`: a clean socket close is a
+        # DISCONNECT now (2026-07-28 ES outage), so run() does not return
+        # on its own. Wait on the engine's OWN progress, never on a clock.
+        _t = asyncio.create_task(eng.run())
+        await eng.wait_idle(timeout=10)
+        eng._stop.set()
+        await asyncio.wait_for(_t, timeout=10)
         msrv.close()
         bsrv.close()
         return strat, blot

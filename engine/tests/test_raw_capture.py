@@ -10,6 +10,7 @@ from engine.core.events import BUY, Bar, DepthUpdate, Trade
 
 
 class _Inner:
+    finite = True      # bounded fake: stream-end is DONE, not a disconnect
     def __init__(self, evs):
         self._evs = evs
 

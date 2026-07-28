@@ -21,6 +21,7 @@ class _FakeQDB:
 
 
 class _FakeFeed:
+    finite = True      # bounded fake: stream-end is DONE, not a disconnect
     def __init__(self, events):
         self.events = events
 

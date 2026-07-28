@@ -48,6 +48,7 @@ def _et_ns(s):
 
 
 class _Feed:
+    finite = True      # bounded fake: stream-end is DONE, not a disconnect
     def __init__(self, evs):
         self._evs = evs
 

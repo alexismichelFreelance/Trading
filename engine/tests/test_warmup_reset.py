@@ -87,7 +87,13 @@ def test_engine_calls_reset_on_live_flip():
                          NinjaTraderBroker("127.0.0.1", bsrv.sockets[0].getsockname()[1]),
                          [Strat()], WallClock(), Blotter("ES", 50.0),
                          drain_timeout=0.3, warmup_gate=True)
-        await asyncio.wait_for(eng.run(), timeout=8)
+        # A real feed is never `finite`: a clean socket close is a
+        # DISCONNECT now (2026-07-28 ES outage), so run() does not return
+        # on its own. Wait on the engine's OWN progress, never on a clock.
+        _t = asyncio.create_task(eng.run())
+        await eng.wait_idle(timeout=8)
+        eng._stop.set()
+        await asyncio.wait_for(_t, timeout=8)
         msrv.close()
         bsrv.close()
 

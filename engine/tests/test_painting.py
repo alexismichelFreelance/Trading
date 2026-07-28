@@ -66,6 +66,7 @@ class _SigStrategy:
 
 
 class _NullFeed:
+    finite = True      # bounded fake: stream-end is DONE, not a disconnect
     def __init__(self, events):
         self._events = events
 

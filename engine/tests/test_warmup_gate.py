@@ -81,7 +81,13 @@ def _run(msgs, warmup_gate):
                          NinjaTraderBroker("127.0.0.1", bport),
                          [strat], WallClock(), Blotter("ES", 50.0),
                          drain_timeout=0.3, warmup_gate=warmup_gate)
-        await asyncio.wait_for(eng.run(), timeout=10)
+        # A real feed is never `finite`: a clean socket close is a
+        # DISCONNECT now (2026-07-28 ES outage), so run() does not return
+        # on its own. Wait on the engine's OWN progress, never on a clock.
+        _t = asyncio.create_task(eng.run())
+        await eng.wait_idle(timeout=10)
+        eng._stop.set()
+        await asyncio.wait_for(_t, timeout=10)
         msrv.close()
         bsrv.close()
         return strat, eng, fills["n"]

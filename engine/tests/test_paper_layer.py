@@ -79,7 +79,13 @@ def _run(strategies, live_owners, place_sink):
         async def on_paper(f):
             papers.append(f)
         eng.on_paper_fill = on_paper
-        await asyncio.wait_for(eng.run(), timeout=10)
+        # A real feed is never `finite`: a clean socket close is a
+        # DISCONNECT now (2026-07-28 ES outage), so run() does not return
+        # on its own. Wait on the engine's OWN progress, never on a clock.
+        _t = asyncio.create_task(eng.run())
+        await eng.wait_idle(timeout=10)
+        eng._stop.set()
+        await asyncio.wait_for(_t, timeout=10)
         msrv.close()
         bsrv.close()
         return eng, papers

@@ -20,6 +20,12 @@ class MergeFeed:
             raise ValueError("MergeFeed needs at least one feed")
         self.feeds = list(feeds)
 
+    @property
+    def finite(self) -> bool:
+        """A merge is bounded only if EVERY leg is. One live leg means the
+        merged stream must be treated as reconnectable."""
+        return all(getattr(f, "finite", False) for f in self.feeds)
+
     async def stream(self) -> AsyncIterator[MarketEvent]:
         its = [f.stream() for f in self.feeds]
         heap: list[tuple[int, int, int, MarketEvent]] = []  # (ts, feed_idx, seq, ev)
