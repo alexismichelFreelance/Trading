@@ -14,6 +14,7 @@ ESM5 Mar20-31 holdout +154 pts (7 days). Known limits: convexity profile
 from __future__ import annotations
 
 from ..core.events import Bar, BookFlow, Trade
+from ..core.exits import ExitCtx, TwoPhaseExit
 from ..core.orders import Order
 from ..core.timeutil import et, et_session_date
 from .base import BaseStrategy
@@ -27,7 +28,8 @@ FLAT_MIN = 15 * 60 + 59      # flatten on the first tick in the 15:59 ET minute
 class OpenDriveStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, stop_mult: float = 1.0, trail_mult: float = 1.5,
                  stop_floor: float = 5.0, trail_floor: float = 8.0,
-                 gamma=None, mode: str = "drive") -> None:
+                 gamma=None, mode: str = "drive",
+                 two_phase: TwoPhaseExit | None = None) -> None:
         self.symbol = symbol
         # optional GammaRegime: entries only on short-gamma days (strategy choice)
         self.gamma = gamma
@@ -38,6 +40,11 @@ class OpenDriveStrategy(BaseStrategy):
         #   buy the up-fakeout; take the resumed down-break). Directly fixes the
         #   2026-07-23 -41pt: it would have shorted the resume, not bought the poke.
         self.mode = mode
+        # Optional RIDE-then-PROTECT exit. When present it REPLACES the trailing
+        # stop as the decision: 2026-07-28 NQ:opendrive held a loser 87 min to
+        # -346 on that trail while onbreak cut the same entry at -118, and on the
+        # winners the trail gave back 177pt. The hard stop stays as insurance.
+        self.two_phase = two_phase
         self.stop_mult, self.trail_mult = stop_mult, trail_mult
         self.stop_floor, self.trail_floor = stop_floor, trail_floor
         self._day: str | None = None
@@ -76,6 +83,8 @@ class OpenDriveStrategy(BaseStrategy):
 
     # ── core logic ───────────────────────────────────────────────────────
     def _step(self, ts: int, px: float) -> list[Order]:
+        if self.two_phase is not None:
+            self.two_phase.note_price(px)
         t = et(ts)
         mod = t.hour * 60 + t.minute
         day = et_session_date(ts)
@@ -121,11 +130,23 @@ class OpenDriveStrategy(BaseStrategy):
             self.stop = max(self.stop_floor, self.stop_mult * rng30)
             self.trail = max(self.trail_floor, self.trail_mult * rng30)
             self.peak_fe = 0.0
+            if self.two_phase is not None:
+                self.two_phase.start(self.side, self.entry_px)
             return [Order(self.symbol, self.side, 1, tag="entry-opendrive")]
         # manage
         if self.pos != 0 and self.side != 0:
             fe = (px - self.entry_px) * self.side
             self.peak_fe = max(self.peak_fe, fe)
+            if self.two_phase is not None:
+                hit = self.two_phase.check(ExitCtx(ts=ts, price=px, dir=self.side,
+                                                   entry_px=self.entry_px,
+                                                   entry_ts=ts, peak_fe=self.peak_fe))
+                if hit or fe <= -self.stop:      # thesis exit, else disaster stop
+                    side = self.side
+                    self.side = 0
+                    return [Order(self.symbol, -side, abs(self.pos),
+                                  tag=hit or "stop", reduce_only=True)]
+                return []
             if fe <= max(-self.stop, self.peak_fe - self.trail):
                 side = self.side
                 self.side = 0
@@ -157,6 +178,8 @@ class OpenDriveStrategy(BaseStrategy):
         self.stop = max(self.stop_floor, self.stop_mult * rng)
         self.trail = max(self.trail_floor, self.trail_mult * rng)
         self.peak_fe = 0.0
+        if self.two_phase is not None:
+            self.two_phase.start(d, self.entry_px)
         return [Order(self.symbol, d, 1, tag="entry-orb")]
 
 

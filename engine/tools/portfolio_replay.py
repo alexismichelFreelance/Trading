@@ -49,6 +49,10 @@ from tools.run_live import ALL_LABELS, _make                     # noqa: E402
 _MIN_NS = 60 * 1_000_000_000
 POINT_USD = 50.0        # ES; NQ lanes would pass their own
 
+# Reloading ~540k mbo_events rows per run took 257s and is what put QuestDB down
+# on 2026-07-28. Each session is fetched ONCE and parked on disk after that.
+CACHE_DIR = ROOT / ".cache" / "replay"
+
 
 class HistFeed:
     finite = True      # bounded: stream-end means DONE, not a disconnect
@@ -66,6 +70,8 @@ class NullBroker:
     """All sleeves are PAPER here, so no order ever reaches a broker. It only
     has to exist and end its event stream cleanly."""
 
+    finite = True      # bounded: stream-end is DONE, not a disconnect
+
     async def events(self):
         return
         yield           # pragma: no cover - makes this an async generator
@@ -75,34 +81,74 @@ class NullBroker:
 
 
 def load_events(qdb: QuestDB, symbol: str, day: str) -> list:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cf = CACHE_DIR / f"{symbol}_{day}.npz"
+    if cf.exists():
+        z = np.load(cf)
+        return _events_from(pd.DataFrame({k: z[k] for k in z.files}), symbol)
+    df = _fetch(qdb, symbol, day)
+    if df is not None and len(df):
+        np.savez_compressed(cf, **{c: df[c].to_numpy() for c in df.columns})
+        return _events_from(df, symbol)
+    return []
+
+
+def _events_from(df: pd.DataFrame, symbol: str) -> list:
+    """Build the event objects from NUMPY arrays, not per-row .iloc.
+
+    This is where the time actually went: 540k rows x 6 fields of `.iloc[i]`
+    cost ~290s, which is why adding a disk cache barely helped (327s -> 290s).
+    The DB was never the bottleneck; pandas scalar indexing was. Pull each
+    column out once and index the arrays.
+    """
+    ts = df["ts"].to_numpy(dtype="int64")
+    kind = df["kind"].to_numpy(dtype="int8")
+    a = df["a"].to_numpy(dtype=float)
+    b = df["b"].to_numpy(dtype=float)
+    c = df["c"].to_numpy(dtype=float)
+    d = df["d"].to_numpy(dtype=float)
+    e = df["e"].to_numpy(dtype="int64")
+    order = np.lexsort((kind, ts))            # ts asc, bars (kind 0) before trades
+    out = []
+    for i in order:
+        t = int(ts[i])
+        if kind[i] == 1:
+            out.append(Trade(t, float(a[i]), int(b[i]), int(c[i]), symbol))
+        else:
+            out.append(Bar(t, "1m", float(a[i]), float(b[i]), float(c[i]),
+                           float(d[i]), int(e[i]), symbol))
+    return out
+
+
+def _fetch(qdb: QuestDB, symbol: str, day: str):
     """Real ticks + 1m bars, merged. Bars are emitted at their CLOSE and ordered
     BEFORE same-instant trades, exactly as ReplayFeed does, so coarse features
     update before the fine ones."""
+    """Real ticks + 1m bars for one session, flattened for the parquet cache."""
     tr = qdb.df("SELECT ts_recv, price, size, side FROM mbo_events "
                 f"WHERE action='T' AND symbol='{symbol}' "
                 f"AND ts_recv >= '{day}T00:00:00.000000Z' "
                 f"AND ts_recv <  '{day}T23:59:59.999999Z' ORDER BY ts_recv")
     if tr.empty:
-        return []
-    out: list[tuple[int, int, object]] = []
-    ts = pd.to_datetime(tr["ts_recv"]).astype("int64").to_numpy()
-    px = tr["price"].to_numpy(float)
-    sz = tr["size"].to_numpy(float)
-    sd = tr["side"].to_numpy()
-    for i in range(len(tr)):
-        agg = BUY if sd[i] == "B" else SELL
-        out.append((int(ts[i]), 1, Trade(int(ts[i]), float(px[i]), int(sz[i]),
-                                         agg, symbol)))
+        return None
+    rows = pd.DataFrame({
+        "ts": pd.to_datetime(tr["ts_recv"]).astype("int64"),
+        "kind": 1,
+        "a": tr["price"].astype(float),
+        "b": tr["size"].astype(float),
+        "c": np.where(tr["side"].to_numpy() == "B", BUY, SELL),
+        "d": 0.0, "e": 0})
     br = qdb.df("SELECT ts,o,h,l,c,vol FROM claude_bars_1m "
                 f"WHERE symbol='{symbol}' "
                 f"AND ts >= '{day}T00:00:00.000000Z' "
                 f"AND ts <  '{day}T23:59:59.999999Z' ORDER BY ts")
-    for r in br.itertuples(index=False):
-        t = int(pd.Timestamp(r.ts).value) + _MIN_NS
-        out.append((t, 0, Bar(t, "1m", float(r.o), float(r.h), float(r.l),
-                              float(r.c), int(r.vol), symbol)))
-    out.sort(key=lambda x: (x[0], x[1]))
-    return [e for _, _, e in out]
+    if len(br):
+        rows = pd.concat([rows, pd.DataFrame({
+            "ts": pd.to_datetime(br["ts"]).astype("int64") + _MIN_NS,
+            "kind": 0, "a": br["o"].astype(float), "b": br["h"].astype(float),
+            "c": br["l"].astype(float), "d": br["c"].astype(float),
+            "e": br["vol"].astype(int)})], ignore_index=True)
+    return rows.sort_values("ts").reset_index(drop=True)
 
 
 def pnl_of(fills, point_usd: float) -> float:
@@ -143,7 +189,13 @@ async def run_day(qdb, symbol, day, labels, peer_map):
     for f in eng.paper_fills:
         s = eng._owner.get(f.order_id)
         by.setdefault(eng.label_of(s), []).append(f)
-    return {"day": day, "fills": by, "signals": len(eng.signals),
+    flat = []
+    for f in eng.paper_fills:
+        st = eng._owner.get(f.order_id)
+        flat.append({"ts": f.ts, "symbol": f.symbol, "sleeve": eng.label_of(st),
+                     "side": 1 if f.size > 0 else -1, "qty": abs(int(f.size)),
+                     "price": f.price, "tag": f.tag})
+    return {"day": day, "fills": by, "flat": flat, "signals": len(eng.signals),
             "peer_exits": eng._peer_exits, "n_events": len(ev)}
 
 
@@ -196,7 +248,7 @@ def report(rows, symbol, point_usd, labels):
 async def main_async(symbol, ndays, peer_map):
     qdb = QuestDB(timeout=240.0)
     labels = [lb for lb in ALL_LABELS if lb not in ("flow_fixed",)]
-    rows = []
+    rows, allflat = [], []
     for d in session_days(symbol, None, None)[-ndays:]:
         try:
             r = await run_day(qdb, symbol, d, labels, peer_map)
@@ -205,11 +257,17 @@ async def main_async(symbol, ndays, peer_map):
             continue
         if r:
             rows.append(r)
+            allflat.extend(r["flat"])
             print(f"  {d}: {r['n_events']:,} events, "
                   f"{sum(len(v) for v in r['fills'].values())} fills, "
                   f"{r['peer_exits']} peer exits", flush=True)
     if not rows:
         raise SystemExit("no sessions replayed")
+    if allflat:
+        out = ROOT / ".cache" / f"replay_fills_{symbol}.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(allflat).to_csv(out, index=False)
+        print(f"\n  wrote {len(allflat)} replay fills -> {out}")
     report(rows, symbol, POINT_USD, labels)
 
 

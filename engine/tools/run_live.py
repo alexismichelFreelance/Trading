@@ -150,6 +150,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     from engine.strategies.flow import FlowFollowingStrategy
     from engine.strategies.ibs_swing import IBSSwingStrategy
     from engine.strategies.ignition import IgnitionStrategy
+    from engine.core.exits import TwoPhaseExit
     from engine.strategies.open_drive import OpenDriveStrategy
     from engine.strategies.overnight_break import OvernightBreakStrategy
     from engine.strategies.pivot import PivotStrategy
@@ -170,6 +171,18 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     if label == "opendrive_orb":     # cleverer: opening-range break, refuses the
         return OpenDriveStrategy(symbol, mode="orb", gamma=_gamma_or_none(symbol))
         # counter-gamma break (short gamma -> won't buy the up-fakeout)
+    # RIDE-then-PROTECT twins. Only exit strategy that survived out-of-sample:
+    # ride untouched until MFE >= 12x the session's own typical move, then leave
+    # on momentum death / range formation. In-sample +$15,602 total and +$13,825
+    # on the tail-5; out-of-sample (15 ESM5 sessions, nothing refitted) +$8,188
+    # and +$425. Sign held on both measures; magnitude did not, so these run as
+    # PAPER twins beside the originals and the record decides.
+    if label == "opendrive_2p":
+        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "decay", 0.1))
+    if label == "opendrive_2p_range":
+        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "range", 0.25))
+    if label == "opendrive_2p_retrace":   # strongest OOS variant
+        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
     if label == "flow":              # adaptive z-score threshold (scale-invariant)
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
                                      gate_utc=FLOW_GATE)
@@ -245,7 +258,8 @@ ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "opendrive_gex", "opendrive_orb", "flow", "flow_fixed", "flow_gex",
               "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex",
               "pivot", "vwapbreak", "vwapbreak_gex", "onbreak", "onbreak_gex",
-              "sweepfade", "sweepfade_deep", "sweepfollow")
+              "sweepfade", "sweepfade_deep", "sweepfollow",
+              "opendrive_2p", "opendrive_2p_range", "opendrive_2p_retrace")
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
