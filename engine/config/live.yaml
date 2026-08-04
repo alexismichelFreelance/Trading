@@ -1,0 +1,38 @@
+# Per-instrument LIVE lane config, consumed by tools/run_live.py --instruments.
+# Each lane needs its own EngineRelay (strategy on that instrument's minimized
+# chart, with matching MarketPort/BrokerPort properties) and its own
+# EngineOverlay indicator (DrawPort) on the chart you watch.
+#
+#   .venv/Scripts/python.exe tools/run_live.py --instruments ES        # same as default
+#   .venv/Scripts/python.exe tools/run_live.py --instruments ES,NQ    # two lanes
+#
+# paper: roster that always paper-trades ('all' or comma list of labels)
+# live:  subset that ALSO routes to the NT8 broker ('' = pure paper)
+instruments:
+  ES:
+    market_port: 36001
+    broker_port: 36002
+    draw_port: 36004
+    paper: all
+    live: ""
+  NQ:
+    market_port: 36011
+    broker_port: 36012
+    draw_port: 36014
+    # Everything whose levels/stops derive from NQ's OWN price action, so it
+    # ports without retuning. EXCLUDED on purpose:
+    #   ignition / ignition_fixed / ignition_gex -- would silently borrow ES's
+    #     fitted HMM (NQ has no hmm_path), and carry hard ES-point thresholds
+    #     (chop_stop 4.0, trend_cap 12.0, trail 6/10, pivot_min_dist 2.0) that
+    #     are meaningless where a session ranges ~400pt instead of ~65pt.
+    #   flow_fixed -- absolute adelta threshold (th=200) is ES-scaled; the
+    #     adaptive `flow` variant is a z-score, so it ports fine.
+    # Re-add ignition once an NQ HMM is fitted and its points are re-scaled.
+    # Also NO *_gex variants here: _gamma_or_none() returns None for anything
+    # but ES (SPX dealer gamma is not an NDX signal), so on NQ every *_gex
+    # sleeve is a byte-identical DUPLICATE of its raw twin -- confirmed by
+    # tools/sleeve_audit.py, where all 6 pairs matched exactly. Duplicates burn
+    # compute and, worse, look like independent agreement in a twin comparison.
+    # Re-add them only once an NDX-based GammaRegime exists.
+    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,opendrive_orb,flow,vwapbreak,onbreak"
+    live: ""
