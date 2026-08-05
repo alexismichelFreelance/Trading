@@ -61,8 +61,13 @@ class _FakeQDB:
 
 
 def _pf(rows):
-    df = pd.DataFrame(rows, columns=["sleeve", "side", "qty", "price"])
-    return df
+    """Fills carry a ts now: the runner needs each position's last fill time to
+    tell a same-session restart from one across a gap (see
+    tests/test_orphan_close_price.py). Times here are arbitrary but ordered."""
+    base = pd.Timestamp("2026-08-04T13:20:00Z").value
+    return pd.DataFrame(
+        [(base + i * NS, *r) for i, r in enumerate(rows)],
+        columns=["ts", "sleeve", "side", "qty", "price"])
 
 
 def test_load_open_positions_nets_closed_and_keeps_open():
@@ -74,9 +79,10 @@ def test_load_open_positions_nets_closed_and_keeps_open():
         ("ES:flow", 1, 1, 6001.0),                     # partial reduce -> -2 @ 6000
     ])
     out = load_open_paper_positions(_FakeQDB(df), ["ES"])
-    assert out["ES:ibs"] == (1, 7484.5)
+    assert out["ES:ibs"][:2] == (1, 7484.5)
     assert "ES:dipbuy" not in out                       # netted flat
-    assert out["ES:flow"] == (-2, 6000.0)              # avg unchanged on reduce
+    assert out["ES:flow"][:2] == (-2, 6000.0)          # avg unchanged on reduce
+    assert all(isinstance(v[2], int) for v in out.values())   # last fill ts
 
 
 def test_load_open_positions_handles_flip():
@@ -85,7 +91,7 @@ def test_load_open_positions_handles_flip():
         ("ES:x", -1, 3, 110.0),                        # flip to -2 @ 110
     ])
     out = load_open_paper_positions(_FakeQDB(df), ["ES"])
-    assert out["ES:x"] == (-2, 110.0)
+    assert out["ES:x"][:2] == (-2, 110.0)
 
 
 # ── LiveEngine: restore applied at the warmup->live flip ────────────────────
@@ -115,7 +121,15 @@ def test_engine_restores_ibs_position_at_flip():
     assert eng._savg[id(s)] == 7484.5
 
 
-def test_engine_drops_unrestorable_position(caplog):
+def test_engine_does_not_hold_an_unrestorable_position(caplog):
+    """A sleeve that cannot resume must not be left carrying risk.
+
+    This used to assert the position was simply DROPPED (`id(s) not in _spos`).
+    Dropping it left an entry with no exit in claude_paper_fills forever, so the
+    engine read flat while the record read long -- 21 such orphans on
+    2026-08-05. The engine still ends flat; now the record does too, via a
+    `restart-void` fill at the ENTRY price -- zero invented P&L. See
+    tests/test_restart_orphans.py."""
     import logging
 
     class _NoRestore(BaseStrategy):
@@ -124,8 +138,11 @@ def test_engine_drops_unrestorable_position(caplog):
     s = _NoRestore()
     with caplog.at_level(logging.WARNING, logger="engine.live"):
         eng = _run(s, restore=(1, 6000.0))
-    assert id(s) not in eng._spos                       # not seeded (would orphan)
+    assert eng._spos.get(id(s), 0) == 0                 # not held
     assert any("NOT restorable" in r.message for r in caplog.records)
+    closes = [f for f in eng.paper_fills if f.tag == "restart-void"]
+    assert len(closes) == 1 and closes[0].size == -1    # and voided out
+    assert closes[0].price == 6000.0                    # at entry: zero P&L
 
 
 def test_no_restore_registered_is_noop():

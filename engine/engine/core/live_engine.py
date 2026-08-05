@@ -323,12 +323,22 @@ class LiveEngine:
                            f"(have {sorted(self.brokers)})")
         return b
 
-    def restore_paper_position(self, strategy, pos: int, avg_px: float) -> None:
+    def restore_paper_position(self, strategy, pos: int, avg_px: float,
+                               close_px: float | None = None) -> None:
         """Register an open paper position to resume at the warmup->live flip
         (from claude_paper_fills). No-op for pos==0. Paper sleeves only — live
-        positions live in the broker/account, not here."""
+        positions live in the broker/account, not here.
+
+        `close_px` is the price to flatten at IF the sleeve turns out not to be
+        able to resume. The runner supplies it when the position's session has
+        already ended, so an intraday sleeve is booked out at that session's
+        close — where the engine's own 15:59 flat would have taken it — instead
+        of wearing hours of overnight drift it was never exposed to by design.
+        None means "close at the current mark", which is right for a restart
+        inside the same session."""
         if pos:
-            self._restore[id(strategy)] = (pos, float(avg_px))
+            self._restore[id(strategy)] = (pos, float(avg_px),
+                                           None if close_px is None else float(close_px))
 
     def stop(self) -> None:
         self._stop.set()
@@ -343,24 +353,74 @@ class LiveEngine:
         return self.risk.vet(id(s), type(s).__name__, o, ts,
                              self._spos.get(id(s), 0))
 
-    def _apply_restore(self, s) -> None:
+    async def _apply_restore(self, s) -> None:
         """At the live flip, hand a registered open position back to the sleeve.
+
         Only reseed the engine's attributed book if the sleeve confirms it can
         manage from (pos, avg) — otherwise the position would be held but never
-        exited (worse than flat), so we drop it and log loudly."""
+        exited, which is worse than flat.
+
+        A sleeve that declines is right to: every intraday sleeve needs its entry
+        ts, stop and MFE, none of which (pos, avg_px) can supply. But the position
+        must still be CLOSED IN THE RECORD. It used to be merely dropped, leaving
+        an entry with no exit in claude_paper_fills forever — 21 of them on
+        2026-08-05, from the session that died at 11:10 the day before. Every
+        number that sums fills (the scorecard, per-sleeve P&L, the promotion
+        gate) then reads a position that never closed: the engine flat, the
+        record long, the two never reconciling.
+
+        So we book the flatten explicitly, through the normal paper path so it is
+        attributed and observed like any other fill, tagged `restart-void` so no
+        scorecard can mistake an accounting entry for a trading decision."""
         r = self._restore.pop(id(s), None)
         if r is None or self._is_live(s):            # live positions aren't ours
             return
-        pos, avg = r
+        pos, avg, close_px = r
         if getattr(s, "restore_state", None) and s.restore_state(pos, avg):
             self._spos[id(s)] = pos
             self._savg[id(s)] = avg
             log.info("restored paper position: %s %+d @ %.2f",
                      type(s).__name__, pos, avg)
-        else:
-            log.warning("open paper position for %s (%+d @ %.2f) NOT restorable "
-                        "(sleeve needs richer state) — left flat, orphaned in "
-                        "claude_paper_fills", type(s).__name__, pos, avg)
+            return
+        await self._close_orphan(s, pos, avg, close_px)
+
+    async def _close_orphan(self, s, pos: int, avg: float,
+                            close_px: float | None) -> None:
+        """VOID a position no sleeve will manage: close it in the record at its
+        own entry price, booking exactly zero P&L.
+
+        The close price is deliberately NOT the market. An abandoned position is
+        not evidence about the sleeve -- the engine was dead, the sleeve never got
+        to manage its own exit, and whatever the market did afterwards it did
+        without anyone watching. Marking these to any market price invents a
+        result and writes it into claude_paper_fills, which is the table
+        scorecard.py and promotion_check.py read to decide what earns real money.
+        Neither of them reads the tag, so every invented point would count.
+
+        Measured on the real record before this landed: 30 orphans going back to
+        2026-07-17, worth +8159 points (~$180k) if marked to their session
+        closes. That is not a P&L, it is a bug with a number attached.
+
+        `close_px` is therefore used only to REPORT what was abandoned. The
+        information belongs in the log, where a human weighs it, not in the
+        table that gates capital."""
+        sym = getattr(s, "symbol", "") or ""
+        ts = self.ts_for(sym) or self.clock.now()
+        # Reseed the book so the reduce_only flatten has something to reduce,
+        # then take the normal paper path: attribution, sink and blotter all see
+        # a perfectly ordinary closing fill.
+        self._spos[id(s)] = pos
+        self._savg[id(s)] = avg
+        o = Order(sym, -_sign(pos), abs(pos), tag="restart-void", reduce_only=True)
+        await self._fill_paper(s, o, float(avg), ts)
+        mark = close_px if close_px is not None else (self.px_for(sym) or None)
+        would = "" if mark is None else (
+            f" It would have been {(mark - avg) * pos:+.2f} pts at {mark:.2f}; "
+            f"that is NOT booked -- the engine was not running to manage it.")
+        log.warning("open paper position for %s (%+d @ %.2f) NOT restorable "
+                    "(sleeve needs richer state) — VOIDED at its entry price so "
+                    "the record reconciles with zero invented P&L.%s",
+                    type(s).__name__, pos, avg, would)
 
     async def _submit_owned(self, s, o) -> bool:
         """Send a LIVE order. Returns True if the broker accepted it.
@@ -690,7 +750,7 @@ class LiveEngine:
                             reset = getattr(s, "reset_for_live", None)
                             if callable(reset):
                                 reset()
-                            self._apply_restore(s)       # resume overnight position
+                            await self._apply_restore(s)  # resume, or book it out
                         log.info("warmup complete [%s]: %d backfill bars consumed, %d "
                                  "warmup orders suppressed; lane strategies reset; now LIVE",
                                  sym or "-", self._bf_bars.get(sym, 0), self._suppressed_orders)
@@ -799,7 +859,30 @@ class LiveEngine:
                             self._sink_q.qsize())
             sinker.cancel()
             await asyncio.gather(sinker, return_exceptions=True)
+            self._report_unapplied_restores()
         return self.blotter
+
+    def _report_unapplied_restores(self) -> None:
+        """Restores are applied at the warmup->live flip and nowhere else, so a
+        lane that never went live (dead feed, engine stopped during warmup) drops
+        every position registered on it. That used to happen without a word.
+
+        These are NOT closed out here. The engine never traded them, so booking a
+        synthetic exit would destroy a position that is still legitimately open;
+        the next start rebuilds it from claude_paper_fills. The only thing owed
+        is saying so."""
+        if not self._restore:
+            return
+        by_sleeve = {}
+        for s in self.strategies:
+            if id(s) in self._restore:
+                pos, avg, _ = self._restore[id(s)]
+                by_sleeve[self.label_of(s)] = f"{pos:+d} @ {avg:.2f}"
+        log.warning("%d registered paper position(s) were NEVER APPLIED: the "
+                    "lane never went live, so the warmup->live flip that hands "
+                    "them back never ran. They are still open in "
+                    "claude_paper_fills and NOT closed here -- the engine never "
+                    "traded them. %s", len(self._restore), by_sleeve or "(unnamed)")
 
 
 __all__ = ["LiveEngine"]

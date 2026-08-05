@@ -367,14 +367,52 @@ def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
     return lv, und, basis
 
 
+def session_close_px(qdb, symbol: str, last_ts: int, now_ns: int | None = None):
+    """Closing price of the ET session `last_ts` falls in, IF that session has
+    already ended. None otherwise (same session -> the engine uses the live mark).
+
+    This exists so an orphaned INTRADAY position is booked out where the engine's
+    own 15:59 session flat would have taken it. The engine died at 11:10 ET on
+    2026-08-04 holding 21 of them and restarted the next morning; marking those
+    at the next day's price charges each sleeve a full overnight session it was
+    never, by design, exposed to.
+
+    Any failure returns None -- a missing price is recoverable (the engine books
+    the position out flat at its entry), a wrong price is not, and neither is
+    taking startup down over it."""
+    from engine.core.timeutil import et_session_date
+    import pandas as _pd
+    try:
+        now_ns = now_ns if now_ns is not None else _pd.Timestamp.utcnow().value
+        if et_session_date(last_ts) == et_session_date(now_ns):
+            return None                              # still the same session
+        day = et_session_date(last_ts)
+        lo = _pd.Timestamp(f"{day} 00:00", tz="America/New_York").tz_convert("UTC")
+        hi = _pd.Timestamp(f"{day} 16:00", tz="America/New_York").tz_convert("UTC")
+        b = qdb.df(f"SELECT ts, c FROM claude_bars_live WHERE symbol='{symbol}' "
+                   f"AND ts >= '{lo.strftime('%Y-%m-%dT%H:%M:%SZ')}' "
+                   f"AND ts <= '{hi.strftime('%Y-%m-%dT%H:%M:%SZ')}' "
+                   f"ORDER BY ts")
+        if b is None or not len(b):
+            return None                              # no bar for that day
+        return float(b["c"].iloc[-1])
+    except Exception:                                # noqa: BLE001
+        return None
+
+
 def load_open_paper_positions(qdb, symbols) -> dict:
-    """{sleeve_label: (pos, avg_px)} for paper sleeves currently holding an open
-    position, avg-cost-reconstructed from the full claude_paper_fills history
-    (closed round-trips net to zero and drop out). Empty on any read failure."""
+    """{sleeve_label: (pos, avg_px, last_fill_ts_ns)} for paper sleeves currently
+    holding an open position, avg-cost-reconstructed from the full
+    claude_paper_fills history (closed round-trips net to zero and drop out).
+    Empty on any read failure.
+
+    The fill TIME is carried because the engine cannot otherwise tell a restart
+    inside the same session from one across a gap, and the two need different
+    close prices for an unrestorable position (see session_close_px)."""
     out: dict = {}
     for sym in symbols:
         try:
-            pf = qdb.df(f"SELECT sleeve, side, qty, price FROM claude_paper_fills "
+            pf = qdb.df(f"SELECT ts, sleeve, side, qty, price FROM claude_paper_fills "
                         f"WHERE symbol='{sym}' ORDER BY ts")
         except Exception:                            # noqa: BLE001
             continue
@@ -398,7 +436,9 @@ def load_open_paper_positions(qdb, symbols) -> dict:
                 else:                                # partial reduce: avg unchanged
                     pos += q
             if pos != 0:
-                out[str(sl)] = (pos, avg)
+                import pandas as pd
+                last_ts = int(pd.Timestamp(g["ts"].iloc[-1]).value)
+                out[str(sl)] = (pos, avg, last_ts)
     return out
 
 
@@ -638,12 +678,21 @@ async def main() -> None:
     except Exception as ex:                          # noqa: BLE001
         open_pos = {}
         print(f"  (paper-position restore skipped: {ex})")
-    for sl, (pos, avg) in open_pos.items():
+    for sl, (pos, avg, last_ts) in open_pos.items():
         s = by_label.get(sl)
         if s is not None and id(s) not in live_owners:
-            eng.restore_paper_position(s, pos, avg)
+            # If the sleeve cannot resume, the engine books it out -- at that
+            # session's close when the session has already ended, so an intraday
+            # sleeve is not charged an overnight it never held.
+            try:
+                cpx = session_close_px(_RQDB(timeout=10), getattr(s, "symbol", ""),
+                                       last_ts)
+            except Exception:                        # noqa: BLE001
+                cpx = None
+            eng.restore_paper_position(s, pos, avg, close_px=cpx)
             print(f"resuming paper position: {sl} {pos:+d} @ {avg:.2f} "
-                  f"(at warmup->live flip)")
+                  f"(at warmup->live flip"
+                  + (f"; if unrestorable, closes at {cpx:.2f})" if cpx else ")"))
 
     # ── chart painting: ONE painter + PaintController PER LANE (each lane's
     # EngineOverlay indicator has its own draw socket). Engine hooks fan out,
