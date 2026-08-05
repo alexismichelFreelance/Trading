@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as _dt
 import sys
 from pathlib import Path
 
@@ -46,6 +47,9 @@ from engine.core.live_engine import LiveEngine                   # noqa: E402
 from tools.flow_replication import session_days                  # noqa: E402
 from tools.run_live import ALL_LABELS, _make                     # noqa: E402
 
+from zoneinfo import ZoneInfo as _ZI
+_ET = _ZI("America/New_York")
+
 _MIN_NS = 60 * 1_000_000_000
 POINT_USD = 50.0        # ES
 POINT_USD_OF = {"ES": 50.0, "NQ": 20.0, "ESM5": 50.0, "ESH5": 50.0}
@@ -53,6 +57,30 @@ POINT_USD_OF = {"ES": 50.0, "NQ": 20.0, "ESM5": 50.0, "ESH5": 50.0}
 # Reloading ~540k mbo_events rows per run took 257s and is what put QuestDB down
 # on 2026-07-28. Each session is fetched ONCE and parked on disk after that.
 CACHE_DIR = ROOT / ".cache" / "replay"
+
+
+
+def et_session_bounds_utc(day: str) -> tuple[str, str]:
+    """UTC bounds of the ET calendar day `day` (YYYY-MM-DD), as QuestDB literals.
+
+    The fetches used to filter `ts >= '{day}T00:00:00Z' AND ts < '{day}T23:59:59Z'`
+    -- a UTC window -- while _live_days() hands out ET session dates. For ET date
+    D that window is really ET 20:00 of D-1 through 19:59 of D, so every replayed
+    "day" opened with the PREVIOUS evening's bars. run_day builds a fresh
+    strategy per day, so a swing sleeve met that 20:00 ET bar first, found minute
+    1200 past its 15:59 DECISION_MIN with `_decided` False, and committed the
+    whole day's decision to one evening bar (two ibs entries on 2026-07-29, one
+    exit).
+
+    Anchoring in ET also survives DST: a fixed UTC offset would shift by an hour
+    either side of a change and quietly mis-slice two sessions a year.
+    """
+    d = _dt.date.fromisoformat(day)
+    lo = _dt.datetime.combine(d, _dt.time(0, 0), tzinfo=_ET)
+    hi = lo + _dt.timedelta(days=1)
+    f = "%Y-%m-%dT%H:%M:%S.%f"
+    return (lo.astimezone(_dt.timezone.utc).strftime(f)[:-3] + "Z",
+            hi.astimezone(_dt.timezone.utc).strftime(f)[:-3] + "Z")
 
 
 class HistFeed:
@@ -122,14 +150,15 @@ def _events_from(df: pd.DataFrame, symbol: str) -> list:
 
 
 def _fetch(qdb: QuestDB, symbol: str, day: str):
+    _lo, _hi = et_session_bounds_utc(day)
     """Real ticks + 1m bars, merged. Bars are emitted at their CLOSE and ordered
     BEFORE same-instant trades, exactly as ReplayFeed does, so coarse features
     update before the fine ones."""
     """Real ticks + 1m bars for one session, flattened for the parquet cache."""
     tr = qdb.df("SELECT ts_recv, price, size, side FROM mbo_events "
                 f"WHERE action='T' AND symbol='{symbol}' "
-                f"AND ts_recv >= '{day}T00:00:00.000000Z' "
-                f"AND ts_recv <  '{day}T23:59:59.999999Z' ORDER BY ts_recv")
+                f"AND ts_recv >= '{_lo}' "
+                f"AND ts_recv <  '{_hi}' ORDER BY ts_recv")
     if tr.empty:
         return None
     rows = pd.DataFrame({
@@ -141,8 +170,8 @@ def _fetch(qdb: QuestDB, symbol: str, day: str):
         "d": 0.0, "e": 0})
     br = qdb.df("SELECT ts,o,h,l,c,vol FROM claude_bars_1m "
                 f"WHERE symbol='{symbol}' "
-                f"AND ts >= '{day}T00:00:00.000000Z' "
-                f"AND ts <  '{day}T23:59:59.999999Z' ORDER BY ts")
+                f"AND ts >= '{_lo}' "
+                f"AND ts <  '{_hi}' ORDER BY ts")
     if len(br):
         rows = pd.concat([rows, pd.DataFrame({
             "ts": pd.to_datetime(br["ts"]).astype("int64") + _MIN_NS,
@@ -153,6 +182,7 @@ def _fetch(qdb: QuestDB, symbol: str, day: str):
 
 
 def _fetch_live(qdb: QuestDB, symbol: str, day: str):
+    _lo, _hi = et_session_bounds_utc(day)
     """Same shape as _fetch, but from the LIVE capture tables (claude_ticks_live /
     claude_bars_live, symbol 'ES'/'NQ') instead of mbo_events + claude_bars_1m.
 
@@ -167,12 +197,12 @@ def _fetch_live(qdb: QuestDB, symbol: str, day: str):
     """
     tr = qdb.df("SELECT ts, price, size, aggressor FROM claude_ticks_live "
                 f"WHERE symbol='{symbol}' "
-                f"AND ts >= '{day}T00:00:00.000000Z' "
-                f"AND ts <  '{day}T23:59:59.999999Z' ORDER BY ts")
+                f"AND ts >= '{_lo}' "
+                f"AND ts <  '{_hi}' ORDER BY ts")
     br = qdb.df("SELECT ts,o,h,l,c,vol FROM claude_bars_live "
                 f"WHERE symbol='{symbol}' "
-                f"AND ts >= '{day}T00:00:00.000000Z' "
-                f"AND ts <  '{day}T23:59:59.999999Z' ORDER BY ts")
+                f"AND ts >= '{_lo}' "
+                f"AND ts <  '{_hi}' ORDER BY ts")
     if tr.empty and br.empty:
         return None
     parts = []

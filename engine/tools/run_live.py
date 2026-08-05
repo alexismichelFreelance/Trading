@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
 
@@ -478,8 +479,25 @@ async def main() -> None:
                          "instruments.yaml gex.basis, re-measured at each close)")
     a = ap.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
-                        datefmt="%H:%M:%S")
+    # Console AND a durable file. Until 2026-08-05 this was console-only, so when
+    # the engine stopped trading at 11:10 ET the counters, the stack trace and
+    # every diagnostic died with the terminal -- the failure could only be
+    # inferred from gaps in QuestDB tables hours later. A log you cannot read
+    # after the fact is not a log. Same lesson as the GEX task in July, which
+    # buffered stdout into a file and lost everything when Windows killed it.
+    _logdir = ROOT / "logs"
+    _logdir.mkdir(exist_ok=True)
+    _fh = logging.handlers.TimedRotatingFileHandler(
+        _logdir / "engine.log", when="midnight", backupCount=30,
+        encoding="utf-8", delay=False)
+    _fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s"))
+    _ch = logging.StreamHandler()
+    _ch.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s",
+                                       datefmt="%H:%M:%S"))
+    logging.basicConfig(level=logging.INFO, handlers=[_ch, _fh], force=True)
+    logging.getLogger("engine").info(
+        "engine starting -- log file %s", _logdir / "engine.log")
     # silence per-request HTTP logs (QuestDB recorder calls via httpx) — pure noise
     for noisy in ("httpx", "httpcore", "hpack", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -783,16 +801,45 @@ async def main() -> None:
         eng.stop()
 
     async def heartbeat():
-        last = -1
+        """Print what the ENGINE is doing, not what the feed is doing.
+
+        The old line showed obs.trades / obs.bars / blot.n_orders / blot.n_fills.
+        None of those can detect the engine having stopped trading:
+          * obs is the FIRST entry in `strategies`, so obs.trades increments at
+            the top of the dispatch loop -- it kept climbing all through
+            2026-08-04 while every sleeve behind it was dead;
+          * blot is the LIVE blotter, which reads 0 all day in a paper-only
+            setup, so `fills=0` was printed on every line of a normal session
+            and meant nothing.
+        Paper fills, dispatched events, sink drops and strategy failures are the
+        numbers that go to zero when the book stops. Those are what print now.
+        """
+        from engine.core import dispatch as _dsp
+        last_seen = -1
+        last_fills = 0
         while True:
             await asyncio.sleep(5)
             state = "LIVE" if eng._live else f"WARMUP({eng._backfill_bars} bars)"
             ghosts = sum(p._n_ghost for p in pcs.values())
-            if obs.trades != last or not eng._live:
-                print(f"  [{state}] trades={obs.trades} bars={obs.bars} "
-                      f"last={obs.last_px} ghosts_painted={ghosts} "
-                      f"live_orders={blot.n_orders} fills={blot.n_fills}")
-                last = obs.trades
+            pf = len(eng.paper_fills)
+            fails = _dsp.strategy_failures()
+            dead = [k for k, v in fails.items() if v["disabled"]]
+            open_pos = sum(1 for s in strategies
+                           if abs(getattr(s, "pos", 0) or 0) > 0)
+            if obs.trades != last_seen or not eng._live:
+                line = (f"  [{state}] ev={eng._processed} trades={obs.trades} "
+                        f"bars={obs.bars} last={obs.last_px} "
+                        f"paper_fills={pf}(+{pf - last_fills}) open={open_pos} "
+                        f"ghosts={ghosts} live={blot.n_fills}")
+                if eng._sink_dropped or eng._sink_errors:
+                    line += (f" SINK drop={eng._sink_dropped} "
+                             f"err={eng._sink_errors}")
+                if fails:
+                    line += f" STRAT_FAIL={len(fails)}"
+                if dead:
+                    line += f" DISABLED={','.join(k.split('@')[0] for k in dead)}"
+                print(line)
+                last_seen, last_fills = obs.trades, pf
 
     tasks = [asyncio.create_task(eng.run()), asyncio.create_task(heartbeat())]
     if a.seconds:

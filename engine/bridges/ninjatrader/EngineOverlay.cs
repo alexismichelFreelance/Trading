@@ -145,29 +145,27 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        // Engine timestamps are nanoseconds since the UNIX epoch, UTC. NT8 places
-        // a drawing by matching this DateTime against the BAR timestamps, and
-        // those carry the instrument's TRADING-HOURS timezone (ET for ES/NQ) --
-        // NOT the machine's.
+        // Engine timestamps are nanoseconds since the UNIX epoch, UTC. This must
+        // be the exact INVERSE of EngineRelay.ToNs, which stamps everything the
+        // engine ever sees:
         //
-        // This used to end in .ToLocalTime(), which converts to whatever zone the
-        // PC is set to. On a UTC+2 machine every mark landed 6 hours right of the
-        // trade: opendrive's 10:00 ET entry was drawn at 16:00, a 14:28 ET fill at
-        // 20:28 -- at or past the right edge of an RTH chart. The FILLS were
-        // always correct and in-session; only the picture was wrong, which is the
-        // worse failure, because it makes a working sleeve look like it fires at
-        // absurd times and there is nothing in the data to contradict it.
+        //     ToNs(t) = (t.ToUniversalTime() - Epoch).Ticks * 100
         //
-        // Falls back to the machine zone only if the chart has no trading-hours
-        // template, which should not happen on a real instrument.
-        private DateTime FromNs(double ns)
+        // ToUniversalTime() on a Kind=Unspecified DateTime treats it as MACHINE
+        // LOCAL. The recorded data proves that is what happens and that it comes
+        // out right: claude_bars_live holds ES RTH bars at 13:30-20:00 UTC, i.e.
+        // 09:30-16:00 ET. So NT8 hands over times already in machine-local, and
+        // .ToLocalTime() here is the correct inverse.
+        //
+        // 2026-08-05: this was briefly "fixed" to convert into
+        // Bars.TradingHours.TimeZoneInfo (ET) on the theory that marks were
+        // landing 6h right of the trade. That was wrong -- it would have pushed
+        // every mark 6h the OTHER way on a UTC+2 machine, and it broke the
+        // round-trip with ToNs. Reverted. If drawings ever do land on the wrong
+        // bar, fix ToNs and FromNs together, never one of them.
+        private static DateTime FromNs(double ns)
         {
-            DateTime utc = Epoch.AddTicks((long)(ns / 100.0));
-            TimeZoneInfo tz = (Bars != null && Bars.TradingHours != null
-                               && Bars.TradingHours.TimeZoneInfo != null)
-                              ? Bars.TradingHours.TimeZoneInfo
-                              : TimeZoneInfo.Local;
-            return TimeZoneInfo.ConvertTimeFromUtc(utc, tz);
+            return Epoch.AddTicks((long)(ns / 100.0)).ToLocalTime();
         }
 
         private Brush BrushOf(string spec, Brush fallback)
