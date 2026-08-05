@@ -251,17 +251,54 @@ def pnl_of(fills, point_usd: float) -> float:
     return real * point_usd
 
 
-async def run_day(qdb, symbol, day, labels, peer_map, source="mbo", min_events=10_000):
-    ev = load_events(qdb, symbol, day, source)
-    if len(ev) < min_events:
-        return None
-    strats = []
+def build_strategies(symbol, labels, peer_map):
+    """One strategy object per label, built ONCE for the whole replay.
+
+    run_day used to construct fresh instances every session. For an intraday
+    sleeve that is harmless -- they reset on their own session rollover -- but it
+    makes a SWING sleeve impossible to evaluate: IBS enters Monday and exits
+    Thursday, so with a new object each day the position never closes, nothing is
+    ever realised, and the report shows 0 days / $0 even though fills were
+    written (15 fills, both sleeves reported empty, 2026-06/08 ES live).
+
+    Carrying the objects across days is also what the LIVE engine does, so the
+    replay now matches it instead of quietly modelling a different program.
+
+    STILL NOT ENOUGH -- swing sleeves remain unevaluable here. Position state
+    lives in the ENGINE (LiveEngine._pos / Blotter), and run_day builds a fresh
+    engine and blotter per session. So a strategy's own self.pos survives the day
+    boundary but the engine's does not, and the reduce_only exit it emits on day
+    D+3 is applied against an engine that believes it is flat. Verified after
+    this change: ibs/rsi2 still report 0 days / $0.
+
+    Making this work needs the engine and blotter to span the replay too, with
+    the feed chained across sessions rather than restarted -- i.e. replay one
+    CONTINUOUS stream and cut the reporting by session, instead of running N
+    independent one-day engines. Until then:
+        * intraday sleeves (trendjoin, opendrive, onbreak, vwapbreak...) are
+          measured correctly here -- they open and close inside a session;
+        * ibs and rsi2 are NOT, and every replay figure for them should be
+          treated as absent, not as zero.
+    The 16-year IBS evidence comes from strategy_lab/ibs_verify.py, which does
+    not use this harness and is unaffected.
+    """
+    out = []
     for lb in labels:
         s = _make(lb, symbol=symbol)
         s.label = f"{symbol}:{lb}"
         if lb in peer_map and hasattr(s, "peer_exit"):
             s.peer_exit = tuple(f"{symbol}:{p}" for p in peer_map[lb])
-        strats.append(s)
+        out.append(s)
+    return out
+
+
+async def run_day(qdb, symbol, day, labels, peer_map, source="mbo",
+                  min_events=10_000, strats=None):
+    ev = load_events(qdb, symbol, day, source)
+    if len(ev) < min_events:
+        return None
+    if strats is None:                      # standalone use keeps old behaviour
+        strats = build_strategies(symbol, labels, peer_map)
     eng = LiveEngine(HistFeed(ev), NullBroker(), strats, EventClock(),
                      Blotter(symbol, POINT_USD_OF.get(symbol, POINT_USD),
                              ), warmup_gate=False,
@@ -368,9 +405,11 @@ async def main_async(symbol, ndays, peer_map, source="mbo", only=""):
             else session_days(symbol, None, None))
     # live capture has far fewer events than mbo_events; do not skip real days
     minev = 500 if source == "live" else 10_000
+    strats = build_strategies(symbol, labels, peer_map)
     for d in days[-ndays:]:
         try:
-            r = await run_day(qdb, symbol, d, labels, peer_map, source, minev)
+            r = await run_day(qdb, symbol, d, labels, peer_map, source, minev,
+                              strats=strats)
         except Exception as ex:                       # noqa: BLE001
             print(f"  {d}: FAILED {type(ex).__name__}: {str(ex)[:70]}", flush=True)
             continue
