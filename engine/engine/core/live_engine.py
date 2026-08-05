@@ -386,8 +386,20 @@ class LiveEngine:
 
     async def _close_orphan(self, s, pos: int, avg: float,
                             close_px: float | None) -> None:
-        """VOID a position no sleeve will manage: close it in the record at its
-        own entry price, booking exactly zero P&L.
+        """Close a position no sleeve will manage. HOW depends on whether it is
+        still live.
+
+        SAME SESSION (close_px is None -- the last fill is in the session still
+        running). The position is real and open right now and the market is
+        trading. An engine that resumes and cannot manage it is genuinely closing
+        it, at the market, this instant. That is an ordinary fill with real P&L,
+        tagged `restart-flat`. Voiding it would throw away a live trade: on
+        2026-08-05 the engine was stopped at 11:00 ET and restarted at 12:25 ET,
+        and every open position was voided as though it were a three-week-old
+        orphan.
+
+        FINISHED SESSION (the runner supplied that session's close). VOID it at
+        its own entry for exactly zero P&L -- see below.
 
         The close price is deliberately NOT the market. An abandoned position is
         not evidence about the sleeve -- the engine was dead, the sleeve never got
@@ -406,20 +418,31 @@ class LiveEngine:
         table that gates capital."""
         sym = getattr(s, "symbol", "") or ""
         ts = self.ts_for(sym) or self.clock.now()
+        mark = self.px_for(sym) or None
+        live = close_px is None and mark is not None
         # Reseed the book so the reduce_only flatten has something to reduce,
         # then take the normal paper path: attribution, sink and blotter all see
         # a perfectly ordinary closing fill.
         self._spos[id(s)] = pos
         self._savg[id(s)] = avg
-        o = Order(sym, -_sign(pos), abs(pos), tag="restart-void", reduce_only=True)
-        await self._fill_paper(s, o, float(avg), ts)
-        mark = close_px if close_px is not None else (self.px_for(sym) or None)
-        would = "" if mark is None else (
-            f" It would have been {(mark - avg) * pos:+.2f} pts at {mark:.2f}; "
-            f"that is NOT booked -- the engine was not running to manage it.")
+        px = float(mark) if live else float(avg)
+        tag = "restart-flat" if live else "restart-void"
+        await self._fill_paper(s, Order(sym, -_sign(pos), abs(pos), tag=tag,
+                                        reduce_only=True), px, ts)
+        if live:
+            log.warning("open paper position for %s (%+d @ %.2f) NOT restorable "
+                        "(sleeve needs richer state) — it is still LIVE this "
+                        "session, so CLOSED at the market %.2f for %+.2f pts. "
+                        "That is a real fill, not an accounting entry.",
+                        type(s).__name__, pos, avg, px, (px - avg) * pos)
+            return
+        would = "" if (close_px or mark) is None else (
+            f" It would have been {((close_px or mark) - avg) * pos:+.2f} pts at "
+            f"{(close_px or mark):.2f}; that is NOT booked -- the engine was not "
+            f"running to manage it.")
         log.warning("open paper position for %s (%+d @ %.2f) NOT restorable "
-                    "(sleeve needs richer state) — VOIDED at its entry price so "
-                    "the record reconciles with zero invented P&L.%s",
+                    "(sleeve needs richer state) — its session has CLOSED, so "
+                    "VOIDED at its entry price with zero invented P&L.%s",
                     type(s).__name__, pos, avg, would)
 
     async def _submit_owned(self, s, o) -> bool:

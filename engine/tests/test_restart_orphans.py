@@ -125,7 +125,7 @@ def test_unrestorable_position_is_closed_in_the_record():
     """THE REGRESSION. The sleeve declines, the engine goes flat — and a closing
     fill must appear so the table reconciles."""
     s = _Sleeve()
-    eng = _run([s], {s: (2, 29003.56)})
+    eng = _run([s], {s: (2, 29003.56, 29100.0)})
     closes = [f for f in eng.paper_fills if "restart" in (f.tag or "")]
     assert closes, ("no closing fill for an unrestorable position -- it stays "
                     "open in claude_paper_fills forever")
@@ -137,7 +137,7 @@ def test_unrestorable_position_is_closed_in_the_record():
 def test_the_book_nets_to_flat_after_the_close():
     """The whole point: entry + synthetic exit must sum to zero."""
     s = _Sleeve()
-    eng = _run([s], {s: (-3, 7412.25)})
+    eng = _run([s], {s: (-3, 7412.25, 7400.0)})
     net = -3 + sum(f.size for f in eng.paper_fills if "restart" in (f.tag or ""))
     assert net == 0, f"position did not reconcile to flat: net {net:+d}"
 
@@ -154,9 +154,12 @@ def test_a_resumable_sleeve_is_not_closed_out():
 
 def test_the_void_books_zero_pnl_even_when_the_market_moved():
     """The whole reason this is a void and not a mark-to-market: the sleeve gets
-    neither credit nor blame for a move it was not there for."""
+    neither credit nor blame for a move it was not there for.
+
+    The third element marks a FINISHED session -- that is what makes this a void
+    rather than a live close. See tests/test_same_session_restart.py."""
     s = _Sleeve()
-    eng = _run([s], {s: (1, 7000.0)},
+    eng = _run([s], {s: (1, 7000.0, 7050.0)},
                evs=[Trade(NOW, 7123.75, 1, BUY, "ES")])
     f = [f for f in eng.paper_fills if "restart" in (f.tag or "")][0]
     assert f.price == 7000.0, (
@@ -218,7 +221,7 @@ def test_the_close_is_tagged_so_it_is_never_read_as_a_strategy_exit():
     """A synthetic flatten is an accounting entry, not a trading decision. Every
     scorecard must be able to tell them apart."""
     s = _Sleeve()
-    eng = _run([s], {s: (1, 7000.0)})
+    eng = _run([s], {s: (1, 7000.0, 7050.0)})        # finished session -> void
     f = [f for f in eng.paper_fills if "restart" in (f.tag or "")][0]
     assert f.tag == "restart-void", f"opaque tag {f.tag!r}"
 

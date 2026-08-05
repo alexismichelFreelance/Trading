@@ -897,7 +897,10 @@ async def main() -> None:
                 # whose ILP writer thread has died, looks perfectly healthy from
                 # every counter above. Both happened on 2026-08-05 and cost a
                 # session of tape. Say it on every line until it is fixed.
-                broken = [t.symbol for t in (*recorders, *rawcaps)
+                probed = list(recorders) + list(rawcaps)
+                if paper_blot is not None:
+                    probed.append(paper_blot)
+                broken = [getattr(t, "symbol", "paper") for t in probed
                           if getattr(t, "ingest_ok", None) is False]
                 if broken:
                     line += f" !!TABLE-NOT-INGESTING[{','.join(sorted(set(broken)))}]"

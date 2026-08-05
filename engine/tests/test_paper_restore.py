@@ -127,9 +127,10 @@ def test_engine_does_not_hold_an_unrestorable_position(caplog):
     This used to assert the position was simply DROPPED (`id(s) not in _spos`).
     Dropping it left an entry with no exit in claude_paper_fills forever, so the
     engine read flat while the record read long -- 21 such orphans on
-    2026-08-05. The engine still ends flat; now the record does too, via a
-    `restart-void` fill at the ENTRY price -- zero invented P&L. See
-    tests/test_restart_orphans.py."""
+    2026-08-05. The engine still ends flat; now the record does too -- closed at
+    the market while the session is live (`restart-flat`), voided at entry once
+    it has closed (`restart-void`). See tests/test_restart_orphans.py and
+    tests/test_same_session_restart.py."""
     import logging
 
     class _NoRestore(BaseStrategy):
@@ -140,9 +141,10 @@ def test_engine_does_not_hold_an_unrestorable_position(caplog):
         eng = _run(s, restore=(1, 6000.0))
     assert eng._spos.get(id(s), 0) == 0                 # not held
     assert any("NOT restorable" in r.message for r in caplog.records)
-    closes = [f for f in eng.paper_fills if f.tag == "restart-void"]
-    assert len(closes) == 1 and closes[0].size == -1    # and voided out
-    assert closes[0].price == 6000.0                    # at entry: zero P&L
+    # no close price supplied -> the session is still running, so this is a
+    # real close at the market rather than a void (test_same_session_restart.py)
+    closes = [f for f in eng.paper_fills if f.tag == "restart-flat"]
+    assert len(closes) == 1 and closes[0].size == -1    # and closed out
 
 
 def test_no_restore_registered_is_noop():
