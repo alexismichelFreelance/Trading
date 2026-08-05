@@ -24,6 +24,39 @@ class _FakeQDB:
         return {}
 
 
+def _ilp_sink_multi(n_conns=4, idle=1.0):
+    """Like _ilp_sink but accepts SEVERAL successive connections -- a tee whose
+    feed reconnected spawns a fresh writer thread that opens a fresh socket."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(n_conns)
+    port = srv.getsockname()[1]
+    buf = bytearray()
+
+    def run():
+        srv.settimeout(5)
+        for _ in range(n_conns):
+            try:
+                conn, _addr = srv.accept()
+            except OSError:
+                return
+            conn.settimeout(idle)
+            while True:
+                try:
+                    d = conn.recv(65536)
+                except socket.timeout:
+                    break
+                except OSError:
+                    return
+                if not d:
+                    break
+                buf.extend(d)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return port, buf, srv
+
+
 def _ilp_sink():
     """Local TCP server that collects everything sent (stand-in for QuestDB ILP)."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -94,3 +127,113 @@ def test_overflow_drops_and_counts_loudly():
         tee._push(("t", i, 1.0, 1, 1))
     assert tee._q.qsize() == 3          # cap respected
     assert tee.n_dropped == 7           # the rest dropped, counted (not silent)
+
+
+# ── feed reconnect ───────────────────────────────────────────────────────────
+
+def test_writer_survives_a_feed_reconnect():
+    """THE REGRESSION (2026-08-05, live ES+NQ session).
+
+    LiveEngine._pump_feed reconnects a live feed by re-entering feed.stream() on
+    the SAME object. stream()'s finally block sets self._stop -- and nothing ever
+    cleared it. So the writer thread spawned by the SECOND stream() evaluated
+
+        while not (self._stop.is_set() and self._q.empty() and not pending)
+
+    exactly once, found _stop already set and the queue not yet filled, and
+    returned before it ever opened a socket. From then on every captured row went
+    into a queue that nobody drained.
+
+    Live evidence -- both feeds dropped at 09:54:53 and reconnected 6s later:
+
+        09:55:19  raw capture [NQ]: written=23982  queue=0       dropped=0
+        12:10:04  raw capture [NQ]: written=23982  queue=500000  dropped=515084
+        12:10:13  raw capture [ES]: written=6153   queue=332499  dropped=0
+
+    n_written frozen at its pre-disconnect value for 2h15m, and not a single "ILP
+    writer reconnect" warning in the whole log: the thread was GONE, not
+    struggling. 666k rows of NQ tape lost by 12:27, ES silently filling toward
+    the same cliff, and ~100 MB per symbol pinned in a queue with no reader.
+
+    Trading was unaffected (Trades are yielded before the push), but the raw
+    tape this capture exists to collect was lost for the session.
+    """
+    port, buf, srv = _ilp_sink_multi()
+    tee = RawCaptureTee(None, "ES", ilp_port=port, qdb=_FakeQDB(),
+                        flush_ms=50, batch=2)
+
+    async def run(evs):
+        tee.inner = _Inner(evs)
+        return [e async for e in tee.stream()]
+
+    asyncio.run(run([Trade(1, 7543.5, 2, BUY, "ES")]))
+    first = tee.n_written
+    assert first == 1, f"first connection wrote {first} rows"
+
+    # the disconnect/reconnect: same tee, stream() entered a second time
+    asyncio.run(run([Trade(2, 7544.0, 3, BUY, "ES"),
+                     DepthUpdate(3, -1, 7544.5, 10, 0, "ES")]))
+    assert tee.n_written == 3, (
+        f"after reconnect the tee wrote {tee.n_written - first} of 2 rows -- "
+        f"the writer thread died with _stop still set")
+    assert tee.n_dropped == 0
+    assert tee._q.qsize() == 0, "rows left stranded in the queue after reconnect"
+
+    time.sleep(0.3)
+    txt = bytes(buf).decode()
+    srv.close()
+    assert "price=7544.0,size=3i" in txt, "post-reconnect tick never reached ILP"
+    assert "side=-1i,level=0i,price=7544.5" in txt
+
+
+def test_reconnect_flushes_rows_queued_before_the_disconnect():
+    """A disconnect mid-batch leaves rows in the queue. The reconnected writer
+    must pick them up, not orphan them -- otherwise every disconnect punches a
+    hole in the tape even once the thread is alive again."""
+    port, buf, srv = _ilp_sink_multi()
+    tee = RawCaptureTee(None, "ES", ilp_port=port, qdb=_FakeQDB(),
+                        flush_ms=50, batch=2)
+    tee._stop.set()                      # as the previous run's finally left it
+    tee._q.put(("t", 99, 7000.0, 1, 1))  # stranded by the disconnect
+
+    async def go():
+        tee.inner = _Inner([Trade(100, 7001.0, 1, BUY, "ES")])
+        return [e async for e in tee.stream()]
+
+    asyncio.run(go())
+    assert tee.n_written == 2, f"stranded row was orphaned (wrote {tee.n_written})"
+    time.sleep(0.3)
+    txt = bytes(buf).decode()
+    srv.close()
+    assert "price=7000.0" in txt and "price=7001.0" in txt
+
+
+def test_second_writer_is_not_started_on_top_of_a_live_one():
+    """Re-arming must not leave two threads draining the same queue -- ILP order
+    would interleave and n_written would double-count."""
+    port, _buf, srv = _ilp_sink_multi()
+    tee = RawCaptureTee(None, "ES", ilp_port=port, qdb=_FakeQDB(), flush_ms=50)
+
+    async def go():
+        tee.inner = _Inner([Trade(1, 7000.0, 1, BUY, "ES")])
+        return [e async for e in tee.stream()]
+
+    for _ in range(3):
+        asyncio.run(go())
+        live = [t for t in threading.enumerate() if t.name == "rawcap-ES" and t.is_alive()]
+        assert len(live) <= 1, f"{len(live)} writer threads alive for one tee"
+    srv.close()
+
+
+def test_overflow_names_a_dead_writer_rather_than_blaming_the_db(caplog):
+    """The live message read "writer/DB can't keep up", which sent the diagnosis
+    at QuestDB for hours while the real answer was that no thread was running.
+    An alarm that misnames the fault is worse than a quiet one."""
+    import logging
+    tee = RawCaptureTee(None, "NQ", qdb=_FakeQDB(), queue_cap=1)
+    with caplog.at_level(logging.ERROR, logger="engine.rawcapture"):
+        tee._push(("t", 1, 1.0, 1, 1))
+        tee._push(("t", 2, 1.0, 1, 1))
+    assert tee.n_dropped == 1
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "DEAD" in msg, f"overflow with no writer thread did not say so: {msg}"

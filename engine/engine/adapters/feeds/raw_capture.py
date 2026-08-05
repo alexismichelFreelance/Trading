@@ -15,6 +15,13 @@ Design (money-critical: the feed must never wait on the database):
                           gap in money-critical data is never silent. (Chosen
                           over blocking, which would reintroduce feed backpressure.)
 
+RECONNECT. A live feed is infinite: when the NT8 socket drops, LiveEngine calls
+`feed.stream()` again on the SAME tee. Everything per-run therefore has to be
+re-armed in `stream()`, and `_stop` above all — the previous run's finally block
+set it, and a writer thread that starts with `_stop` already set exits on its
+first loop check, before opening a socket. That is what happened on 2026-08-05
+(see `_start_writer` and tests/test_raw_capture.py).
+
 Captured onward: Trade + DepthUpdate are recorded; DepthUpdate is NOT forwarded
 to the engine (nothing downstream consumes raw depth — the per-second BookFlow
 the strategies use is still produced by NinjaTraderFeed). Requires the inner
@@ -72,6 +79,34 @@ class RawCaptureTee:
             f"level LONG, price DOUBLE, size LONG, ts TIMESTAMP) TIMESTAMP(ts) "
             f"PARTITION BY DAY WAL")
 
+    # ── writer lifecycle ──────────────────────────────────────────────────
+    @property
+    def writer_alive(self) -> bool:
+        return self._writer is not None and self._writer.is_alive()
+
+    def _start_writer(self) -> None:
+        """Arm the writer thread for THIS run of stream().
+
+        `_stop` is sticky: the previous run's finally block set it, so a thread
+        started without clearing it first returns on its first loop check and
+        the queue silently grows until it overflows. Any rows still queued from
+        before the disconnect belong to the tape, so they are kept and the new
+        writer drains them.
+        """
+        prev = self._writer
+        if prev is not None and prev.is_alive():
+            self._stop.set()                 # ask the old one to finish first…
+            prev.join(timeout=10)
+            if prev.is_alive():
+                log.error("raw capture [%s]: previous writer thread will not "
+                          "exit -- refusing to run two writers on one queue; "
+                          "rows will queue until it does", self.symbol)
+                return
+        self._stop.clear()                   # …then re-arm for this run
+        self._writer = threading.Thread(target=self._run_writer, daemon=True,
+                                        name=f"rawcap-{self.symbol}")
+        self._writer.start()
+
     # ── hot path: enqueue, never block ────────────────────────────────────
     def _push(self, row: tuple) -> None:
         try:
@@ -81,9 +116,16 @@ class RawCaptureTee:
             now = time.monotonic()
             if now - self._last_drop_log >= 1.0:     # rate-limit the alarm
                 self._last_drop_log = now
+                # Name the actual fault. "writer/DB can't keep up" was the only
+                # thing this said on 2026-08-05, and it pointed the diagnosis at
+                # QuestDB for two hours while the truth was that no thread was
+                # running at all.
                 log.error("RAW CAPTURE OVERFLOW [%s]: queue full, dropping rows "
-                          "(total dropped=%d) — writer/DB can't keep up",
-                          self.symbol, self.n_dropped)
+                          "(total dropped=%d) — writer thread %s",
+                          self.symbol, self.n_dropped,
+                          "is behind: the DB/ILP sink cannot keep up"
+                          if self.writer_alive else
+                          "is DEAD -- nothing is draining the queue")
 
     def _fmt(self, row: tuple) -> str:
         sym = self.symbol
@@ -148,9 +190,7 @@ class RawCaptureTee:
             async for ev in self.inner.stream():
                 yield ev
             return
-        self._writer = threading.Thread(target=self._run_writer, daemon=True,
-                                        name=f"rawcap-{self.symbol}")
-        self._writer.start()
+        self._start_writer()
         last_log = time.monotonic()
         prev_written = 0
         log.info("raw capture ON [%s] -> %s/%s via ILP :%d (buffered, off hot path)",
@@ -168,8 +208,12 @@ class RawCaptureTee:
                 now = time.monotonic()
                 if now - last_log >= self.log_every_s:
                     rate = (self.n_written - prev_written) / (now - last_log)
-                    log.info("raw capture [%s]: %.0f rows/s  written=%d  queue=%d  dropped=%d",
-                             self.symbol, rate, self.n_written, self._q.qsize(), self.n_dropped)
+                    lvl = logging.INFO if self.writer_alive else logging.ERROR
+                    log.log(lvl, "raw capture [%s]: %.0f rows/s  written=%d  "
+                            "queue=%d  dropped=%d%s",
+                            self.symbol, rate, self.n_written, self._q.qsize(),
+                            self.n_dropped,
+                            "" if self.writer_alive else "  WRITER THREAD DEAD")
                     last_log, prev_written = now, self.n_written
         finally:
             self._stop.set()
