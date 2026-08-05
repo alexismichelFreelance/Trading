@@ -247,6 +247,12 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return PivotStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
     if label == "vwapbreak":         # study-motivated: trade the session-VWAP band break
         return VwapBreakStrategy(symbol)
+    if label == "vwapbreak_retest":  # user-specified: limit AT the VWAP line,
+        # never chase the break. See VwapBreakStrategy.entry_mode.
+        return VwapBreakStrategy(symbol, entry_mode="retest")
+    if label == "vwapbreak_retest_2p":
+        return VwapBreakStrategy(symbol, entry_mode="retest",
+                                 two_phase=TwoPhaseExit(arm_mult=2.4))
     if label == "vwapbreak_gex":     # variant: breaks only on short-gamma days
         return VwapBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
     if label == "vwapbreak_2p":      # ride-then-protect twin (gave back 142.25pt)
@@ -347,7 +353,8 @@ ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               # than the volatility ruler; 16/24/32pt all run, none privileged
               "opendrive_2p16", "opendrive_2p24", "opendrive_2p32",
               "onbreak_2p24", "onbreak_2p32",
-              "vwapbreak_2p24", "vwapbreak_2p32")
+              "vwapbreak_2p24", "vwapbreak_2p32",
+              "vwapbreak_retest", "vwapbreak_retest_2p")
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
