@@ -383,7 +383,7 @@ def session_close_px(qdb, symbol: str, last_ts: int, now_ns: int | None = None):
     from engine.core.timeutil import et_session_date
     import pandas as _pd
     try:
-        now_ns = now_ns if now_ns is not None else _pd.Timestamp.utcnow().value
+        now_ns = now_ns if now_ns is not None else _pd.Timestamp.now("UTC").value
         if et_session_date(last_ts) == et_session_date(now_ns):
             return None                              # still the same session
         day = et_session_date(last_ts)
@@ -690,9 +690,15 @@ async def main() -> None:
             except Exception:                        # noqa: BLE001
                 cpx = None
             eng.restore_paper_position(s, pos, avg, close_px=cpx)
+            # Say what will actually happen. This line used to promise a close
+            # at `cpx`, which was the earlier design; the position is now VOIDED
+            # at its entry for zero P&L, and cpx only reports what was abandoned.
             print(f"resuming paper position: {sl} {pos:+d} @ {avg:.2f} "
                   f"(at warmup->live flip"
-                  + (f"; if unrestorable, closes at {cpx:.2f})" if cpx else ")"))
+                  + (f"; if unrestorable, VOIDED at entry for 0.00 — it would "
+                     f"have been {(cpx - avg) * pos:+.1f} pts at {cpx:.2f}, "
+                     f"not booked)" if cpx else "; if unrestorable, VOIDED at "
+                     f"entry for 0.00)"))
 
     # ── chart painting: ONE painter + PaintController PER LANE (each lane's
     # EngineOverlay indicator has its own draw socket). Engine hooks fan out,
