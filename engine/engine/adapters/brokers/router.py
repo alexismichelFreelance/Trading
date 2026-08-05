@@ -9,9 +9,12 @@ replay; also usable live over N socket brokers.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 from ...core.events import BrokerEvent
+
+log = logging.getLogger("engine.router")
 
 
 class SymbolRouterBroker:
@@ -68,25 +71,33 @@ class SymbolRouterBroker:
                 b.on_end()
 
     async def events(self) -> AsyncIterator[BrokerEvent]:
-        """Async fan-in (live path) — merges every broker's events stream."""
+        """Async fan-in (live path) — merges every broker's events stream.
+
+        The FIRST leg to end ends the fan-in. A broker stream ending is a
+        dropped connection, and LiveEngine only reconnects when events()
+        returns: draining the survivors instead would leave that instrument
+        with no fills for the rest of the session while the engine saw a
+        perfectly healthy broker. Same rule as MergeFeed.
+        """
         q: asyncio.Queue = asyncio.Queue()
         DONE = object()
 
-        async def pump(b):
+        async def pump(sym, b):
             try:
                 async for ev in b.events():
                     await q.put(ev)
             finally:
-                await q.put(DONE)
+                await q.put((DONE, sym))
 
-        tasks = [asyncio.create_task(pump(b)) for b in self.brokers.values()]
-        done = 0
+        tasks = [asyncio.create_task(pump(s, b)) for s, b in self.brokers.items()]
         try:
-            while done < len(tasks):
+            while True:
                 ev = await q.get()
-                if ev is DONE:
-                    done += 1
-                    continue
+                if isinstance(ev, tuple) and ev and ev[0] is DONE:
+                    log.warning("BROKER leg %s ended: treating as a DISCONNECT "
+                                "and ending the fan-in so every leg reconnects",
+                                ev[1])
+                    return
                 yield ev
         finally:
             for t in tasks:

@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator
 import pandas as pd
 
 from ...core.events import Bar, BookFlow, MarketEvent, Trade
+from ..ingest_check import (DEFAULT_TIMEOUT_S, PROBE_SYMBOL,
+                            verify_ingest_async)
 from ..questdb import AsyncQuestDB
 
 log = logging.getLogger("engine.recorder")
@@ -35,7 +37,8 @@ def _ts(ns: int) -> str:
 class RecorderTee:
     def __init__(self, inner, qdb: AsyncQuestDB | None = None,
                  symbol: str = "ES", table: str = "claude_bars_live",
-                 record_sec: bool = True, sec_table: str = "claude_sec_live") -> None:
+                 record_sec: bool = True, sec_table: str = "claude_sec_live",
+                 probe_timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
         self.inner = inner
         self.qdb = qdb or AsyncQuestDB()
         self.symbol = symbol
@@ -49,6 +52,10 @@ class RecorderTee:
         self._sready = False
         self.n_recorded = 0
         self.n_sec = 0
+        self.probe_timeout_s = probe_timeout_s
+        # None = not probed yet. False = a table accepts writes and stores
+        # nothing, so this session's recording is going nowhere.
+        self.ingest_ok: bool | None = None
         # per-second trade accumulators (reset on each BookFlow second boundary)
         self._pxc = 0.0
         self._adelta = 0
@@ -88,7 +95,52 @@ class RecorderTee:
         except Exception as ex:                      # noqa: BLE001
             log.warning("sec-recorder flush failed (%d rows dropped): %s", len(rows), ex)
 
+    def _rearm(self) -> None:
+        """Reset the state that belongs to ONE run of stream().
+
+        A live feed is infinite, so LiveEngine reconnects by calling stream()
+        again on this same object. Two things must not cross that boundary:
+
+        * the per-second accumulators — a disconnect lands mid-second, and the
+          trades it stranded would otherwise be folded into the first second
+          recorded after the reconnect, whose adelta/avol would then describe
+          two moments minutes apart. adelta is what the ignition and flow
+          sleeves consume.
+        * `_live` — NT8 replays its whole chart on reconnect (9466 bars on
+          2026-08-05). With `_live` still True from the previous run, every one
+          of those backfill bars takes its own HTTP POST instead of batching,
+          flooding QuestDB exactly while the feed is catching up.
+
+        `_buf`/`_sbuf` deliberately survive: rows buffered when the feed dropped
+        are still real data and belong in the table.
+        """
+        self._live = False
+        self._pxc = 0.0
+        self._adelta = self._avol = self._ntr = 0
+
+    async def _verify_ingest(self) -> bool:
+        """Round-trip a probe row into every table this tee writes, through the
+        same INSERT path the real rows take. Both tables broke independently on
+        2026-08-05, so proving one says nothing about the other."""
+        ok = True
+        if self._ready:
+            ok &= await verify_ingest_async(
+                self.qdb, self.table,
+                lambda ts: self.qdb.query(
+                    f"INSERT INTO {self.table} VALUES "
+                    f"('{PROBE_SYMBOL}','{_ts(ts)}',0,0,0,0,0)"),
+                timeout_s=self.probe_timeout_s)
+        if self._sready:
+            ok &= await verify_ingest_async(
+                self.qdb, self.sec_table,
+                lambda ts: self.qdb.query(
+                    f"INSERT INTO {self.sec_table} VALUES "
+                    f"('{PROBE_SYMBOL}','{_ts(ts)}',0,0,0,0,0,0,0,0)"),
+                timeout_s=self.probe_timeout_s)
+        return bool(ok)
+
     async def stream(self) -> AsyncIterator[MarketEvent]:
+        self._rearm()
         try:
             await self._ensure_table()
             self._ready = True
@@ -102,6 +154,7 @@ class RecorderTee:
             except Exception as ex:                  # noqa: BLE001
                 log.warning("sec-recorder disabled (table init failed): %s", ex)
                 self._sready = False
+        self.ingest_ok = await self._verify_ingest()
         async for ev in self.inner.stream():
             if isinstance(ev, Trade):
                 self._live = True

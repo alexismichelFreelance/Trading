@@ -41,6 +41,7 @@ import time
 from collections.abc import AsyncIterator
 
 from ...core.events import DepthUpdate, MarketEvent, Trade
+from ..ingest_check import DEFAULT_TIMEOUT_S, PROBE_SYMBOL, verify_ingest
 from ..questdb import QuestDB
 
 log = logging.getLogger("engine.rawcapture")
@@ -53,7 +54,8 @@ class RawCaptureTee:
     def __init__(self, inner, symbol: str = "ES", host: str = "127.0.0.1",
                  ilp_port: int = 9009, queue_cap: int = 500_000,
                  batch: int = 5000, flush_ms: int = 250, log_every_s: float = 15.0,
-                 qdb: QuestDB | None = None) -> None:
+                 qdb: QuestDB | None = None,
+                 probe_timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
         self.inner = inner
         self.symbol = symbol
         self.host, self.ilp_port = host, ilp_port
@@ -67,6 +69,10 @@ class RawCaptureTee:
         self.n_written = 0
         self.n_dropped = 0
         self._last_drop_log = 0.0
+        self.probe_timeout_s = probe_timeout_s
+        # None = not probed yet. False = the table accepts writes and stores
+        # nothing; everything captured this session is going nowhere.
+        self.ingest_ok: bool | None = None
 
     # ── table DDL (one-time, via HTTP; ILP would auto-create but without WAL/part) ─
     def _ensure_tables(self) -> None:
@@ -78,6 +84,29 @@ class RawCaptureTee:
             f"CREATE TABLE IF NOT EXISTS {DEPTH} (symbol SYMBOL, side LONG, "
             f"level LONG, price DOUBLE, size LONG, ts TIMESTAMP) TIMESTAMP(ts) "
             f"PARTITION BY DAY WAL")
+
+    # ── startup precondition: do these tables actually store anything? ────
+    def _send_ilp(self, payload: str) -> None:
+        s = socket.create_connection((self.host, self.ilp_port), timeout=5)
+        try:
+            s.sendall(payload.encode())
+        finally:
+            s.close()
+
+    def _verify_ingest(self) -> bool:
+        """Round-trip one probe row into EACH table, over ILP — the same path
+        the tape takes. Both tables broke independently on 2026-08-05, so
+        proving one says nothing about the other."""
+        ok = True
+        for table, line in (
+                (TICKS, f"{TICKS},symbol={PROBE_SYMBOL} price=0.0,size=0i,"
+                        f"aggressor=0i {{ts}}\n"),
+                (DEPTH, f"{DEPTH},symbol={PROBE_SYMBOL} side=0i,level=0i,"
+                        f"price=0.0,size=0i {{ts}}\n")):
+            ok &= verify_ingest(self._qdb, table,
+                                lambda ts, ln=line: self._send_ilp(ln.format(ts=ts)),
+                                timeout_s=self.probe_timeout_s)
+        return bool(ok)
 
     # ── writer lifecycle ──────────────────────────────────────────────────
     @property
@@ -190,6 +219,7 @@ class RawCaptureTee:
             async for ev in self.inner.stream():
                 yield ev
             return
+        self.ingest_ok = self._verify_ingest()
         self._start_writer()
         last_log = time.monotonic()
         prev_written = 0

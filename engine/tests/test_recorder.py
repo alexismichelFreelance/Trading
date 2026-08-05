@@ -1,8 +1,14 @@
 """RecorderTee: transparently passes events through AND records 1m bars as
-batched INSERTs; a broken QuestDB never breaks the feed."""
+batched INSERTs; a broken QuestDB never breaks the feed.
+
+The stub DB answers the startup ingest probe (see engine/adapters/ingest_check)
+so these tests exercise the same path the live recorder takes. Probe rows are
+tagged PROBE_SYMBOL and filtered out of the assertions below -- that tag exists
+precisely so a probe can never be mistaken for recorded market data."""
 import asyncio
 
 from engine.adapters.feeds.recorder_tee import RecorderTee
+from engine.adapters.ingest_check import PROBE_SYMBOL
 from engine.core.events import Bar, BookFlow, Trade
 
 NS = 1_000_000_000
@@ -17,6 +23,8 @@ class _FakeQDB:
         self.queries.append(sql)
         if self.fail:
             raise RuntimeError("qdb down")
+        if sql.lstrip().lower().startswith("select count()"):
+            return {"dataset": [[1]]}          # the probe row landed
         return {}
 
 
@@ -48,7 +56,7 @@ def test_records_bars_and_passes_through():
     out = asyncio.run(go())
     assert len(out) == 4                          # 1 trade + 3 bars, all passed through
     assert feed.n_recorded == 3
-    inserts = [q for q in qdb.queries if q.startswith("INSERT")]
+    inserts = [q for q in qdb.queries if q.startswith("INSERT") and PROBE_SYMBOL not in q]
     assert len(inserts) >= 1
     assert "claude_bars_live" in qdb.queries[0]    # CREATE TABLE ... DEDUP
     assert "DEDUP UPSERT KEYS(ts, symbol)" in qdb.queries[0]
@@ -66,7 +74,7 @@ def test_backfill_batches_at_100():
 
     asyncio.run(go())
     assert feed.n_recorded == 250
-    inserts = [q for q in qdb.queries if q.startswith("INSERT")]
+    inserts = [q for q in qdb.queries if q.startswith("INSERT") and PROBE_SYMBOL not in q]
     assert all(q.count("),(") < 100 for q in inserts)     # each batch <=100 rows
 
 
@@ -102,7 +110,8 @@ def test_records_per_second_aggressor_features():
     out = asyncio.run(go())
     assert len(out) == 5                            # everything passed through
     assert feed.n_sec == 2
-    sec_ins = [q for q in qdb.queries if q.startswith("INSERT") and "claude_sec_live" in q]
+    sec_ins = [q for q in qdb.queries if q.startswith("INSERT") and "claude_sec_live" in q
+                and PROBE_SYMBOL not in q]
     assert len(sec_ins) >= 1
     # first second: adelta=+2, avol=4, ntr=2, pxc=5001, plus the bookflow 7,4,2,9
     assert "5001.0,2,4,2,7,4,2,9" in sec_ins[0]

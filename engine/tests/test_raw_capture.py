@@ -1,11 +1,18 @@
 """RawCaptureTee: ILP line format, capture-forward behavior (raw depth NOT
-forwarded to the engine), buffered write to a local ILP sink, overflow drop."""
+forwarded to the engine), buffered write to a local ILP sink, overflow drop,
+and survival across a feed reconnect.
+
+The stub DB answers the startup ingest probe (engine/adapters/ingest_check), so
+these tests take the same path the live tee does. The probe opens its own ILP
+connection per table and writes one PROBE_SYMBOL row into each; those lines are
+filtered out of the assertions below."""
 import asyncio
 import socket
 import threading
 import time
 
 from engine.adapters.feeds.raw_capture import RawCaptureTee
+from engine.adapters.ingest_check import PROBE_SYMBOL
 from engine.core.events import BUY, Bar, DepthUpdate, Trade
 
 
@@ -21,68 +28,51 @@ class _Inner:
 
 class _FakeQDB:
     def query(self, sql):
+        if sql.lstrip().lower().startswith("select count()"):
+            return {"dataset": [[1]]}          # the probe row landed
         return {}
 
 
-def _ilp_sink_multi(n_conns=4, idle=1.0):
-    """Like _ilp_sink but accepts SEVERAL successive connections -- a tee whose
-    feed reconnected spawns a fresh writer thread that opens a fresh socket."""
+def _tape(buf):
+    """Sink contents with the startup probe rows removed."""
+    return "\n".join(ln for ln in bytes(buf).decode().splitlines()
+                     if PROBE_SYMBOL not in ln)
+
+
+def _ilp_sink_multi(idle=1.0):
+    """Stand-in for QuestDB's ILP port, collecting everything sent.
+
+    Accepts any number of CONCURRENT connections: a single run of the tee opens
+    one per table for the startup ingest probe plus one for the writer thread,
+    and a reconnect opens a fresh set. Serialising them would deadlock the test
+    rather than the code."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
-    srv.listen(n_conns)
+    srv.listen(16)
     port = srv.getsockname()[1]
     buf = bytearray()
 
-    def run():
+    def read(conn):
+        conn.settimeout(idle)
+        try:
+            while True:
+                d = conn.recv(65536)
+                if not d:
+                    return
+                buf.extend(d)            # GIL makes the append atomic enough here
+        except OSError:
+            return
+
+    def accept_loop():
         srv.settimeout(5)
-        for _ in range(n_conns):
+        while True:
             try:
                 conn, _addr = srv.accept()
             except OSError:
                 return
-            conn.settimeout(idle)
-            while True:
-                try:
-                    d = conn.recv(65536)
-                except socket.timeout:
-                    break
-                except OSError:
-                    return
-                if not d:
-                    break
-                buf.extend(d)
+            threading.Thread(target=read, args=(conn,), daemon=True).start()
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    return port, buf, srv
-
-
-def _ilp_sink():
-    """Local TCP server that collects everything sent (stand-in for QuestDB ILP)."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    port = srv.getsockname()[1]
-    buf = bytearray()
-
-    def run():
-        srv.settimeout(5)
-        try:
-            conn, _ = srv.accept()
-            conn.settimeout(3)
-            while True:
-                try:
-                    d = conn.recv(65536)
-                except socket.timeout:
-                    break
-                if not d:
-                    break
-                buf.extend(d)
-        except OSError:
-            pass
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
+    threading.Thread(target=accept_loop, daemon=True).start()
     return port, buf, srv
 
 
@@ -95,7 +85,7 @@ def test_fmt_ilp_lines():
 
 
 def test_captures_all_forwards_trades_not_depth_and_writes_ilp():
-    port, buf, srv = _ilp_sink()
+    port, buf, srv = _ilp_sink_multi()
     evs = [Trade(1, 7543.5, 2, BUY, "ES"),
            DepthUpdate(2, -1, 7544.0, 10, 3, "ES"),
            DepthUpdate(3, 1, 7543.0, 40, 0, "ES"),
@@ -111,7 +101,7 @@ def test_captures_all_forwards_trades_not_depth_and_writes_ilp():
     # engine sees trades + bar; raw depth is captured but NOT forwarded
     assert forwarded == ["Trade", "Bar", "Trade"]
     time.sleep(0.4)
-    txt = bytes(buf).decode()
+    txt = _tape(buf)
     srv.close()
     # everything (both trades AND both depth updates) reached the ILP sink
     assert txt.count("claude_ticks_live") == 2
@@ -180,7 +170,7 @@ def test_writer_survives_a_feed_reconnect():
     assert tee._q.qsize() == 0, "rows left stranded in the queue after reconnect"
 
     time.sleep(0.3)
-    txt = bytes(buf).decode()
+    txt = _tape(buf)
     srv.close()
     assert "price=7544.0,size=3i" in txt, "post-reconnect tick never reached ILP"
     assert "side=-1i,level=0i,price=7544.5" in txt
@@ -203,7 +193,7 @@ def test_reconnect_flushes_rows_queued_before_the_disconnect():
     asyncio.run(go())
     assert tee.n_written == 2, f"stranded row was orphaned (wrote {tee.n_written})"
     time.sleep(0.3)
-    txt = bytes(buf).decode()
+    txt = _tape(buf)
     srv.close()
     assert "price=7000.0" in txt and "price=7001.0" in txt
 

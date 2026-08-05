@@ -838,6 +838,17 @@ async def main() -> None:
                     line += f" STRAT_FAIL={len(fails)}"
                 if dead:
                     line += f" DISABLED={','.join(k.split('@')[0] for k in dead)}"
+                # A recorder whose table accepts writes and stores nothing, or
+                # whose ILP writer thread has died, looks perfectly healthy from
+                # every counter above. Both happened on 2026-08-05 and cost a
+                # session of tape. Say it on every line until it is fixed.
+                broken = [t.symbol for t in (*recorders, *rawcaps)
+                          if getattr(t, "ingest_ok", None) is False]
+                if broken:
+                    line += f" !!TABLE-NOT-INGESTING[{','.join(sorted(set(broken)))}]"
+                stalled = [rc.symbol for rc in rawcaps if not rc.writer_alive]
+                if stalled:
+                    line += f" !!RAWCAP-WRITER-DEAD[{','.join(sorted(set(stalled)))}]"
                 print(line)
                 last_seen, last_fills = obs.trades, pf
 
@@ -855,14 +866,21 @@ async def main() -> None:
         for ptr in painters:
             await ptr.close()
 
+    # "recorded" means STORED. A count of rows sent into a table that swallowed
+    # them is not a recording, and printing it as one is how 2026-08-04's whole
+    # session looked complete the next morning.
     for rec in recorders:
         print(f"recorded [{rec.symbol}] {rec.n_recorded} 1m bars -> claude_bars_live, "
               f"{rec.n_sec} per-second rows -> claude_sec_live"
-              + (f", {paper_blot.n} paper fills -> claude_paper_fills" if paper_blot else ""))
+              + (f", {paper_blot.n} paper fills -> claude_paper_fills" if paper_blot else "")
+              + ("" if rec.ingest_ok is not False else
+                 "   *** NONE OF IT STORED: a target table is not ingesting ***"))
     for rc in rawcaps:
         print(f"raw capture [{rc.symbol}]: {rc.n_written} rows -> "
               f"claude_ticks_live/claude_depth_live"
-              + (f"  (DROPPED {rc.n_dropped} — DB couldn't keep up!)" if rc.n_dropped else ""))
+              + (f"  (DROPPED {rc.n_dropped} — writer/DB fell behind!)" if rc.n_dropped else "")
+              + ("" if rc.ingest_ok is not False else
+                 "   *** NONE OF IT STORED: a target table is not ingesting ***"))
     print(f"\nsession summary: {obs.trades} trades, {obs.flows} bookflow-seconds, "
           f"{obs.bars} 1m bars ({eng._backfill_bars} backfill), last px {obs.last_px}")
     print(f"warmup orders suppressed: {eng._suppressed_orders}  |  live orders {blot.n_orders}, fills {blot.n_fills}")
