@@ -83,3 +83,40 @@ sleeves:
       netted per-second adelta this sleeve consumes points at the COMPLETED
       move, and tools/sweep_replication.py showed that netting destroys the
       sweep structure that does carry information. Not a promotion candidate.
+
+  ibs:
+    tier: t0
+    # G2 -- the 0.20/0.80 thresholds are the PUBLISHED spec ("IBS effect"
+    # literature, UBS desk-note lineage) and were not fitted here. But the
+    # sleeve was SELECTED from 6 screened candidates in
+    # strategy_lab/QUIET_CLASSICS_SCREEN.md, and selection is fitting, so the
+    # screen window is declared as calibration. Bonferroni x6 noted there;
+    # t=5.0 on 486 trades survives it. Re-derived independently 2026-08-01 by
+    # strategy_lab/ibs_verify.py (original screen script was not kept).
+    calibration:
+      tool: strategy_lab/ibs_verify.py
+      window: "SPX daily 2010-01-01..2025-06-30 (460 trades)"
+      params_chosen: []        # thresholds inherited, not scanned
+    # G3 -- the year since the screen was written, never seen when it was.
+    # Same sign and strongly positive, but 2.7x the calibration median: the
+    # window is only 26 trades and fell in a high-volatility regime that
+    # favours daily mean reversion (2025 alone: +881pt). Declared as measured;
+    # this FAILS the +/-50% band and should, until the magnitudes match.
+    out_of_sample:
+      window: "SPX daily 2025-07-01..2026-07-31 (26 trades)"
+      same_sign: true
+      median_ratio: 2.69       # OOS +28.11pt vs calibration +10.43pt median
+    # G4 -- MOC execution on both legs, so both sides cross. Verified net of
+    # 0.517pt round-turn (es_costs aggressive preset).
+    costs:
+      entry: cross
+      exit: cross
+      needs_passive_fills: false
+    control_twin: null         # ibs_gex is a SIZE variant, not a control
+    notes: >
+      Validated on SPX index daily bars, not ES. Points translate ~1:1 but the
+      forward paper record is the only ES evidence and is 2 sessions long.
+      Binding constraint is G7 (40 sessions). NO STOP by design -- the classic
+      spec; stops break daily mean reversion. Tail is real: worst trade -321pt
+      (-$16,050/contract), max equity drawdown -386pt, one losing year in 16
+      (2018, -364pt). Sizing is the entire risk control.

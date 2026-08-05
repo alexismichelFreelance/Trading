@@ -24,6 +24,7 @@ this sleeve exists partly to accumulate its own forward record.
 from __future__ import annotations
 
 from ..core.events import Bar
+from ..core.exits import ExitCtx, TwoPhaseExit
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
 from .base import BaseStrategy
@@ -39,13 +40,15 @@ class OvernightBreakStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, buf_frac: float = BUF_FRAC,
                  stop_mult: float = 0.5, trail_mult: float = 0.75,
                  stop_floor: float = 5.0, trail_floor: float = 8.0,
-                 min_range: float = MIN_RANGE, gamma=None) -> None:
+                 min_range: float = MIN_RANGE, gamma=None,
+                 two_phase: TwoPhaseExit | None = None) -> None:
         self.symbol = symbol
         self.gamma = gamma
         self.buf_frac = buf_frac
         self.stop_mult, self.trail_mult = stop_mult, trail_mult
         self.stop_floor, self.trail_floor = stop_floor, trail_floor
         self.min_range = min_range
+        self.two_phase = two_phase
         self._day: str | None = None
         self.pos = 0
         self._reset_session()
@@ -76,6 +79,8 @@ class OvernightBreakStrategy(BaseStrategy):
                 side = 1 if self.pos > 0 else -1
                 return [Order(self.symbol, -side, abs(self.pos), tag="safety-flat",
                               reduce_only=True)]
+        if self.two_phase is not None:
+            self.two_phase.note_price(bar.c, bar.ts)   # the market's own scale
         m = et_minute_of_day(bar.ts)
         if m < RTH_START:                     # build the overnight range
             self.on_hi = bar.h if self.on_hi is None else max(self.on_hi, bar.h)
@@ -110,9 +115,13 @@ class OvernightBreakStrategy(BaseStrategy):
         stop = max(self.stop_floor, self.stop_mult * rng)
         trail = max(self.trail_floor, self.trail_mult * rng)
         self.trade = {"side": side, "entry": c, "stop": stop, "trail": trail, "peak": 0.0}
+        if self.two_phase is not None:
+            self.two_phase.start(side, c)
         return [Order(self.symbol, side, 1, tag="entry-onbreak")]
 
-    # ── management: failed break (back inside), else hard/trailing stop ──────
+    # ── management ───────────────────────────────────────────────────────────
+    # INVALIDATION first (the break failed), then either the two-phase thesis
+    # exit or the legacy trail, then the disaster stop.
     def _manage(self, c: float) -> list[Order]:
         t = self.trade
         side = t["side"]
@@ -121,6 +130,16 @@ class OvernightBreakStrategy(BaseStrategy):
             return self._flatten("range-fail")
         fe = (c - t["entry"]) * side
         t["peak"] = max(t["peak"], fe)
+        if self.two_phase is not None:
+            # RIDE untouched, then hunt the reversal. On 2026-07-28 this sleeve's
+            # trail left 74.75pt on the table; the trail is what gets replaced,
+            # the hard stop stays as insurance.
+            hit = self.two_phase.check(ExitCtx(ts=0, price=c, dir=side,
+                                               entry_px=t["entry"], entry_ts=0,
+                                               peak_fe=t["peak"]))
+            if hit:
+                return self._flatten(hit)
+            return self._flatten("stop") if fe <= -t["stop"] else []
         if fe <= max(-t["stop"], t["peak"] - t["trail"]):
             return self._flatten("trail")
         return []

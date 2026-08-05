@@ -27,7 +27,19 @@ DECISION_MIN = 15 * 60 + 59      # 15:59 ET
 
 
 class IBSSwingStrategy(BaseStrategy):
-    def __init__(self, symbol: str, *, in_th: float = 0.20, out_th: float = 0.80,
+    # A SWING sleeve by design: it is meant to carry positions through the
+    # close. The only sleeve entitled to opt out of the session flat.
+    holds_overnight = True
+
+    # out_th 0.90, not the classic 0.80. Measured on the same 486 entries over
+    # 16y (strategy_lab/ibs_exits.py): +7,106pt vs +5,953, +18.41/trade vs
+    # +12.30, t 5.4 vs 5.0, win 72% vs 68%, and BOTH tails smaller -- worst
+    # trade -269 vs -321, max drawdown -302 vs -386 (ret/DD 23.5 vs 15.4).
+    # Monotone from 0.5 to 0.9 and an interior optimum: 0.95 is worse (21.7),
+    # 0.99 collapses (10.0, DD -800). Beats 0.80 in H1, H2 AND the out-of-sample
+    # year separately. Not merely "hold longer": a 5-day time exit at the same
+    # mean hold returns +13.14/trade at ret/DD 7.8.
+    def __init__(self, symbol: str, *, in_th: float = 0.20, out_th: float = 0.90,
                  qty_base: int = 1, gamma=None, gex_full_pctl: float = 1.0 / 3.0,
                  qty_gex_boost: int = 2) -> None:
         self.symbol = symbol

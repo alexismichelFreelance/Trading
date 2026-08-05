@@ -46,24 +46,35 @@ def paper_pnl(qdb: QuestDB) -> pd.DataFrame:
     df["day"] = pd.to_datetime(df["ts"]).dt.tz_convert(
         "America/New_York").dt.strftime("%Y-%m-%d")
     rows = []
-    for (sleeve, day), g in df.groupby(["sleeve", "day"], sort=True):
-        pos, cost, real = 0, 0.0, 0.0
-        for r in g.itertuples(index=False):
-            qd = int(r.side * r.qty)
-            while qd:
-                if pos and (pos > 0) != (qd > 0):
-                    n = min(abs(qd), abs(pos))
-                    sgn = 1 if pos > 0 else -1
-                    real += n * (r.price - cost) * sgn
-                    pos -= n * sgn
-                    qd -= n * (1 if qd > 0 else -1)
-                else:
-                    tot = abs(pos) + abs(qd)
-                    cost = (cost * abs(pos) + r.price * abs(qd)) / tot
-                    pos += qd
-                    qd = 0
-        rows.append({"sleeve": sleeve, "day": day, "pnl": real,
-                     "symbol": g["symbol"].iloc[0]})
+    # Position and average cost carry ACROSS sessions, per sleeve. They used to
+    # be re-zeroed inside a groupby(["sleeve","day"]) loop, which abandoned any
+    # open position at every session boundary: a sleeve that entered Monday and
+    # exited Thursday realised nothing at all, so every `holds_overnight` sleeve
+    # scored +0.00pt on G5/G6/G8 and was BLOCKED regardless of how it performed.
+    # Intraday sleeves are unaffected either way -- they close inside a session.
+    for sleeve, sg in df.groupby("sleeve", sort=True):
+        pos, cost = 0, 0.0
+        sg = sg.sort_values("ts")
+        for day, g in sg.groupby("day", sort=True):
+            real = 0.0
+            for r in g.itertuples(index=False):
+                qd = int(r.side * r.qty)
+                while qd:
+                    if pos and (pos > 0) != (qd > 0):
+                        n = min(abs(qd), abs(pos))
+                        sgn = 1 if pos > 0 else -1
+                        real += n * (r.price - cost) * sgn
+                        pos -= n * sgn
+                        qd -= n * (1 if qd > 0 else -1)
+                    else:
+                        tot = abs(pos) + abs(qd)
+                        cost = (cost * abs(pos) + r.price * abs(qd)) / tot
+                        pos += qd
+                        qd = 0
+            # P&L lands on the session the trade CLOSED in -- the gate counts
+            # sessions, so smearing it over the hold would invent results.
+            rows.append({"sleeve": sleeve, "day": day, "pnl": real,
+                         "symbol": g["symbol"].iloc[0]})
     return pd.DataFrame(rows)
 
 

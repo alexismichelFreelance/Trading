@@ -20,8 +20,10 @@ import logging
 from .blotter import Blotter
 from .dispatch import _wants, dispatch_broker, dispatch_market
 from .events import Bar, Fill, PositionUpdate, Signal, Trade
+from .orders import Order, OrderType
 from .risk import RiskSupervisor
 from .timeutil import et_session_date
+from ..strategies.base import BaseStrategy
 
 log = logging.getLogger("engine.live")
 
@@ -36,7 +38,8 @@ class LiveEngine:
     def __init__(self, feed, broker, strategies, clock, blotter: Blotter,
                  reconnect_delay: float = 1.0, drain_timeout: float = 0.5,
                  warmup_gate: bool = True, risk: RiskSupervisor | None = None,
-                 live_owners: set | None = None) -> None:
+                 live_owners: set | None = None,
+                 stale_event_s: float = 60.0, sink_qsize: int = 4096) -> None:
         # Multi-instrument: `feed` may be one adapter or a list of them (one per
         # instrument lane); `broker` one adapter or {symbol: adapter}. The scalar
         # forms are exactly the pre-multi behavior.
@@ -69,6 +72,56 @@ class LiveEngine:
         self.warmup_signals: list[tuple[int, int, int, str, float, str]] = []
         # last trade/bar price per lane; "" holds the latest from any lane
         self._last_px: dict[str, float] = {"": 0.0}
+        # ...and the EVENT TIMESTAMP that price came from. These two must travel
+        # together. A paper fill used to be stamped self.clock.now(), which in
+        # live mode is WallClock -- and WallClock.set() is a no-op, so the stamp
+        # came from the OS while the price came from the event stream. Any lag
+        # between market time and processing time therefore wrote a trade that
+        # never happened: seconds-to-minutes of skew in normal running, HOURS
+        # when NT8 replayed history into a running engine (2026-07-29: a fill
+        # recorded at 16:53 ET priced 7459.50 while ES was 7337-7340, and
+        # sleeves that hard-flatten at 15:59 logged fresh entries at 16:53).
+        # claude_paper_fills is the table every sleeve is judged on, so this was
+        # corrupting the only evidence we have.
+        self._last_ts: dict[str, int] = {"": 0}
+        # BACKFILL DETECTION, by event time alone. A live feed yields strictly
+        # ascending timestamps (see FeedAdapter). A feed replaying history does
+        # not: it jumps BACKWARDS. So an event more than `stale_event_s` behind
+        # the newest event that lane has already delivered is history, whatever
+        # the wall clock says. Deliberately not a wall-clock comparison -- that
+        # would also flag replay, tests, and any synthetic timestamp, and would
+        # need an opt-out at every call site that someone would eventually
+        # forget. Regression against the lane's own high-water mark is the
+        # anomaly itself. Startup backfill still ascends, so the warmup gate
+        # keeps handling that as before; this catches backfill AFTER going live.
+        self.stale_event_s = stale_event_s
+        self._hwm: dict[str, int] = {}               # lane -> newest ts seen
+        self._stale_events: dict[str, int] = {}
+        # Paper orders that are not MARKET wait here until the tape trades through
+        # their level (see _check_resting). [(strategy, Order)]
+        self._resting: list[tuple] = []
+        # LIVE orders the broker transport refused (socket dead/stalled). Counted
+        # so a silent routing outage is visible instead of looking like "no signals".
+        self.failed_orders = 0
+        # id(strategy) -> session date already flattened (once per sleeve per day)
+        self._session_flat: dict[int, str] = {}
+        # ── SIDE-EFFECT SINKS ────────────────────────────────────────────────
+        # The hooks below are OBSERVERS: chart painting and the QuestDB paper
+        # blotter. They must never run inside the dispatch loop. They used to be
+        # awaited there, which meant a stalled QuestDB insert or an NT8 draw
+        # socket that stopped reading applied backpressure to TRADING -- and
+        # because recording happens on the feed pump task, the engine kept
+        # writing bars, ticks and per-second features and looked completely
+        # healthy while placing no orders at all. tests/test_sink_backpressure.py
+        # reproduces it: one stuck observer, and 1 of 6 events gets dispatched.
+        # These now go on a bounded queue drained by its own task; the loop only
+        # ever does put_nowait. On overflow work is DROPPED and counted, never
+        # waited on -- losing a chart marker is acceptable, delaying an exit is
+        # not.
+        self._sink_q: asyncio.Queue | None = None
+        self.sink_qsize = sink_qsize
+        self._sink_dropped = 0
+        self._sink_errors = 0
         # optional async callbacks for the chart painter
         self.on_live_order = None          # async (ts, side, qty, tag, px) — decision time
         self.on_live_fill = None           # async (Fill) — ACTUAL engine fill ts+price
@@ -172,11 +225,55 @@ class LiveEngine:
             if self._processed != seen:
                 seen, last_change = self._processed, now
             elif seen > 0 and now - last_change >= quiet:
+                # observers run off the hot path now, so "loop quiet" is not yet
+                # "side effects landed". Tests assert on painted fills and
+                # blotter rows, so drain that queue too -- otherwise this becomes
+                # another wait that passes early.
+                if self._sink_q is not None and (self._sink_q.qsize()
+                                                 or self._sink_q._unfinished_tasks):
+                    continue
                 return seen
             if now >= deadline:
                 raise TimeoutError(
                     f"engine never went idle: dispatched {self._processed} "
                     f"events in {timeout}s (0 means it processed NOTHING)")
+
+    # ── side-effect sinks: never awaited by the dispatch loop ────────────────
+    def _emit_sink(self, cb, *args) -> None:
+        """Hand an observer callback to the drain task. Non-blocking by
+        construction: no await, so trading can never queue behind it."""
+        if cb is None:
+            return
+        if self._sink_q is None:                 # emitted outside run()
+            self._sink_q = asyncio.Queue(self.sink_qsize)
+        try:
+            self._sink_q.put_nowait((cb, args))
+        except asyncio.QueueFull:
+            self._sink_dropped += 1
+            if self._sink_dropped in (1, 100) or self._sink_dropped % 1000 == 0:
+                log.error("SINK QUEUE FULL: dropped %d observer callbacks "
+                          "(painting/blotter). Trading is UNAFFECTED by design, "
+                          "but a sink is not keeping up -- check QuestDB and the "
+                          "NT8 draw socket.", self._sink_dropped)
+
+    async def _pump_sinks(self) -> None:
+        """Drain observers off the hot path. One failing sink must not stop the
+        others and must never reach the dispatch loop."""
+        q = self._sink_q
+        while True:
+            cb, args = await q.get()
+            try:
+                await cb(*args)
+            except asyncio.CancelledError:
+                q.task_done()
+                raise
+            except Exception as ex:              # noqa: BLE001
+                self._sink_errors += 1
+                if self._sink_errors in (1, 10) or self._sink_errors % 100 == 0:
+                    log.warning("sink callback failed (%d so far): %s: %s",
+                                self._sink_errors, type(ex).__name__, ex)
+            finally:
+                q.task_done()
 
     def _is_live(self, s) -> bool:
         return self.live_owners is None or id(s) in self.live_owners
@@ -188,6 +285,23 @@ class LiveEngine:
 
     def px_for(self, symbol: str) -> float:
         return self._last_px.get(symbol) or self._last_px.get("", 0.0)
+
+    def ts_for(self, symbol: str) -> int:
+        """Timestamp of the event that produced px_for(symbol). Always use these
+        two together — a price from one clock and a stamp from another is how the
+        paper record got corrupted."""
+        return self._last_ts.get(symbol) or self._last_ts.get("", 0)
+
+    def _is_stale(self, sym: str, ts: int) -> bool:
+        """True if this event regresses far behind the newest one this lane has
+        already delivered — i.e. the feed is replaying history. Pure event time,
+        so replay, tests and live all share one rule and there is nothing to
+        configure per call site. Advances the lane's high-water mark."""
+        hwm = self._hwm.get(sym)
+        self._hwm[sym] = ts if hwm is None else max(hwm, ts)
+        if hwm is None or self.stale_event_s <= 0:
+            return False
+        return (hwm - ts) > self.stale_event_s * 1e9
 
     @property
     def _live(self) -> bool:                          # any lane live?
@@ -248,11 +362,29 @@ class LiveEngine:
                         "(sleeve needs richer state) — left flat, orphaned in "
                         "claude_paper_fills", type(s).__name__, pos, avg)
 
-    async def _submit_owned(self, s, o) -> None:
+    async def _submit_owned(self, s, o) -> bool:
+        """Send a LIVE order. Returns True if the broker accepted it.
+
+        Order of operations matters and used to be wrong: the blotter was written
+        BEFORE the send and risk.on_submit AFTER it, so a raise in between left
+        the blotter holding an order that never existed while risk had no record
+        of it -- two ledgers, silently diverged. Nothing caught the exception
+        either, so it propagated out of run() and shut down every strategy in the
+        process. A broker that cannot take an order is a bad order, not a dead
+        engine: record ONLY what the broker accepted, log loudly, keep trading."""
+        try:
+            await self._broker_for(o.symbol).submit(o)
+        except Exception as ex:                      # noqa: BLE001
+            self.failed_orders += 1
+            log.error("ORDER REJECTED BY TRANSPORT [%s %s %+d x%d %s]: %s: %s "
+                      "-- not recorded; engine continues (%d failed so far)",
+                      self.label_of(s), o.symbol, o.side, o.qty, o.tag,
+                      type(ex).__name__, ex, self.failed_orders)
+            return False
         self._owner[o.order_id] = s
         self.blotter.on_order(o)
-        await self._broker_for(o.symbol).submit(o)
         self.risk.on_submit(id(s), o)
+        return True
 
     async def _emit_signal(self, emitter, o, ts: int, px: float) -> None:
         """Broadcast `emitter`'s intent to its peers and route any replies.
@@ -286,9 +418,77 @@ class LiveEngine:
         return getattr(s, "label", None) or type(s).__name__
 
     async def _paper_submit(self, s, o) -> None:
-        """Fill a paper strategy's order inline at last_px (market model), against
-        its OWN attributed book. reduce_only clamps/drops so the paper book stays
-        coherent; no broker, no risk gate. Visible + recorded."""
+        """Route a paper order: MARKET fills now, STOP/LIMIT RESTS until the market
+        trades through its level.
+
+        Resting is the whole point. Every order used to fill at px_for(symbol) --
+        the price *now* -- so a sleeve could only implement a stop by watching bar
+        closes and then market-selling. On 2026-07-31 ES:zones_gap did exactly
+        that: sized for a $2,000 loss on a ~7.5pt stop, it noticed the breach at a
+        1-minute bar close and sold 25 points below the level, losing $12,512 --
+        6x the risk its own sizing was computed from. With the level held here, a
+        stop can only be beaten by a genuine gap, which is real market risk rather
+        than the engine not looking."""
+        if o.type in (OrderType.STOP, OrderType.LIMIT):
+            self._resting.append((s, o))
+            return
+        await self._fill_paper(s, o, self.px_for(o.symbol),
+                               self.ts_for(o.symbol) or self.clock.now())
+
+    async def _flatten_for_session(self, sym: str, ts: int) -> None:
+        """Flatten every intraday sleeve on this lane once the session is over.
+
+        Fires at most once per sleeve per session date, so it cannot fight a
+        sleeve that is already exiting, and never touches one that declares
+        `holds_overnight = True` (IBS)."""
+        if not BaseStrategy.session_over(ts):
+            return
+        day = et_session_date(ts)
+        for s in self.strategies:
+            if getattr(s, "symbol", "") not in (sym, ""):
+                continue
+            if getattr(s, "holds_overnight", False):
+                continue
+            pid = id(s)
+            if self._session_flat.get(pid) == day:
+                continue
+            pos = self._spos.get(pid, 0)
+            if pos == 0:
+                continue
+            self._session_flat[pid] = day
+            side = -1 if pos > 0 else 1
+            log.info("session flat [%s]: %s still %+d at the close",
+                     sym or "-", self.label_of(s), pos)
+            o = Order(s.symbol or sym, side, abs(pos), tag="session-flat",
+                      reduce_only=True)
+            if self._is_live(s):
+                await self._submit_owned(s, o)
+            else:
+                await self._paper_submit(s, o)
+
+    async def _check_resting(self, sym: str, px: float, ts: int) -> None:
+        """Fill any resting order this price trades through. Called on EVERY market
+        event, which is what keeps a stop honest: the trigger price is the first
+        price that actually traded at or beyond the level, so the only way to be
+        filled far from it is a real gap."""
+        if not self._resting:
+            return
+        still: list[tuple] = []
+        for s, o in self._resting:
+            if o.symbol not in (sym, ""):
+                still.append((s, o))
+                continue
+            if o.type is OrderType.STOP:
+                hit = px <= o.stop_price if o.side < 0 else px >= o.stop_price
+            else:                                    # LIMIT: fill at or better
+                hit = px <= o.limit_price if o.side > 0 else px >= o.limit_price
+            if not hit:
+                still.append((s, o))
+                continue
+            await self._fill_paper(s, o, px, ts)     # the price that triggered it
+        self._resting = still
+
+    async def _fill_paper(self, s, o, price: float, ts: int) -> None:
         pid = id(s)
         pos = self._spos.get(pid, 0)
         qty = o.qty
@@ -297,12 +497,14 @@ class LiveEngine:
                 return                               # nothing to reduce
             qty = min(qty, abs(pos))
         self._owner[o.order_id] = s
-        f = Fill(self.clock.now(), o.order_id, o.symbol, self.px_for(o.symbol),
-                 o.side * qty, 0.0, 0.0, o.tag)
+        # Stamp with the EVENT that priced this fill, never the wall clock: the
+        # two must not come from different clocks (see _last_ts). Falls back to
+        # clock.now() only before any market event has arrived.
+        f = Fill(ts, o.order_id, o.symbol, price, o.side * qty, 0.0, 0.0, o.tag)
         self.paper_fills.append(f)
         self._attribute_fill(f)                      # own book only (not live risk)
         if self.on_paper_fill is not None:
-            await self.on_paper_fill(f)
+            self._emit_sink(self.on_paper_fill, f)
 
     def _attribute_fill(self, f: Fill) -> None:
         s = self._owner.get(f.order_id)
@@ -424,6 +626,10 @@ class LiveEngine:
                 await asyncio.sleep(self.reconnect_delay)
 
     async def run(self) -> Blotter:
+        # observers drain on their own task: nothing they touch (QuestDB, the
+        # NT8 draw socket) can apply backpressure to trading
+        self._sink_q = asyncio.Queue(self.sink_qsize)
+        sinker = asyncio.create_task(self._pump_sinks())
         feeders = [asyncio.create_task(self._pump_feed(f)) for f in self.feeds]
         # liveness watchdog: only meaningful for an unbounded (live) feed set
         dog = (asyncio.create_task(self._watchdog())
@@ -449,12 +655,33 @@ class LiveEngine:
                     self.clock.set(ev.ts)
                     if isinstance(ev, Trade):
                         self._last_px[sym] = self._last_px[""] = ev.price
+                        self._last_ts[sym] = self._last_ts[""] = ev.ts
                         self.risk.note_price(sym, ev.price)   # $ caps always marked
                     elif isinstance(ev, Bar):
                         self._last_px[sym] = self._last_px[""] = ev.c
+                        self._last_ts[sym] = self._last_ts[""] = ev.ts
                         self.risk.note_price(sym, ev.c)
                     lane_live = self._lane_live(sym)
-                    if not lane_live and isinstance(ev, Trade):
+                    # STALE EVENT GUARD. The warmup gate only covers STARTUP: once
+                    # a lane has gone live it stays live, so a mid-session backfill
+                    # (NT8 reloading a chart, a data-session boundary, a reconnect)
+                    # was replayed into live strategies and filled as real trades.
+                    # An event far behind the wall clock is history by definition.
+                    # State still warms; orders are dropped, exactly as in warmup.
+                    # A stale Trade must ALSO not flip a lane live -- it is not
+                    # evidence that live data has started, it is evidence of replay.
+                    stale = self._is_stale(sym, ev.ts)
+                    if stale:
+                        n = self._stale_events[sym] = self._stale_events.get(sym, 0) + 1
+                        if n == 1 or n % 500 == 0:
+                            log.error("BACKFILL INTO A LIVE LANE [%s]: %d events, "
+                                      "latest %s is %.0fs BEHIND the newest already "
+                                      "seen. Warming state but placing NOTHING. The "
+                                      "feed is replaying history (NT8 chart reload / "
+                                      "data-session boundary).",
+                                      sym or "-", n, type(ev).__name__,
+                                      (self._hwm.get(sym, ev.ts) - ev.ts) / 1e9)
+                    if not lane_live and not stale and isinstance(ev, Trade):
                         self._live_lanes.add(sym)        # this lane goes live
                         lane_live = True
                         for s in self.strategies:        # clear warmup phantom state
@@ -469,6 +696,8 @@ class LiveEngine:
                                  sym or "-", self._bf_bars.get(sym, 0), self._suppressed_orders)
                     if not lane_live and isinstance(ev, Bar):
                         self._bf_bars[sym] = self._bf_bars.get(sym, 0) + 1
+                    if stale:
+                        lane_live = False        # history: warm state, place nothing
                     # ET session rollover (live only, once per change): refresh
                     # day-keyed snapshots. Warmup backfill (pre-live) is skipped
                     # so replayed historical days don't fire it.
@@ -478,8 +707,23 @@ class LiveEngine:
                             self._session_day = d
                         elif d != self._session_day:
                             self._session_day = d
-                            await self.on_session_rollover(d)
+                            self._emit_sink(self.on_session_rollover, d)
                     px = self.px_for(sym)
+                    # SESSION BOUNDARY, enforced centrally. Sleeves declare
+                    # holds_overnight; a declaration nothing acts on is only a
+                    # comment, and per-sleeve discipline is exactly what failed
+                    # (zones_strategy and ignition both shipped with no end-of-day
+                    # flat at all). Doing it here means a sleeve written tomorrow
+                    # inherits it, and forgetting costs a flat position rather
+                    # than an unplanned overnight one.
+                    if lane_live:
+                        await self._flatten_for_session(sym, ev.ts)
+                    # Resting stops/limits are checked against EVERY price, before
+                    # strategies see the event. That ordering matters: a protective
+                    # stop must be beaten by the market, never by a sleeve reacting
+                    # to the same tick first.
+                    if lane_live and self._resting:
+                        await self._check_resting(sym, px, ev.ts)
                     for s in self.strategies:            # per-strategy: orders are OWNED
                         for o in dispatch_market([s], ev):
                             # PEER CHANNEL: broadcast this intent to the other
@@ -498,17 +742,19 @@ class LiveEngine:
                                 sig = (ev.ts, o.side, o.qty, o.tag, px, o.symbol)
                                 self.warmup_signals.append(sig)
                                 if self.on_warmup_signal is not None:
-                                    await self.on_warmup_signal(*sig)   # ghost now
+                                    self._emit_sink(self.on_warmup_signal, *sig)
                             elif not self._is_live(s):   # PAPER: raw signal, inline fill
                                 await self._paper_submit(s, o)
                             else:                        # LIVE: vetted -> real broker
                                 o = self._vet(s, o, ev.ts)
                                 if o is None:
                                     continue
-                                await self._submit_owned(s, o)
+                                if not await self._submit_owned(s, o):
+                                    continue          # transport refused it
                                 if self.on_live_order is not None:
-                                    await self.on_live_order(ev.ts, o.side, o.qty,
-                                                             o.tag, self.px_for(o.symbol))
+                                    self._emit_sink(self.on_live_order, ev.ts,
+                                                    o.side, o.qty, o.tag,
+                                                    self.px_for(o.symbol))
                     if self._live:                       # supervisor-owned actions (LIVE only)
                         books = [(id(s), type(s).__name__, s.symbol,
                                   self._spos.get(id(s), 0)) for s in self.strategies
@@ -517,7 +763,8 @@ class LiveEngine:
                             owner = next(s for s in self.strategies if id(s) == sid)
                             await self._submit_owned(owner, o)
                     if isinstance(ev, Bar) and self.on_bar_hook is not None:
-                        await self.on_bar_hook(ev, lane_live, self._bf_bars.get(sym, 0))
+                        self._emit_sink(self.on_bar_hook, ev, lane_live,
+                                        self._bf_bars.get(sym, 0))
                     self.blotter.on_market_event(ev)
                 else:  # broker event
                     self.blotter.on_broker_event(ev)
@@ -529,9 +776,9 @@ class LiveEngine:
                         # relay strategy is on the chart (NT hijacks the execution
                         # display), so we re-draw them ourselves via on_manual_fill.
                         if attributed and self.on_live_fill is not None:
-                            await self.on_live_fill(ev)
+                            self._emit_sink(self.on_live_fill, ev)
                         elif not attributed and self.on_manual_fill is not None:
-                            await self.on_manual_fill(ev)
+                            self._emit_sink(self.on_manual_fill, ev)
                     # account-level PositionUpdates are NOT broadcast to
                     # strategies: each sleeve sees only its own attributed book
         finally:
@@ -541,6 +788,17 @@ class LiveEngine:
             await asyncio.gather(*feeders, *brokerers, return_exceptions=True)
             if dog is not None:
                 dog.cancel()
+            # bounded chance for observers to land (so shutdown does not lose the
+            # last blotter rows), then stop regardless -- shutdown must not hang
+            # on a stuck sink either.
+            try:
+                await asyncio.wait_for(self._sink_q.join(),
+                                       timeout=self.drain_timeout * 4)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                log.warning("sink queue still had %d items at shutdown",
+                            self._sink_q.qsize())
+            sinker.cancel()
+            await asyncio.gather(sinker, return_exceptions=True)
         return self.blotter
 
 

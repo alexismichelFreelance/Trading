@@ -12,7 +12,7 @@ from collections import deque
 
 from ..core.events import BookFlow, Trade
 from ..core.orders import Order
-from ..core.timeutil import et_session_date, ns_to_utc
+from ..core.timeutil import et_minute_of_day, et_session_date, ns_to_utc
 from .base import BaseStrategy
 
 
@@ -80,11 +80,43 @@ class FlowFollowingStrategy(BaseStrategy):
         self._adelta += t.aggressor * t.size
         return []
 
+    def in_window(self, ts: int) -> bool:
+        """Is `ts` inside the trading window, in ET?
+
+        `gate_utc` is kept as (open_hour, close_hour) for config compatibility but
+        is now interpreted in EASTERN time, because a fixed UTC hour is not a
+        fixed session hour: 21 UTC is 17:00 ET in July and 16:00 ET in December.
+        The old code compared ns_to_utc(ts).hour directly, so the window moved by
+        an hour at each DST change -- an hour of unintended post-close trading
+        every summer, or an hour cut off every winter. The default (13, 21) maps
+        to 09:00-16:00 ET and now means that all year.
+        """
+        if self.gate_utc is None:
+            return True
+        open_et = (self.gate_utc[0] - 4) % 24        # 13 UTC -> 09:00 ET
+        close_et = (self.gate_utc[1] - 4) % 24       # 21 UTC -> 16:00 ET
+        m = et_minute_of_day(ts)
+        return open_et * 60 <= m < close_et * 60
+
+    def _reduce_band(self, held: int) -> float:
+        """Signal swing required to start REDUCING an existing position.
+
+        `hold_band` exists to stop a large position thrashing on noise, and for a
+        large position that is right. Applied flat it is backwards: a 1-lot short
+        needed delta > 5, i.e. the target had to reach +4 contracts before the
+        position was touched at all -- a band of 1 to enter and 5 to leave. On
+        2026-08-03 NQ:flow rode a 1-lot short through a 489pt rally and only got
+        out on the 15:59 flat.
+
+        Getting out must never require a bigger swing than the position itself,
+        so the band is capped by |held|. Large positions keep the full band.
+        """
+        return min(self.hold_band, max(1, abs(held)))
+
     def on_bookflow(self, bf: BookFlow) -> list[Order]:
         orders: list[Order] = []
         if self.gate_utc is not None:
-            h = ns_to_utc(bf.ts).hour
-            if not (self.gate_utc[0] <= h < self.gate_utc[1]):
+            if not self.in_window(bf.ts):
                 self._buf.clear()
                 self._F = 0.0
                 self._adelta = 0
@@ -123,7 +155,8 @@ class FlowFollowingStrategy(BaseStrategy):
         tgt = max(-self.maxp, min(self.maxp, self._F / scale))
         delta = tgt - held
         band = self.add_band if held == 0 else (
-            self.add_band if _sign(delta) == _sign(held) else self.hold_band)
+            self.add_band if _sign(delta) == _sign(held)
+            else self._reduce_band(held))
         if abs(delta) > band:
             step = _jsround(tgt) - held
             if step != 0:

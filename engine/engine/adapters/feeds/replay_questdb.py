@@ -23,9 +23,22 @@ class ReplayFeed:
     def __init__(self, qdb: AsyncQuestDB, table: str = "claude_sec_feat",
                  start: str | None = None, end: str | None = None,
                  days: list[str] | None = None, bars_symbol: str | None = None,
-                 bars_table: str = "claude_bars_1m", symbol: str = "") -> None:
+                 bars_table: str = "claude_bars_1m", symbol: str = "",
+                 tick: float = 0.0) -> None:
         self.qdb = qdb
         self.table = table
+        # `pxc` is the VOLUME-WEIGHTED AVERAGE of the second, not a traded price.
+        # Measured against the raw tape (mbo_events, ESM5 2025-05-05 RTH, 21,183
+        # seconds): 0.00% of pxc values sit on the 0.25 tick grid, 21.5% are more
+        # than a tick from the last traded price, max deviation 2.118pt. Replaying
+        # fills at that value books trades at prints that never existed, and
+        # because a VWAP lies inside the second's own range 53% of the time, a
+        # round trip there silently avoids the spread it should have paid.
+        # tick>0 snaps to the nearest legal price. It does NOT make pxc the right
+        # price -- it is still an average rather than the last trade -- but it
+        # removes the impossible-print error. Default 0.0 leaves existing callers
+        # byte-identical so no parity baseline shifts without being asked for.
+        self.tick = tick
         self.start = start
         self.end = end
         self._days = days
@@ -66,6 +79,10 @@ class ReplayFeed:
         for i in range(len(df)):
             t = int(ts[i])
             ad, av, px = int(adelta[i]), int(avol[i]), pxc[i]
+            if px == px and self.tick > 0:
+                # snap once, before the split, so the BUY and the SELL of the
+                # same second keep one price and no phantom spread is invented
+                px = round(px / self.tick) * self.tick
             if px == px:  # not NaN
                 buy = (av + ad) // 2
                 sell = (av - ad) // 2

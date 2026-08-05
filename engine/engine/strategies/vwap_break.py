@@ -24,6 +24,7 @@ rest until it earns (or fails to earn) a live slot.
 from __future__ import annotations
 
 from ..core.events import Bar
+from ..core.exits import ExitCtx, TwoPhaseExit
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
 from ..features.avwap import AnchoredVWAP
@@ -39,12 +40,13 @@ class VwapBreakStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, band_k: float = 1.0,
                  stop_mult: float = 1.0, trail_mult: float = 1.5,
                  stop_floor: float = 5.0, trail_floor: float = 8.0,
-                 gamma=None) -> None:
+                 gamma=None, two_phase: TwoPhaseExit | None = None) -> None:
         self.symbol = symbol
         self.gamma = gamma
         self.band_k = band_k
         self.stop_mult, self.trail_mult = stop_mult, trail_mult
         self.stop_floor, self.trail_floor = stop_floor, trail_floor
+        self.two_phase = two_phase
         self._day: str | None = None
         self.pos = 0
         self._reset_session()
@@ -78,6 +80,8 @@ class VwapBreakStrategy(BaseStrategy):
         m = et_minute_of_day(bar.ts)
         if m < RTH_START:                         # overnight: RTH VWAP not started
             return []
+        if self.two_phase is not None:
+            self.two_phase.note_price(bar.c, bar.ts)
         # accumulate the RTH session VWAP on this bar's typical price
         tp = (bar.h + bar.l + bar.c) / 3.0
         self.av.add(tp, float(bar.v) if bar.v else 0.0)
@@ -113,6 +117,8 @@ class VwapBreakStrategy(BaseStrategy):
         stop = max(self.stop_floor, self.stop_mult * w)
         trail = max(self.trail_floor, self.trail_mult * w)
         self.trade = {"side": side, "entry": c, "stop": stop, "trail": trail, "peak": 0.0}
+        if self.two_phase is not None:
+            self.two_phase.start(side, c)
         self.entries += 1
         return [Order(self.symbol, side, 1, tag="entry-vwapbreak")]
 
@@ -125,6 +131,15 @@ class VwapBreakStrategy(BaseStrategy):
             return self._flatten("vwap-fail")
         fe = (c - t["entry"]) * side
         t["peak"] = max(t["peak"], fe)
+        if self.two_phase is not None:
+            # 2026-07-28: this sleeve ran +127.75pt and closed at -14.50 on the
+            # MOC, 142.25pt given back. Ride, then hunt the reversal.
+            hit = self.two_phase.check(ExitCtx(ts=0, price=c, dir=side,
+                                               entry_px=t["entry"], entry_ts=0,
+                                               peak_fe=t["peak"]))
+            if hit:
+                return self._flatten(hit)
+            return self._flatten("stop") if fe <= -t["stop"] else []
         if fe <= max(-t["stop"], t["peak"] - t["trail"]):
             return self._flatten("trail")
         return []

@@ -58,9 +58,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int BrokerPort { get; set; }
 
         private TcpListener marketListener, brokerListener;
-        private readonly List<TcpClient> marketClients = new List<TcpClient>();
-        private readonly List<TcpClient> brokerClients = new List<TcpClient>();
-        private readonly object mLock = new object(), bLock = new object();
+        // Socket transport lives in RelayChannel.cs (same folder, no NT deps so it
+        // is unit-testable -- see tests/ChannelTests.cs). Publishing NEVER blocks a
+        // NinjaTrader thread; each channel has its own writer thread and its own
+        // bounded backlog, so the L2 firehose can never delay a fill.
+        private readonly EngineBridge.RelayChannel marketCh =
+            new EngineBridge.RelayChannel("market", 50000);
+        private readonly EngineBridge.RelayChannel brokerCh =
+            new EngineBridge.RelayChannel("broker", 5000);
         private readonly Dictionary<string, Order> live = new Dictionary<string, Order>();
         // historical 1m bars buffered during State.Historical; sent to each market
         // client on connect so the engine's bar-driven features warm up instantly
@@ -113,8 +118,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // submitted via Account.Submit, so subscribe to the account itself.
                 Account.ExecutionUpdate += OnAccountExecution;
                 Account.PositionUpdate += OnAccountPosition;
-                StartServer(ref marketListener, MarketPort, marketClients, mLock, false);
-                StartServer(ref brokerListener, BrokerPort, brokerClients, bLock, true);
+                StartServer(ref marketListener, MarketPort, marketCh, false);
+                StartServer(ref brokerListener, BrokerPort, brokerCh, true);
                 Print("EngineRelay: market:" + MarketPort + " broker:" + BrokerPort);
                 RLog("=== EngineRelay realtime. market:" + MarketPort + " broker:" +
                      BrokerPort + " chart=" + (ChartControl != null) + " ===");
@@ -130,6 +135,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     if (marketListener != null) marketListener.Stop();
                     if (brokerListener != null) brokerListener.Stop();
+                    RLog("EngineRelay stopping: market dropped=" + marketCh.Dropped +
+                         " broker dropped=" + brokerCh.Dropped);
+                    marketCh.Dispose();
+                    brokerCh.Dispose();
                 }
                 catch { }
             }
@@ -222,7 +231,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (e.MarketDataType == MarketDataType.Last)
             {
                 int aggressor = e.Price >= lastAsk && lastAsk > 0 ? 1 : (e.Price <= lastBid && lastBid > 0 ? -1 : 1);
-                Broadcast(marketClients, mLock,
+                marketCh.Publish(
                     "{\"t\":\"trade\",\"ts\":" + ns + ",\"price\":" + J(e.Price) +
                     ",\"size\":" + e.Volume + ",\"aggressor\":" + aggressor + "}");
             }
@@ -240,7 +249,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             long ns = ToNs(e.Time);
             // Operation Remove -> size 0 at that price; Add/Update -> current volume.
             long size = e.Operation == Operation.Remove ? 0 : e.Volume;
-            Broadcast(marketClients, mLock,
+            marketCh.Publish(
                 "{\"t\":\"depth\",\"ts\":" + ns + ",\"side\":" + side + ",\"price\":" + J(e.Price) +
                 ",\"size\":" + size + ",\"level\":" + e.Position + "}");
         }
@@ -256,7 +265,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             int qty = e.Execution.Quantity;
             int signed = e.Execution.MarketPosition == MarketPosition.Long ? qty : -qty;
             string name = e.Execution.Order != null ? e.Execution.Order.Name : "";
-            Broadcast(brokerClients, bLock,
+            brokerCh.Publish(
                 "{\"t\":\"fill\",\"ts\":" + ToNs(e.Execution.Time) + ",\"order_id\":\"" + name +
                 "\",\"symbol\":\"" + Instrument.MasterInstrument.Name +
                 "\",\"price\":" + J(e.Execution.Price) + ",\"size\":" + signed +
@@ -271,7 +280,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             int signed = e.Position.MarketPosition == MarketPosition.Long ? e.Position.Quantity
                        : (e.Position.MarketPosition == MarketPosition.Short ? -e.Position.Quantity : 0);
             if (e.Operation == Operation.Remove) signed = 0;
-            Broadcast(brokerClients, bLock,
+            brokerCh.Publish(
                 "{\"t\":\"position\",\"ts\":" + ToNs(DateTime.UtcNow) + ",\"symbol\":\"" +
                 Instrument.MasterInstrument.Name + "\",\"qty\":" + signed +
                 ",\"avg_px\":" + J(e.Position.AveragePrice) + "}");
@@ -413,7 +422,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // ── tiny socket plumbing ─────────────────────────────────────────
-        private void StartServer(ref TcpListener listener, int port, List<TcpClient> clients, object lk, bool isBroker)
+        private void StartServer(ref TcpListener listener, int port, EngineBridge.RelayChannel ch, bool isBroker)
         {
             listener = new TcpListener(IPAddress.Loopback, port);
             listener.Start();
@@ -425,7 +434,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     TcpClient c;
                     try { c = l.AcceptTcpClient(); } catch { break; }
                     if (!isBroker) SendBackfill(c);          // warmup bars first
-                    lock (lk) clients.Add(c);
+                    ch.AddClient(c);
                     if (isBroker) new Thread(() => ReadBroker(c)).Start();
                 }
             }) { IsBackground = true }.Start();
@@ -472,18 +481,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch { }
         }
 
-        private void Broadcast(List<TcpClient> clients, object lk, string json)
-        {
-            byte[] bytes = Encoding.UTF8.GetBytes(json + "\n");
-            lock (lk)
-            {
-                for (int i = clients.Count - 1; i >= 0; i--)
-                {
-                    try { clients[i].GetStream().Write(bytes, 0, bytes.Length); }
-                    catch { try { clients[i].Close(); } catch { } clients.RemoveAt(i); }
-                }
-            }
-        }
+        // Broadcast() is GONE. It wrote to the socket synchronously, inside a lock,
+        // on whatever NinjaTrader thread called it -- and OnMarketDepth calls it
+        // 339 times a second on average (peak 1,218/s, 7.93M messages in one RTH
+        // session). tests/ChannelTests.cs shows the consequence: with a consumer
+        // that stops reading, the producer thread is STUCK inside Write() after
+        // 791 messages, under 2.5 seconds of real depth. Use marketCh/brokerCh.
     }
 
     // ── minimal flat-object JSON reader (NT8 ships no JSON); same file, same

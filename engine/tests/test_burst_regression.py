@@ -20,6 +20,21 @@ from engine.core.live_engine import LiveEngine
 from engine.core.orders import Order
 from engine.core.risk import RiskConfig, RiskSupervisor
 
+
+async def _until(pred, timeout=15.0):
+    """Wait for a CONDITION, never a duration. wait_idle() alone races: a fill
+    still has to round-trip the broker socket, and a quiet window can elapse while
+    it is in flight -- the test then 'passes' a fill short (~1 run in 3, worse
+    under load). These tests guard the 2026-07-09 runaway, so a version that can
+    pass while the engine did LESS than expected is worse than no test."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while loop.time() < end:
+        if pred():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"condition never met within {timeout}s")
+
 NS = 1_000_000_000
 
 
@@ -102,6 +117,12 @@ def test_burst_cannot_oscillate():
         # on its own. Wait on the engine's OWN progress, never on a clock.
         _t = asyncio.create_task(eng.run())
         await eng.wait_idle(timeout=15)
+        # wait_idle() alone races: the flatten's fill still has to round-trip the
+        # broker socket, and a quiet window can elapse while it is in flight -- the
+        # test then "passes" a fill short (~1 run in 3, worse under load). Wait on
+        # the CONDITION. This guards the 2026-07-09 pathology, so a version of it
+        # that can pass while the engine did less than expected is worse than none.
+        await _until(lambda: len(s.fills) >= 2)     # entry + the ONE flatten
         eng._stop.set()
         await asyncio.wait_for(_t, timeout=15)
         msrv.close()
@@ -169,6 +190,12 @@ def test_rate_limit_stops_tick_refire():
         # on its own. Wait on the engine's OWN progress, never on a clock.
         _t = asyncio.create_task(eng.run())
         await eng.wait_idle(timeout=15)
+        # wait_idle() alone races: the flatten's fill still has to round-trip the
+        # broker socket, and a quiet window can elapse while it is in flight -- the
+        # test then "passes" a fill short (~1 run in 3, worse under load). Wait on
+        # the CONDITION. This guards the 2026-07-09 pathology, so a version of it
+        # that can pass while the engine did less than expected is worse than none.
+        await _until(lambda: len(submitted) >= 3)   # rate limit lets 3 through
         eng._stop.set()
         await asyncio.wait_for(_t, timeout=15)
         msrv.close()

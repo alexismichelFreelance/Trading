@@ -54,7 +54,21 @@ class Sleeve:
         self.positions.append(e)
 
 
-def _run(sleeves, extra_broker_lines=None):
+async def _until(pred, timeout=10.0):
+    """Wait for a CONDITION, never for a duration. wait_idle() alone races here:
+    the last order's fill has to round-trip through the broker socket, and a quiet
+    window can elapse while it is still in flight — the test then 'passes' with a
+    fill missing (this was intermittent, ~1 run in 3, before this wait existed)."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while loop.time() < end:
+        if pred():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"condition never met within {timeout}s")
+
+
+def _run(sleeves, extra_broker_lines=None, until=None):
     msgs = [{"t": "trade", "ts": (i + 1) * NS, "price": 5000.0 + i, "size": 1,
              "aggressor": 1} for i in range(4)]
 
@@ -96,6 +110,8 @@ def _run(sleeves, extra_broker_lines=None):
         # on its own. Wait on the engine's OWN progress, never on a clock.
         _t = asyncio.create_task(eng.run())
         await eng.wait_idle(timeout=10)
+        if until is not None:
+            await _until(until)          # every expected fill has landed
         eng._stop.set()
         await asyncio.wait_for(_t, timeout=10)
         msrv.close()
@@ -121,7 +137,7 @@ def test_reduce_only_dropped_when_flat_and_clamped_when_oversized():
     s = Sleeve({1: Order("ES", SELL, 5, tag="ghost-flat", reduce_only=True),
                 2: Order("ES", BUY, 1, tag="entry"),
                 3: Order("ES", SELL, 3, tag="exit", reduce_only=True)})
-    eng, blot = _run([s])
+    eng, blot = _run([s], until=lambda: len(s.fills) >= 2)
     sizes = [f.size for f in s.fills]
     assert sizes == [1, -1]                           # drop, fill +1, clamp -3 -> -1
     assert eng.strategy_position(s) == 0

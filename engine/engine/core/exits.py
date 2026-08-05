@@ -216,11 +216,19 @@ class TwoPhaseExit(ExitRule):
                      no give-back. This is what preserves the tail: 5 of 41
                      trades were 63% of all available P&L, and every uniform
                      rule tested destroyed exactly those.
-    ARM              MFE >= arm_mult x the SESSION'S OWN typical move. Scaled by
-                     the market, so it means the same thing on a quiet ES day and
-                     a wild NQ one. Arming on a multiple of the trade's own risk
-                     instead was tested and FAILED out-of-sample -- it improved
-                     totals while damaging the tail, i.e. the old mistake.
+    ARM              MFE >= arm_mult x a trailing typical move (see `unit`).
+                     Arming on a multiple of the trade's own risk instead was
+                     tested and FAILED out-of-sample -- it improved totals while
+                     damaging the tail, i.e. the old mistake.
+                     Do NOT read this as "the session's typical move". The ruler
+                     is built from the trailing `vol_win` minutes, which at the
+                     open is ~10 hours and therefore almost entirely OVERNIGHT.
+                     Measured on 30 ES sessions, the overnight typical move runs
+                     1.6-2.8x smaller than the RTH one, and NO estimator
+                     available at 09:30 predicted the RTH value (R^2 ~ 0.01 for
+                     overnight range, overnight typical move, and this trailing
+                     window alike; a lookahead estimator gets 0.42-0.60). So the
+                     ruler sets a level, it does not forecast the day.
     PHASE 2 PROTECT  watch for the move ending and leave while still a good
                      winner.
 
@@ -232,30 +240,82 @@ class TwoPhaseExit(ExitRule):
                achieved -- it has gone sideways into a range of no interest.
         retrace gives back `rev_f` of the run AFTER arming (never before).
 
-    Measured, both samples, thresholds refitted to nothing:
-        in-sample  29 live ES trades : total +$15,602, tail +$13,825, 8 armed
-        out-of-sample 15 ESM5 sessions: total  +$8,188, tail    +$425, 65 armed
-    Sign held on both measures across a different contract and year. The size of
-    the tail benefit did NOT replicate, so treat the magnitude as unknown.
+    EVIDENCE -- READ THIS BEFORE TRUSTING arm_mult=12.
+    The earlier results (in-sample 29 live ES trades +$15,602; out-of-sample 15
+    ESM5 sessions +$8,188) were measured with a ruler this class no longer uses:
+    it was computed over each session's WHOLE set of bars, including bars after
+    the trade. That is lookahead, and it is favourable lookahead -- on a day that
+    turned out volatile the unit is larger, so arming happens later and the rule
+    rides longer, exactly on the big-move days that carry the result. Those two
+    numbers do not describe this code and are NOT evidence for it.
+
+    What HAS been re-measured causally (tools/exit_causal_sweep.py, ~165 replay
+    round-trips each on ESH5 and ESM5, both rulers, arming distance swept 0.5 to
+    1200 points):
+
+      1. The adaptive ruler never beats a fixed distance. Matched on how many
+         trades arm, `arm_pts` won every ESH5 cell (+$50.5k vs +$43.2k at ~66
+         armed; +$56.0k vs +$28.3k at ~50) and tied on ESM5. That is what an
+         estimator with R^2 ~ 0.01 is worth: the day-to-day wobble in the ruler
+         is noise, and noise in a threshold is worse than a constant.
+      2. In POINTS the two contracts agree: both peak at 24-32 ES points of
+         arming distance, improving total AND tail, and fall away on both sides.
+         Read in multiplier space that same curve looked like an unbounded ramp,
+         because the two rulers differ ~19x in scale -- 12x meant 3 points in a
+         tick-fed sleeve and 57 in a bar-fed one, on opposite sides of the peak.
+
+    STILL NOT VALIDATED. Two contracts, 15 sessions each, and the 24-32pt band
+    was read off these same curves, so it is in-sample. It is also ES points and
+    will not port to NQ unscaled. The roster therefore carries several arming
+    distances at once and lets the forward record choose, rather than baking in
+    a number fitted to 30 sessions.
     """
     kind, tag = THESIS, "twophase"
 
     def __init__(self, arm_mult: float = 12.0, rev_kind: str = "decay",
-                 rev_f: float = 0.1, win: int = 30, vol_win: int = 600) -> None:
+                 rev_f: float = 0.1, win_min: int = 30, vol_win_min: int = 600,
+                 arm_pts: float | None = None) -> None:
+        """`arm_pts` arms at a FIXED distance in points and ignores the ruler
+        entirely. Measured better than the ruler at matched arm rate (see
+        EVIDENCE), and it is defined from the first tick of a session -- the
+        ruler is not, so a ruler-based sleeve simply cannot arm early in a day.
+        Set one or the other; `arm_pts` wins when both are given."""
         self.arm_mult, self.rev_kind, self.rev_f = arm_mult, rev_kind, rev_f
-        self.win, self.vol_win = win, vol_win
-        self._vol: list[float] = []
+        self.arm_pts = arm_pts
+        self.win, self.vol_win = win_min, vol_win_min
+        self._vol: list[float] = []          # one close per MINUTE, not per call
+        self._last_min = -1
         self.reset()
 
-    # the session's own scale, kept from the price stream the sleeve sees
-    def note_price(self, px: float) -> None:
+    # The market's own scale, on a fixed one-minute grid.
+    #
+    # `ts` is REQUIRED. It used to be a bare price appended once per call, so
+    # `vol_win=600` meant 600 *samples* -- which is 600 minutes (10 hours) in a
+    # sleeve that feeds it from on_bar, and about thirty SECONDS in one that
+    # feeds it from on_trade. Same parameter, 50x apart, and the trade-fed
+    # sleeve armed after 3 points instead of 42, which deletes the ride phase
+    # that the whole rule exists to protect. Bucketing by minute makes `win` and
+    # `vol_win` mean minutes no matter which callback a sleeve wires up, and
+    # making `ts` mandatory means a sleeve that forgets fails loudly at the call
+    # instead of silently running a different rule.
+    def note_price(self, px: float, ts: int) -> None:
+        m = int(ts) // 60_000_000_000
+        if m == self._last_min and self._vol:
+            self._vol[-1] = px               # same minute -> running close
+            return
+        self._last_min = m
         self._vol.append(px)
         if len(self._vol) > self.vol_win:
             del self._vol[0]
 
     def unit(self) -> float:
-        """Median absolute move over `win` samples -- the market's own ruler.
-        Median, not std, so one spike cannot set the scale."""
+        """Median absolute move over `win` MINUTES -- the market's own ruler.
+        Median, not std, so one spike cannot set the scale. Deliberately spans
+        the overnight: at 09:30 a 600-minute window is ~10 hours and is
+        therefore an overnight estimate. Measured on 30 ES sessions, the
+        overnight typical move runs 1.6-2.8x SMALLER than the RTH one, and no
+        causal estimator predicted the RTH value (R^2 ~ 0.01), so this is a
+        level, not a forecast -- do not read `arm_mult` as adaptive."""
         n = len(self._vol)
         if n <= self.win:
             return 0.0
@@ -281,9 +341,15 @@ class TwoPhaseExit(ExitRule):
         i = len(self._adv) - 1
         if adv > self._peak:
             self._peak, self._peak_i = adv, i
-        u = self._unit_at_entry or self.unit()
         if not self.armed:
-            if u <= 0 or self._peak < self.arm_mult * u:
+            if self.arm_pts is not None:
+                need = self.arm_pts
+            else:
+                u = self._unit_at_entry or self.unit()
+                if u <= 0:
+                    return None                  # no ruler yet -> cannot arm
+                need = self.arm_mult * u
+            if self._peak < need:
                 return None                      # PHASE 1: ride, untouched
             self.armed = True
             return None

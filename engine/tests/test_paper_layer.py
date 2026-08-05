@@ -42,7 +42,21 @@ class Sleeve:
         self.positions.append(e)
 
 
-def _run(strategies, live_owners, place_sink):
+async def _until(pred, timeout=10.0):
+    """Wait for a CONDITION, never a duration. wait_idle() alone races: the last
+    order's fill still has to traverse the paper path, and a quiet window can
+    elapse while it is in flight -- the test then 'passes' a fill short (~1 run in
+    3, worse under load)."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while loop.time() < end:
+        if pred():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"condition never met within {timeout}s")
+
+
+def _run(strategies, live_owners, place_sink, until=None):
     msgs = [{"t": "trade", "ts": (i + 1) * NS, "price": 5000.0 + i, "size": 1,
              "aggressor": 1} for i in range(4)]
 
@@ -84,6 +98,8 @@ def _run(strategies, live_owners, place_sink):
         # on its own. Wait on the engine's OWN progress, never on a clock.
         _t = asyncio.create_task(eng.run())
         await eng.wait_idle(timeout=10)
+        if until is not None:
+            await _until(lambda: until(papers))
         eng._stop.set()
         await asyncio.wait_for(_t, timeout=10)
         msrv.close()
@@ -116,7 +132,8 @@ def test_paper_reduce_only_clamps_against_own_book():
     # paper sleeve: buy 1, then try to sell 5 reduce_only -> clamps to 1 (flat)
     paper = Sleeve({1: Order("ES", BUY, 1, tag="p-entry"),
                     2: Order("ES", SELL, 5, tag="p-exit", reduce_only=True)})
-    eng, papers = _run([paper], live_owners=set(), place_sink=[])
+    eng, papers = _run([paper], live_owners=set(), place_sink=[],
+                       until=lambda p: len(p) >= 2)
     assert [f.size for f in papers] == [1, -1]            # +1 then clamped -1
     assert eng.strategy_position(paper) == 0
 

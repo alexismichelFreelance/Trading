@@ -83,7 +83,15 @@ class ZoneDetector:
 
     def update(self, bar: Bar) -> list[Zone]:
         """Feed a closed 30m bar; return any zones formed (gap and/or
-        base->departure). A gap zone forms on the first bar of a new session."""
+        base->departure). A gap zone forms on the first bar of a new session.
+
+        NOTE: bars now carry `complete` (see features/bars.py). Truncated bars
+        are still admitted here. Skipping them is plausible -- a short bar drags
+        avg_r down and lowers the 1.4x departure bar for everything after it --
+        but that mechanism has only been shown on synthetic data, and gating on
+        it changes a parity-gated detector. Validate against real outage days
+        before acting on it.
+        """
         zones: list[Zone] = []
         # GAP zone: first bar of a new RTH session, |open - prior close| >= thr
         if self.gap_thr > 0:

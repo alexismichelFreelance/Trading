@@ -42,7 +42,10 @@ from tools.sweep_replication import load_day                    # noqa: E402
 
 TICK = 0.25
 SPANS = [3, 4, 6, 8, 10]
-HOLDS = [5, 15, 30, 60]
+# Widened: the live sleeve holds 15s and 55% of its exits are the TIMEOUT,
+# i.e. the target almost never lands inside the window. So test whether the
+# window is simply wrong before redesigning the exit.
+HOLDS = [2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300]
 
 
 def clusters(ts_ns, side, px, sz, dt_ms=1):

@@ -47,7 +47,8 @@ from tools.flow_replication import session_days                  # noqa: E402
 from tools.run_live import ALL_LABELS, _make                     # noqa: E402
 
 _MIN_NS = 60 * 1_000_000_000
-POINT_USD = 50.0        # ES; NQ lanes would pass their own
+POINT_USD = 50.0        # ES
+POINT_USD_OF = {"ES": 50.0, "NQ": 20.0, "ESM5": 50.0, "ESH5": 50.0}
 
 # Reloading ~540k mbo_events rows per run took 257s and is what put QuestDB down
 # on 2026-07-28. Each session is fetched ONCE and parked on disk after that.
@@ -80,13 +81,13 @@ class NullBroker:
         raise AssertionError("portfolio replay is paper-only; nothing routes live")
 
 
-def load_events(qdb: QuestDB, symbol: str, day: str) -> list:
+def load_events(qdb: QuestDB, symbol: str, day: str, source: str = "mbo") -> list:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cf = CACHE_DIR / f"{symbol}_{day}.npz"
+    cf = CACHE_DIR / f"{symbol}_{day}{'_live' if source == 'live' else ''}.npz"
     if cf.exists():
         z = np.load(cf)
         return _events_from(pd.DataFrame({k: z[k] for k in z.files}), symbol)
-    df = _fetch(qdb, symbol, day)
+    df = _fetch_live(qdb, symbol, day) if source == "live" else _fetch(qdb, symbol, day)
     if df is not None and len(df):
         np.savez_compressed(cf, **{c: df[c].to_numpy() for c in df.columns})
         return _events_from(df, symbol)
@@ -151,6 +152,56 @@ def _fetch(qdb: QuestDB, symbol: str, day: str):
     return rows.sort_values("ts").reset_index(drop=True)
 
 
+def _fetch_live(qdb: QuestDB, symbol: str, day: str):
+    """Same shape as _fetch, but from the LIVE capture tables (claude_ticks_live /
+    claude_bars_live, symbol 'ES'/'NQ') instead of mbo_events + claude_bars_1m.
+
+    This exists to REBUILD claude_paper_fills. Until 2026-07-29 a live paper fill
+    was stamped from the wall clock while priced from the event stream, so 51% of
+    the recorded rows held a price the market never traded in the minute claimed
+    (tools/paper_audit.py). The captured market data was never affected -- bars
+    are complete for every session, zero missing trading minutes -- so the record
+    is regenerable: replay the real tape through the same LiveEngine under an
+    EventClock, where clock.set() actually works and every fill is stamped by the
+    event that priced it.
+    """
+    tr = qdb.df("SELECT ts, price, size, aggressor FROM claude_ticks_live "
+                f"WHERE symbol='{symbol}' "
+                f"AND ts >= '{day}T00:00:00.000000Z' "
+                f"AND ts <  '{day}T23:59:59.999999Z' ORDER BY ts")
+    br = qdb.df("SELECT ts,o,h,l,c,vol FROM claude_bars_live "
+                f"WHERE symbol='{symbol}' "
+                f"AND ts >= '{day}T00:00:00.000000Z' "
+                f"AND ts <  '{day}T23:59:59.999999Z' ORDER BY ts")
+    if tr.empty and br.empty:
+        return None
+    parts = []
+    if len(tr):
+        parts.append(pd.DataFrame({
+            "ts": pd.to_datetime(tr["ts"]).astype("int64"),
+            "kind": 1,
+            "a": tr["price"].astype(float),
+            "b": tr["size"].astype(float),
+            "c": tr["aggressor"].astype(float),
+            "d": 0.0, "e": 0}))
+    if len(br):
+        # NO +_MIN_NS here, unlike _fetch. The two bar tables use OPPOSITE
+        # timestamp conventions, verified by joining each to its own tick source
+        # at offsets -2..+2 minutes:
+        #   claude_bars_1m   (research) ts = bar OPEN  -> needs +1min to emit at
+        #                    close (offset 0 puts 0/71,940 ESM5 ticks outside)
+        #   claude_bars_live (capture)  ts = bar CLOSE -> already correct
+        #                    (offset +1 puts 1/53,546 ES ticks outside; offset 0
+        #                     leaves 34% out)
+        # Adding a minute here shifted every bar-driven fill one minute late.
+        parts.append(pd.DataFrame({
+            "ts": pd.to_datetime(br["ts"]).astype("int64"),
+            "kind": 0, "a": br["o"].astype(float), "b": br["h"].astype(float),
+            "c": br["l"].astype(float), "d": br["c"].astype(float),
+            "e": br["vol"].astype(int)}))
+    return pd.concat(parts, ignore_index=True).sort_values("ts").reset_index(drop=True)
+
+
 def pnl_of(fills, point_usd: float) -> float:
     pos, cost, real = 0, 0.0, 0.0
     for f in fills:
@@ -170,9 +221,9 @@ def pnl_of(fills, point_usd: float) -> float:
     return real * point_usd
 
 
-async def run_day(qdb, symbol, day, labels, peer_map):
-    ev = load_events(qdb, symbol, day)
-    if len(ev) < 10_000:
+async def run_day(qdb, symbol, day, labels, peer_map, source="mbo", min_events=10_000):
+    ev = load_events(qdb, symbol, day, source)
+    if len(ev) < min_events:
         return None
     strats = []
     for lb in labels:
@@ -182,7 +233,8 @@ async def run_day(qdb, symbol, day, labels, peer_map):
             s.peer_exit = tuple(f"{symbol}:{p}" for p in peer_map[lb])
         strats.append(s)
     eng = LiveEngine(HistFeed(ev), NullBroker(), strats, EventClock(),
-                     Blotter(symbol, POINT_USD), warmup_gate=False,
+                     Blotter(symbol, POINT_USD_OF.get(symbol, POINT_USD),
+                             ), warmup_gate=False,
                      live_owners=set())        # set() = every sleeve is PAPER
     await eng.run()
     by = {}
@@ -245,13 +297,50 @@ def report(rows, symbol, point_usd, labels):
     print("=" * 84 + "\n")
 
 
-async def main_async(symbol, ndays, peer_map):
+def _live_days(qdb: QuestDB, symbol: str) -> list[str]:
+    """ET session dates that actually have live capture for this instrument."""
+    b = qdb.df("SELECT ts FROM claude_bars_live "
+               f"WHERE symbol='{symbol}' ORDER BY ts")
+    if b.empty:
+        return []
+    t = pd.to_datetime(b.ts, utc=True).dt.tz_convert("America/New_York")
+    return sorted(t.dt.strftime("%Y-%m-%d").unique())
+
+
+def _select(only: str) -> list[str]:
+    """Which sleeves to replay.
+
+    Running all 36 costs ~8M no-op callbacks per session for the bar-only
+    sleeves, because every one of ~0.5-1.3M tick events is dispatched to every
+    strategy. Validating one sleeve family should not pay for the other 32:
+    a 50-day ESM5 run over the April 2025 crash days took 19 HOURS all-in.
+
+    --labels accepts exact names or prefixes, comma separated:
+        --labels trendjoin          every trendjoin* variant
+        --labels ibs,rsi2           just the swing sleeves
+    """
+    base = [lb for lb in ALL_LABELS if lb not in ("flow_fixed",)]
+    if not only:
+        return base
+    want = [w.strip() for w in only.split(",") if w.strip()]
+    sel = [lb for lb in base if lb in want or any(lb.startswith(w) for w in want)]
+    if not sel:
+        raise SystemExit(f"--labels {only!r} matched nothing. available: "
+                         + ", ".join(base))
+    return sel
+
+
+async def main_async(symbol, ndays, peer_map, source="mbo", only=""):
     qdb = QuestDB(timeout=240.0)
-    labels = [lb for lb in ALL_LABELS if lb not in ("flow_fixed",)]
+    labels = _select(only)
     rows, allflat = [], []
-    for d in session_days(symbol, None, None)[-ndays:]:
+    days = (_live_days(qdb, symbol) if source == "live"
+            else session_days(symbol, None, None))
+    # live capture has far fewer events than mbo_events; do not skip real days
+    minev = 500 if source == "live" else 10_000
+    for d in days[-ndays:]:
         try:
-            r = await run_day(qdb, symbol, d, labels, peer_map)
+            r = await run_day(qdb, symbol, d, labels, peer_map, source, minev)
         except Exception as ex:                       # noqa: BLE001
             print(f"  {d}: FAILED {type(ex).__name__}: {str(ex)[:70]}", flush=True)
             continue
@@ -264,17 +353,24 @@ async def main_async(symbol, ndays, peer_map):
     if not rows:
         raise SystemExit("no sessions replayed")
     if allflat:
-        out = ROOT / ".cache" / f"replay_fills_{symbol}.csv"
+        out = ROOT / ".cache" / f"replay_fills_{symbol}{'_live' if source=='live' else ''}.csv"
         out.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(allflat).to_csv(out, index=False)
         print(f"\n  wrote {len(allflat)} replay fills -> {out}")
-    report(rows, symbol, POINT_USD, labels)
+    report(rows, symbol, POINT_USD_OF.get(symbol, POINT_USD), labels)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="ESM5")
     ap.add_argument("--days", type=int, default=5)
+    ap.add_argument("--source", choices=("mbo", "live"), default="mbo",
+                    help="'live' rebuilds from claude_ticks_live/claude_bars_live "
+                         "(symbol ES/NQ) -- use this to regenerate the corrupted "
+                         "claude_paper_fills record")
+    ap.add_argument("--labels", default="",
+                    help="replay only these sleeves (exact names or prefixes, "
+                         "comma separated). Default: the whole roster.")
     ap.add_argument("--peer-exit", default="",
                     help="sleeve:peer1|peer2,... e.g. sweepfade:onbreak|opendrive")
     a = ap.parse_args()
@@ -282,7 +378,7 @@ def main() -> None:
     for part in filter(None, a.peer_exit.split(",")):
         k, _, v = part.partition(":")
         pm[k] = [x for x in v.split("|") if x]
-    asyncio.run(main_async(a.symbol, a.days, pm))
+    asyncio.run(main_async(a.symbol, a.days, pm, a.source, a.labels))
 
 
 if __name__ == "__main__":

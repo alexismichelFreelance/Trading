@@ -74,6 +74,11 @@ class Bar:
     c: float
     v: int
     symbol: str = ""
+    # False when this bar covers LESS than its timeframe: an aggregated bucket
+    # that lost inputs to a feed outage or the 17:00-18:00 ET halt, or a partial
+    # first/last bucket. A 30m zone drawn off ten minutes of data is not a 30m
+    # zone. Defaulted True so every existing construction site is unchanged.
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)

@@ -127,7 +127,12 @@ def _gamma_or_none(symbol: str):
     not an NQ/GC signal. Fail-open: no GEX table / busy DB -> None (variant
     trades raw). One shared instance; short timeout so a busy QuestDB never
     stalls session startup."""
-    if symbol != "ES":
+    # root_symbol, not a literal match: 'ESM5' and 'ESH5' ARE ES, and matching
+    # the bare string silently gave them NO gate. Every 2025 replay therefore ran
+    # its *_gex twins byte-identical to the raw ones -- which is why the gamma
+    # result could not be validated out-of-sample: the wire was never connected.
+    from engine.core.config import root_symbol
+    if root_symbol(symbol) != "ES":
         return None
     if "ES" not in _GAMMA_CACHE:
         from engine.adapters.questdb import QuestDB
@@ -138,6 +143,19 @@ def _gamma_or_none(symbol: str):
             print(f"  (*_gex variants trade RAW: GammaRegime unavailable: {ex})")
             _GAMMA_CACHE["ES"] = None
     return _GAMMA_CACHE["ES"]
+
+
+def _spec(symbol: str):
+    """InstrumentSpec for `symbol`, resolving contract months to their root
+    ('ESM5' -> ES). Returns a stub with an empty `extra` when the instrument is
+    not in the registry, so a missing entry falls back to the coded default
+    rather than taking the engine down at startup."""
+    from engine.core.config import root_symbol
+    spec = INSTRUMENTS.get(root_symbol(symbol))
+    if spec is None:
+        log.warning("no instrument spec for %s; using coded defaults", symbol)
+        return type("_Stub", (), {"extra": {}})()
+    return spec
 
 
 def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
@@ -171,18 +189,31 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     if label == "opendrive_orb":     # cleverer: opening-range break, refuses the
         return OpenDriveStrategy(symbol, mode="orb", gamma=_gamma_or_none(symbol))
         # counter-gamma break (short gamma -> won't buy the up-fakeout)
-    # RIDE-then-PROTECT twins. Only exit strategy that survived out-of-sample:
-    # ride untouched until MFE >= 12x the session's own typical move, then leave
-    # on momentum death / range formation. In-sample +$15,602 total and +$13,825
-    # on the tail-5; out-of-sample (15 ESM5 sessions, nothing refitted) +$8,188
-    # and +$425. Sign held on both measures; magnitude did not, so these run as
-    # PAPER twins beside the originals and the record decides.
+    # RIDE-then-PROTECT twins: ride untouched, then leave on momentum death /
+    # range formation / retrace. Two families, because the arming rule is the
+    # open question and the record should settle it, not me:
+    #   _2p*      arm on 12x a trailing volatility ruler (the original)
+    #   _2pN      arm at a FIXED N points
+    # Measured on ~165 replay round-trips each of ESH5 and ESM5, arming distance
+    # swept 0.5-1200pt: the fixed distance beat the ruler at matched arm rate on
+    # every ESH5 cell and tied on ESM5, and both contracts peaked at 24-32 ES
+    # points improving total AND tail. That band was read off those same curves
+    # (in-sample, 30 sessions) so 16/24/32 all run and none is privileged.
     if label == "opendrive_2p":
         return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "decay", 0.1))
     if label == "opendrive_2p_range":
         return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "range", 0.25))
     if label == "opendrive_2p_retrace":   # strongest OOS variant
         return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
+    if label == "opendrive_2p16":
+        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=16.0))
+    if label == "opendrive_2p24":
+        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=24.0))
+    if label == "opendrive_2p32":
+        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=32.0))
     if label == "flow":              # adaptive z-score threshold (scale-invariant)
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
                                      gate_utc=FLOW_GATE)
@@ -217,10 +248,32 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return VwapBreakStrategy(symbol)
     if label == "vwapbreak_gex":     # variant: breaks only on short-gamma days
         return VwapBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
+    if label == "vwapbreak_2p":      # ride-then-protect twin (gave back 142.25pt)
+        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(12.0, "decay", 0.1))
+    if label == "vwapbreak_2p_retrace":
+        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
+    if label == "vwapbreak_2p24":    # fixed-distance arming (see opendrive_2pN)
+        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=24.0))
+    if label == "vwapbreak_2p32":
+        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=32.0))
     if label == "onbreak":           # study-motivated: overnight-range break
         return OvernightBreakStrategy(symbol)
     if label == "onbreak_gex":       # variant: breaks only on short-gamma days
         return OvernightBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
+    if label == "onbreak_2p":        # ride-then-protect twin (gave back 74.75pt)
+        return OvernightBreakStrategy(symbol,
+                                      two_phase=TwoPhaseExit(12.0, "decay", 0.1))
+    if label == "onbreak_2p_retrace":
+        return OvernightBreakStrategy(symbol,
+                                      two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
+    if label == "onbreak_2p24":      # fixed-distance arming (see opendrive_2pN)
+        return OvernightBreakStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=24.0))
+    if label == "onbreak_2p32":
+        return OvernightBreakStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=32.0))
     if label == "sweepfade":         # MBO-derived: fade deep aggressive sweeps
         return SweepFollowStrategy(symbol, min_span_ticks=6, hold_s=15.0)
     if label == "sweepfade_deep":    # higher conviction, fewer signals
@@ -228,6 +281,32 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     if label == "sweepfollow":       # measured LOSER; paper twin as the control
         return SweepFollowStrategy(symbol, min_span_ticks=6, hold_s=15.0,
                                    mode="follow")
+    if label == "rsi2":              # Connors RSI(2), the IBS satellite
+        from engine.strategies.rsi2_swing import RSI2SwingStrategy
+        return RSI2SwingStrategy(symbol)
+    if label.startswith("trendjoin"):
+        from engine.core.exits import TwoPhaseExit
+        from engine.strategies.trend_join import TrendJoinStrategy
+        # Sizing comes from the instrument registry, not from ES numbers copied
+        # onto NQ: 15pt is 23% of an ES range (no discrimination -- small legs
+        # still reach it 97% of the time) and utterly meaningless on NQ, which
+        # ranges ~7x wider. See config/instruments.yaml trend_join.
+        tj = (_spec(symbol).extra.get("trend_join") or {})
+        conf = float(tj.get("conf_pts", 27.0))
+        stop = float(tj.get("stop_pts", 6.0))
+        if label == "trendjoin":                 # clock exit -- the control
+            return TrendJoinStrategy(symbol, conf_pts=conf, stop_pts=stop)
+        if label == "trendjoin_narrow":          # half the confirmation
+            return TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+        if label in ("trendjoin_2p24", "trendjoin_2p32"):
+            # arming distance in the SAME units as conf, scaled per instrument
+            f = 0.9 if label.endswith("24") else 1.2
+            return TrendJoinStrategy(symbol, conf_pts=conf, stop_pts=stop,
+                                     two_phase=TwoPhaseExit(
+                                         rev_kind="retrace", rev_f=0.25,
+                                         arm_pts=conf * f))
+        raise SystemExit(f"unknown trendjoin variant '{label}'")
+
     raise SystemExit(f"unknown strategy '{label}'")
 
 
@@ -256,10 +335,18 @@ FLOW_GATE = (13, 20)          # 09:00 -> 16:00 ET
 # every strategy + variant — the full paper roster (--paper all)
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "opendrive_gex", "opendrive_orb", "flow", "flow_fixed", "flow_gex",
-              "zones", "zones_gap", "dipbuy", "dipbuy_gex", "ibs", "ibs_gex",
+              "zones", "zones_gap", "ibs", 
               "pivot", "vwapbreak", "vwapbreak_gex", "onbreak", "onbreak_gex",
-              "sweepfade", "sweepfade_deep", "sweepfollow",
-              "opendrive_2p", "opendrive_2p_range", "opendrive_2p_retrace")
+              "rsi2", "trendjoin", "trendjoin_narrow",
+              "trendjoin_2p24", "trendjoin_2p32",
+              "opendrive_2p", "opendrive_2p_range", "opendrive_2p_retrace",
+              "onbreak_2p", "onbreak_2p_retrace",
+              "vwapbreak_2p", "vwapbreak_2p_retrace",
+              # fixed-distance arming twins — the variant that measured better
+              # than the volatility ruler; 16/24/32pt all run, none privileged
+              "opendrive_2p16", "opendrive_2p24", "opendrive_2p32",
+              "onbreak_2p24", "onbreak_2p32",
+              "vwapbreak_2p24", "vwapbreak_2p32")
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):

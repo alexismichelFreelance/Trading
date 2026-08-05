@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from ..core.events import Bar
 from ..core.orders import Order
-from ..core.timeutil import ns_to_utc
+from ..core.timeutil import et_minute_of_day, et_session_date, ns_to_utc
 from ..features.bars import BarAggregator
 from ..features.zones import ZoneDetector
 from .base import BaseStrategy
@@ -70,16 +70,34 @@ class ZoneLifecycleStrategy(BaseStrategy):
         self.zones: list[_ZoneRec] = []
         self._k = -1
         self.pos = 0
+        self._day: str | None = None
         self.trade: _Trade | None = None
         # NEW entries only inside the validated window; management always runs
         self.gate_utc = gate_utc
 
     def on_bar(self, bar: Bar) -> list[Order]:
-        # RTH-only DETECTION (matches the validated claude_bars_1m 13-21 UTC
-        # window + the methodology). Live feeds carry overnight bars; without
-        # this the live 30m zones diverge from the backtest. Replay bars are all
-        # inside 13-21 UTC, so parity is unaffected.
-        if not (13 <= ns_to_utc(bar.ts).hour < 21):
+        # SESSION BOUNDARY. This sleeve had none: no session date, no daily
+        # reset, no end-of-day flat. Its only exit bound was K_BARS bars, so a
+        # late entry rode through the close, through the 17:00 ET Globex halt and
+        # into the next session -- while carrying the LARGEST position in the
+        # roster (it is the only risk-sized sleeve, 5+ contracts).
+        day = et_session_date(bar.ts)
+        if day != self._day:
+            self._day = day
+            self.trade = None            # a new session starts flat and fresh
+        if self.session_over(bar.ts) and self.pos != 0:
+            d = 1 if self.pos > 0 else -1
+            qty, self.trade = abs(self.pos), None
+            return [Order(self.symbol, -d, qty, tag="session-flat", reduce_only=True)]
+        # RTH-only DETECTION (matches the validated claude_bars_1m window + the
+        # methodology). Live feeds carry overnight bars; without this the live 30m
+        # zones diverge from the backtest.
+        # Expressed in ET, not UTC hours: 13-21 UTC is 09:00-17:00 ET in summer
+        # but 08:00-16:00 ET in winter, so the detection window silently shifted
+        # by an hour at each DST change. The 2025 parity data is all EDT, so this
+        # is identical there.
+        m = et_minute_of_day(bar.ts)
+        if not (9 * 60 <= m < 17 * 60):
             return []
         orders: list[Order] = []
         for b in self.agg.update(bar):

@@ -84,7 +84,7 @@ class OpenDriveStrategy(BaseStrategy):
     # ── core logic ───────────────────────────────────────────────────────
     def _step(self, ts: int, px: float) -> list[Order]:
         if self.two_phase is not None:
-            self.two_phase.note_price(px)
+            self.two_phase.note_price(px, ts)   # per-TRADE here; minute-bucketed
         t = et(ts)
         mod = t.hour * 60 + t.minute
         day = et_session_date(ts)

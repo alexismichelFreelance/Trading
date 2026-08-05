@@ -145,9 +145,29 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        private static DateTime FromNs(double ns)
+        // Engine timestamps are nanoseconds since the UNIX epoch, UTC. NT8 places
+        // a drawing by matching this DateTime against the BAR timestamps, and
+        // those carry the instrument's TRADING-HOURS timezone (ET for ES/NQ) --
+        // NOT the machine's.
+        //
+        // This used to end in .ToLocalTime(), which converts to whatever zone the
+        // PC is set to. On a UTC+2 machine every mark landed 6 hours right of the
+        // trade: opendrive's 10:00 ET entry was drawn at 16:00, a 14:28 ET fill at
+        // 20:28 -- at or past the right edge of an RTH chart. The FILLS were
+        // always correct and in-session; only the picture was wrong, which is the
+        // worse failure, because it makes a working sleeve look like it fires at
+        // absurd times and there is nothing in the data to contradict it.
+        //
+        // Falls back to the machine zone only if the chart has no trading-hours
+        // template, which should not happen on a real instrument.
+        private DateTime FromNs(double ns)
         {
-            return Epoch.AddTicks((long)(ns / 100.0)).ToLocalTime();
+            DateTime utc = Epoch.AddTicks((long)(ns / 100.0));
+            TimeZoneInfo tz = (Bars != null && Bars.TradingHours != null
+                               && Bars.TradingHours.TimeZoneInfo != null)
+                              ? Bars.TradingHours.TimeZoneInfo
+                              : TimeZoneInfo.Local;
+            return TimeZoneInfo.ConvertTimeFromUtc(utc, tz);
         }
 
         private Brush BrushOf(string spec, Brush fallback)
