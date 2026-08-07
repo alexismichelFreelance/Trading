@@ -259,3 +259,76 @@ def test_manual_fill_is_redrawn():
     arrows = [m for m in p._w.lines if m.get("kind") == "arrow"]
     assert arrows and arrows[-1]["dir"] == -1
     assert "eng-manual-1" in pc._arrows          # remembered so it stays on top
+
+
+# ── zone RTH gate: ET minutes, not UTC hours ────────────────────────────────
+#
+# 2026-08-06: a zone appeared on the chart at 15:00 chart time every day. The
+# painter gated intraday zones with
+#
+#     RTH_LO, RTH_HI = 13, 21
+#     elif RTH_LO <= ns_to_utc(bar.ts).hour < RTH_HI:
+#
+# UTC HOURS. 13:00 UTC is 09:00 ET -- half an hour BEFORE the open -- so the
+# first 30m bucket was built from pre-open bars the methodology excludes, and
+# drew at 15:00 on a UTC+2 chart. The upper bound 21 is 17:00 ET, an hour past
+# the close. And being a fixed UTC hour it slides by an hour at every DST
+# change while the session does not.
+#
+# Everything else in the codebase gates on et_minute_of_day for exactly this
+# reason. The painter was the last place doing it by UTC hour.
+
+def _bar_at(et_str, tf="1m"):
+    import pandas as pd
+    from engine.core.events import Bar
+    ns = int(pd.Timestamp(et_str, tz="America/New_York").value)
+    return Bar(ns, tf, 7000.0, 7002.0, 6999.0, 7001.0, 100, "ES")
+
+
+def test_pre_open_bars_do_not_build_zones():
+    """THE REGRESSION: 09:00 ET is 13:00 UTC. It must not feed the detector."""
+    from engine.painters import ZoneView
+    zv = ZoneView()
+    fed = []
+    zv._feed = lambda tf, b: fed.append((tf, b))
+    for m in range(0, 30):                      # 09:00 -> 09:29 ET
+        zv.update(_bar_at(f"2026-08-06 09:{m:02d}"))
+    assert not fed, f"pre-open bars built {len(fed)} zone bars"
+
+
+def test_rth_bars_do_build_zones():
+    from engine.painters import ZoneView
+    zv = ZoneView()
+    fed = []
+    zv._feed = lambda tf, b: fed.append((tf, b))
+    for h in (10, 11, 12, 13, 14, 15):
+        for m in range(0, 60):
+            zv.update(_bar_at(f"2026-08-06 {h:02d}:{m:02d}"))
+    assert fed, "no zone bars built during RTH"
+
+
+def test_post_close_bars_do_not_build_zones():
+    """21 UTC = 17:00 ET let an hour of post-close tape into intraday zones."""
+    from engine.painters import ZoneView
+    zv = ZoneView()
+    fed = []
+    zv._feed = lambda tf, b: fed.append((tf, b))
+    for m in range(0, 59):                      # 16:01 -> 16:59 ET
+        zv.update(_bar_at(f"2026-08-06 16:{m:02d}"))
+    assert not fed, f"post-close bars built {len(fed)} zone bars"
+
+
+def test_gate_holds_across_a_dst_change():
+    """A fixed UTC hour shifts by one at DST; the ET session does not."""
+    from engine.painters import ZoneView
+    for day in ("2026-01-15", "2026-07-15"):    # EST and EDT
+        zv = ZoneView()
+        fed = []
+        zv._feed = lambda tf, b: fed.append((tf, b))
+        zv.update(_bar_at(f"{day} 09:00"))
+        assert not fed, f"{day}: 09:00 ET fed a zone"
+        for m in range(30, 60):
+            zv.update(_bar_at(f"{day} 09:{m:02d}"))
+        for m in range(0, 60):
+            zv.update(_bar_at(f"{day} 10:{m:02d}"))
+        assert fed, f"{day}: RTH bars fed nothing"

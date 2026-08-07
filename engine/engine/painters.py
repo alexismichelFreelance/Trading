@@ -16,14 +16,20 @@ Zones are computed on EVERY bar (so history warms up), painted only when LIVE
 from __future__ import annotations
 
 from .adapters.painter import NTChartPainter
-from .core.timeutil import ns_to_utc
+from .core.timeutil import et_minute_of_day, ns_to_utc
 from .features.bars import BarAggregator
 from .features.zones import DEMAND, ZoneBook, ZoneDetector
 
 # the validated intraday session = 13:00-21:00 UTC (what claude_bars_1m uses).
 # Intraday S/D zones are RTH-only per the methodology: overnight/Globex bars are
 # low-volume and their levels don't carry the same weight. Live must match.
-RTH_LO, RTH_HI = 13, 21
+# ET MINUTES, not UTC hours. This was `RTH_LO, RTH_HI = 13, 21` compared against
+# ns_to_utc(...).hour, i.e. 09:00-17:00 ET: half an hour of pre-open tape and a
+# full hour of post-close fed the intraday zone detectors, and a zone drew every
+# day at 15:00 on a UTC+2 chart. Being a fixed UTC hour it also slid by one at
+# every DST change while the session did not. The rest of the codebase gates on
+# et_minute_of_day; this was the last place that did not.
+RTH_LO, RTH_HI = 9 * 60 + 30, 16 * 60
 
 NS = 1_000_000_000
 
@@ -77,7 +83,7 @@ class ZoneView:
     def update(self, bar) -> None:
         if bar.tf == "1d":
             self._feed("1d", bar)
-        elif RTH_LO <= ns_to_utc(bar.ts).hour < RTH_HI:   # RTH-only intraday zones
+        elif RTH_LO <= et_minute_of_day(bar.ts) < RTH_HI:  # RTH-only intraday zones
             for b in self.agg.update(bar):
                 self._feed(b.tf, b)
 

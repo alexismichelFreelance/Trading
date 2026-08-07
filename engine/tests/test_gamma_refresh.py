@@ -97,3 +97,62 @@ def test_rollover_silent_during_warmup():
     evs = [Bar(_et_ns("2026-07-20 10:00"), "1m", 5000, 5001, 4999, 5000, 10, "ES"),
            Bar(_et_ns("2026-07-21 10:00"), "1m", 5000, 5001, 4999, 5000, 10, "ES")]
     assert _run(evs, warmup_gate=True) == []
+
+
+# ── the engine must never depend on being restarted to have current gamma ────
+#
+# The rollover hook alone is not enough, and the reasons are all silent:
+#
+#  1. it is delivered through _emit_sink, a BOUNDED queue that DROPS on overflow.
+#     One dropped callback = stale gamma for the whole session, counted in
+#     _sink_dropped and nowhere else.
+#  2. it fires at ET midnight; the gamma fetch runs at 09:00 ET. A fetch that is
+#     late, retried, or simply slower than usual lands AFTER the only reload the
+#     engine will attempt for 24 hours.
+#  3. a reload that "succeeds" only means the query ran. If the fetch failed that
+#     morning the snapshot is byte-identical and nothing says so.
+#
+# The engine is meant to run for weeks. So freshness has to be a property it
+# maintains from its own state, not an event it hopes to receive.
+
+def test_regime_knows_when_its_snapshot_cannot_answer_for_today():
+    """THE PRIMITIVE. Without this the engine cannot tell 'I have what today
+    needs' from 'I am serving a snapshot from last week'."""
+    gr = GammaRegime(_SeqQDB([_gexdf([("2026-07-17", 0.10), ("2026-08-04", 0.55)])]))
+    assert gr.needs_reload("2026-08-05") is False      # 08-04 answers for 08-05
+    assert gr.needs_reload("2026-08-12") is True       # 08-04 is too old now
+
+
+def test_a_late_fetch_is_picked_up_without_a_restart():
+    """The 09:00 ET fetch lands after midnight's reload. The engine must still
+    end up on the right value the same day -- not tomorrow, not after a restart."""
+    stale = _gexdf([("2026-08-03", 0.10)])                      # 08-04 missing
+    fresh = _gexdf([("2026-08-03", 0.10), ("2026-08-04", 0.92)])
+    gr = GammaRegime(_SeqQDB([stale, stale, fresh]))
+    assert gr.needs_reload("2026-08-11") is True                # 08-03 too old
+    gr.reload()                                                 # midnight: still stale
+    assert gr.needs_reload("2026-08-11") is True                # so it must ask again
+    gr.reload()                                                 # the fetch has landed
+    assert gr.gexp_prev("2026-08-05") == 0.92
+    assert gr.needs_reload("2026-08-05") is False
+
+
+def test_reload_reports_whether_the_data_actually_moved():
+    """A reload that changes nothing must be distinguishable from one that does,
+    or a dead fetch looks exactly like a healthy one."""
+    same = _gexdf([("2026-08-04", 0.55)])
+    more = _gexdf([("2026-08-04", 0.55), ("2026-08-05", 0.31)])
+    gr = GammaRegime(_SeqQDB([same, same, more]))
+    assert gr.reload() is False        # nothing new
+    assert gr.reload() is True         # gained a session
+
+
+def test_needs_reload_is_cheap_and_touches_no_database():
+    """It runs on the hot path's schedule, so it must be pure snapshot
+    arithmetic -- a query here would put QuestDB in front of trading."""
+    q = _SeqQDB([_gexdf([("2026-08-04", 0.55)])])
+    gr = GammaRegime(q)
+    calls = q.i
+    for _ in range(1000):
+        gr.needs_reload("2026-08-05")
+    assert q.i == calls, "needs_reload hit the database"

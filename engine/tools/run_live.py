@@ -36,6 +36,10 @@ from engine.core.live_engine import LiveEngine                      # noqa: E402
 from engine.core.risk import RiskConfig, RiskSupervisor             # noqa: E402
 from engine.painters import PaintController                         # noqa: E402
 
+# How often the engine re-asks whether its gamma snapshot can answer for today.
+# Cheap: pure snapshot arithmetic unless the answer is no.
+GAMMA_CHECK_S = 300
+
 HMM_PATH = str(ROOT / "config" / "hmm_es_1h.json")
 SYMBOL = "ES"
 INSTRUMENTS = load_instruments(ROOT / "config" / "instruments.yaml")
@@ -828,6 +832,51 @@ async def main() -> None:
         asyncio.create_task(asyncio.to_thread(_refresh_gamma_blocking, new_day))
     eng.on_session_rollover = _on_rollover
 
+    async def gamma_keeper():
+        """Keep the gamma snapshot able to answer for TODAY, for as long as the
+        engine runs.
+
+        This engine is not meant to be restarted, so nothing about its data may
+        depend on a restart. The rollover hook alone does, in three ways that are
+        all silent: it is delivered through the bounded sink queue and is DROPPED
+        on overflow; it fires at ET midnight while the fetch runs at 09:00 ET, so
+        a late fetch misses the only reload of the day; and a reload that
+        "succeeds" proves the query ran, not that any data arrived.
+
+        So the engine asks its own snapshot a question it can answer for free --
+        "can I still answer for today?" -- and acts when the answer is no. Not a
+        watchdog over a bug: external data lands on someone else's schedule, and
+        consuming it is the engine's job."""
+        from engine.core.timeutil import et_session_date
+        import time as _t
+        while True:
+            await asyncio.sleep(GAMMA_CHECK_S)
+            gr = _GAMMA_CACHE.get("ES")
+            if gr is None:
+                continue
+            day = et_session_date(_t.time_ns())
+            if not gr.needs_reload(day):
+                continue
+            log.warning("GAMMA STALE for %s (newest session held: %s) -- "
+                        "reloading; *_gex sleeves are failing OPEN meanwhile",
+                        day, gr.newest_session())
+            try:
+                changed = await asyncio.to_thread(gr.reload)
+            except Exception as ex:                  # noqa: BLE001
+                log.error("gamma reload failed: %s (will retry in %ds)",
+                          ex, GAMMA_CHECK_S)
+                continue
+            if gr.needs_reload(day):
+                log.error("GAMMA STILL STALE for %s after a reload that %s -- "
+                          "the daily fetch has not produced a usable session. "
+                          "*_gex sleeves trade as their ungated twins until it "
+                          "does.", day, "gained data" if changed else "changed nothing")
+            else:
+                log.warning("gamma refreshed for %s: gexp_prev=%.4f (newest "
+                            "session %s) -- *_gex filters are live again",
+                            day, gr.gexp_prev(day) or float("nan"),
+                            gr.newest_session())
+
     # DayScore morning read (co-pilot: fade-friendliness lean + VWAP posture).
     # A moderate-tilt SIZING input, not a switch; Crabel prior-range is the most
     # robust live component (volume/overnight are noisy on the delayed feed).
@@ -917,7 +966,8 @@ async def main() -> None:
                 print(line)
                 last_seen, last_fills = obs.trades, pf
 
-    tasks = [asyncio.create_task(eng.run()), asyncio.create_task(heartbeat())]
+    tasks = [asyncio.create_task(eng.run()), asyncio.create_task(heartbeat()),
+             asyncio.create_task(gamma_keeper())]
     if a.seconds:
         tasks.append(asyncio.create_task(stopper()))
     try:

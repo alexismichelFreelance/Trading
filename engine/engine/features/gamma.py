@@ -46,13 +46,42 @@ class GammaRegime:
         # half-updated dates/vals pair.
         self._snap = (dates, vals)
 
-    def reload(self) -> None:
+    def reload(self) -> bool:
         """Re-read the table IN PLACE so long-running holders (the *_gex
         strategies keep one shared instance) pick up sessions written since
         construction — without this, gexp_prev freezes at the startup snapshot
         and drifts one session staler per day the engine runs. May raise on a
-        slow/unreachable DB — the caller retries."""
+        slow/unreachable DB — the caller retries.
+
+        Returns True if the snapshot actually GAINED data. A reload that
+        succeeds only proves the query ran; if that morning's fetch died, the
+        result is byte-identical and a dead pipeline looks exactly like a
+        healthy one. The caller needs to be able to tell those apart."""
+        before = tuple(self._snap[0])
         self._load()
+        return tuple(self._snap[0]) != before
+
+    def newest_session(self) -> str | None:
+        """Newest session date in the snapshot, or None if it is empty."""
+        dates = self._snap[0]
+        return dates[-1] if dates else None
+
+    def needs_reload(self, day: str, max_age_days: int = MAX_AGE_DAYS) -> bool:
+        """True when this snapshot cannot answer for `day` — i.e. gexp_prev(day)
+        would return None because the newest session it holds is missing or too
+        old.
+
+        Pure snapshot arithmetic, no database. It is polled on the engine's own
+        schedule, and anything that reads QuestDB from a hot path puts the
+        database in front of trading.
+
+        This exists because the engine is meant to run for weeks. Refreshing
+        only on the ET-midnight rollover assumes (a) the rollover callback is
+        never dropped by the bounded sink queue, and (b) the 09:00 ET fetch has
+        always landed before the one reload that day. Neither is guaranteed, and
+        both fail silently. Asking "can I answer for today?" is a question the
+        engine can answer from its own state, over and over, for free."""
+        return self.gexp_prev(day, max_age_days=max_age_days) is None
 
     def gexp_prev(self, day: str, max_age_days: int = MAX_AGE_DAYS) -> float | None:
         """CAUSAL prior-session GEX percentile for trading day 'YYYY-MM-DD':
