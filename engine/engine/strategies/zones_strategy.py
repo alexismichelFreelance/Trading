@@ -95,7 +95,8 @@ class ZoneLifecycleStrategy(BaseStrategy):
     def __init__(self, symbol: str,
                  gate_utc: tuple[int, int] | None = (13, 21),
                  gap_thr: float = 0.0, point_usd: float = 50.0,
-                 tf: str = "30m") -> None:
+                 tf: str = "30m", enable_break: bool = True,
+                 runner: bool = True) -> None:
         self.symbol = symbol
         self.point_usd = point_usd     # $/pt for sizing (from InstrumentSpec)
         # 30m was chosen on ES history and is the validated default -- do not
@@ -105,6 +106,13 @@ class ZoneLifecycleStrategy(BaseStrategy):
         # zone, which is a different trade, not the same one scaled.
         self.tf = tf
         self.agg = BarAggregator((tf,))
+        # Defaults keep the validated behaviour so tests/parity stays valid; the
+        # roster turns these off on 36 ES sessions of evidence.
+        #   BREAK setup   4 trips  -1,938  25% win   (fade +6,412/86%, flip +7,288/100%)
+        #   the RUNNER    4 trips  -2,100  25% win   -- half comes off at +4 and
+        #     what is left, held to breakeven, gives back more than it makes.
+        self.enable_break = enable_break
+        self.runner = runner
         # gap_thr>0: also detect RTH-open gap zones, faded only after a
         # leave-and-return (naive immediate-fade lost -$36k; see
         # strategy_lab/GAP_DEPARTURE_STUDY.md). Default 0 = base-only.
@@ -230,7 +238,8 @@ class ZoneLifecycleStrategy(BaseStrategy):
                 tgt = self._opp_target(d, b_entry, self._k, bdir)
                 if tgt is None:
                     tgt = b_entry + bdir * abs(b_entry - b_stop) * 2
-                return self._enter("BREAK", bdir, b_entry, b_stop, tgt, z)
+                if self.enable_break:
+                    return self._enter("BREAK", bdir, b_entry, b_stop, tgt, z)
             # FLIP — retest from broken side
             if z.broke and not z.flip_done and z.break_k is not None and self._k >= z.break_k + 2:
                 ft = (b.h >= z.bot and b.h <= z.top + 0.5) if d > 0 else (b.l <= z.top and b.l >= z.bot - 0.5)
@@ -263,6 +272,8 @@ class ZoneLifecycleStrategy(BaseStrategy):
             scalp_hit = (b.h >= t.scalp_px) if d > 0 else (b.l <= t.scalp_px)
             stop_hit = (b.l <= t.stop) if d > 0 else (b.h >= t.stop)
             if scalp_hit:                       # scalp wins intrabar tie
+                if not self.runner:             # take it all; no breakeven leg
+                    return close(t.remaining, "scalp", done=True)
                 t.scalped = True
                 t.stop = t.entry                # runner to breakeven
                 scalp_qty = t.size // 2
