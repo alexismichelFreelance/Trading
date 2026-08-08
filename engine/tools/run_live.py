@@ -237,6 +237,14 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
         return ZoneLifecycleStrategy(symbol, point_usd=pu)
+    # timeframe sweep: 30m is the ES-validated default; these exist to find out
+    # whether NQ wants a different bucket, not to be traded on faith.
+    if label == "zones_15m":
+        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="15m")
+    if label == "zones_1h":
+        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="1h")
+    if label == "zones_4h":
+        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="4h")
     if label == "zones_gap":         # variant: leave-and-return gap zones on
         return ZoneLifecycleStrategy(symbol, gap_thr=5.0, point_usd=pu)
     if label == "dipbuy":
@@ -358,7 +366,8 @@ ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "opendrive_2p16", "opendrive_2p24", "opendrive_2p32",
               "onbreak_2p24", "onbreak_2p32",
               "vwapbreak_2p24", "vwapbreak_2p32",
-              "vwapbreak_retest", "vwapbreak_retest_2p")
+              "vwapbreak_retest", "vwapbreak_retest_2p",
+              "zones_15m", "zones_1h", "zones_4h")
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):

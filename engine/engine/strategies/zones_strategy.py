@@ -23,6 +23,38 @@ K_BARS = 16
 RISK = 2000.0
 
 
+# ── zone metadata on the fill ────────────────────────────────────────────────
+# The detector scores every zone (departure 0-2 + base 0-2) and counts touches,
+# then the sleeve threw all of it away: the fill said "fade-entry" and nothing
+# else. So the trade record could not answer whether strong, untouched zones
+# outperform weak re-tested ones -- across 36 ES sessions that was unknowable
+# rather than negative, and no replay could recover it.
+#
+# Stamped at entry, at the moment of the decision. The setup prefix is kept
+# first so every existing reader of "fade-entry" keeps working.
+#     fade-entry|d2|b1|t0|30m
+
+def zone_tag(setup: str, dep: int, base: int, touches: int, tf: str) -> str:
+    return f"{setup.lower()}-entry|d{int(dep)}|b{int(base)}|t{int(touches)}|{tf}"
+
+
+def parse_zone_tag(tag):
+    """{setup, dep, base, strength, touches, virgin, tf} or None if the tag
+    carries no zone metadata (every fill written before this, and every exit)."""
+    if not tag or "|" not in str(tag):
+        return None
+    parts = str(tag).split("|")
+    if len(parts) != 5 or not parts[0].endswith("-entry"):
+        return None
+    try:
+        dep = int(parts[1][1:]); base = int(parts[2][1:]); tch = int(parts[3][1:])
+    except ValueError:
+        return None
+    return {"setup": parts[0][:-len("-entry")], "dep": dep, "base": base,
+            "strength": dep + base, "touches": tch, "virgin": tch == 0,
+            "tf": parts[4]}
+
+
 @dataclass
 class _ZoneRec:
     k: int
@@ -34,6 +66,9 @@ class _ZoneRec:
     break_k: int | None = None
     flip_done: bool = False
     ts: int = 0                    # creation time (ns) — metadata for chart painting
+    dep: int = 0                   # departure_score 0-2, from the detector
+    base_s: int = 0                # base_score 0-2
+    touches: int = 0               # times price has entered the band
     is_gap: bool = False           # RTH-open gap zone
     armed: bool = True             # gap zones start disarmed until price leaves them
 
@@ -59,10 +94,17 @@ class _Trade:
 class ZoneLifecycleStrategy(BaseStrategy):
     def __init__(self, symbol: str,
                  gate_utc: tuple[int, int] | None = (13, 21),
-                 gap_thr: float = 0.0, point_usd: float = 50.0) -> None:
+                 gap_thr: float = 0.0, point_usd: float = 50.0,
+                 tf: str = "30m") -> None:
         self.symbol = symbol
         self.point_usd = point_usd     # $/pt for sizing (from InstrumentSpec)
-        self.agg = BarAggregator(("30m",))
+        # 30m was chosen on ES history and is the validated default -- do not
+        # change it for ES without redoing that work. It is a parameter because
+        # nothing says the same bucket suits an instrument whose median RTH range
+        # is 6.5x larger: a 30m NQ zone is ~6.5x wider in points than a 30m ES
+        # zone, which is a different trade, not the same one scaled.
+        self.tf = tf
+        self.agg = BarAggregator((tf,))
         # gap_thr>0: also detect RTH-open gap zones, faded only after a
         # leave-and-return (naive immediate-fade lost -$36k; see
         # strategy_lab/GAP_DEPARTURE_STUDY.md). Default 0 = base-only.
@@ -101,7 +143,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
             return []
         orders: list[Order] = []
         for b in self.agg.update(bar):
-            orders += self._on_30m(b)
+            orders += self._on_tf_bar(b)
         return orders
 
     def on_position(self, p) -> None:
@@ -118,13 +160,14 @@ class ZoneLifecycleStrategy(BaseStrategy):
                 z.flip_done = False
 
     # ── per closed 30m bar ───────────────────────────────────────────────
-    def _on_30m(self, b: Bar) -> list[Order]:
+    def _on_tf_bar(self, b: Bar) -> list[Order]:
         self._k += 1
         orders: list[Order] = []
         if self.trade is not None:
             orders += self._manage(b)
         for z in self.det.update(b):
             self.zones.append(_ZoneRec(self._k, z.direction, z.top, z.bot, ts=b.ts,
+                                       dep=z.departure_score, base_s=z.base_score,
                                        is_gap=z.is_gap, armed=not z.is_gap))
         in_window = self.gate_utc is None or \
             (self.gate_utc[0] <= ns_to_utc(b.ts).hour < self.gate_utc[1])
@@ -132,6 +175,11 @@ class ZoneLifecycleStrategy(BaseStrategy):
             orders += self._scan(b)
         # LEAVE-AND-RETURN arming (after scan, so a gap fade needs a PRIOR bar to
         # have left the zone): a gap zone arms once price clears its proximal edge
+        # touch accounting -- `virgin` must mean something by the time a later
+        # bar takes the zone, so count entries into the band on every bar
+        for z in self.zones:
+            if not z.broke and b.l <= z.top and b.h >= z.bot:
+                z.touches += 1
         for z in self.zones:
             if z.is_gap and not z.armed and not z.broke:
                 if (b.h > z.top) if z.dir > 0 else (b.l < z.bot):
@@ -145,14 +193,17 @@ class ZoneLifecycleStrategy(BaseStrategy):
             return None
         return min(z.bot for z in cands) if dir_sign > 0 else max(z.top for z in cands)
 
-    def _enter(self, setup: str, d: int, entry: float, stop: float, target: float) -> list[Order]:
+    def _enter(self, setup: str, d: int, entry: float, stop: float, target: float,
+               z: "_ZoneRec | None" = None) -> list[Order]:
         risk = abs(entry - stop)
         size = position_size(RISK, risk, self.point_usd, 30)
         if size <= 0:
             return []
         self.trade = _Trade(setup, d, entry, stop, target, size,
                             entry + d * SCALP, remaining=size)
-        return [Order(self.symbol, d, size, tag=f"{setup.lower()}-entry")]
+        tag = (zone_tag(setup, z.dep, z.base_s, z.touches, self.tf) if z is not None
+               else f"{setup.lower()}-entry")
+        return [Order(self.symbol, d, size, tag=tag)]
 
     def _scan(self, b: Bar) -> list[Order]:
         for z in self.zones:
@@ -167,7 +218,8 @@ class ZoneLifecycleStrategy(BaseStrategy):
                     if tgt is None:
                         stop0 = z.bot - 1 if d > 0 else z.top + 1
                         tgt = z.prox + d * abs(z.prox - stop0) * 2
-                    return self._enter("FADE", d, z.prox, z.bot - 1 if d > 0 else z.top + 1, tgt)
+                    return self._enter("FADE", d, z.prox, z.bot - 1 if d > 0 else z.top + 1,
+                                   tgt, z)
             # detect break
             if not z.broke and ((b.c < z.bot - 1) if d > 0 else (b.c > z.top + 1)):
                 z.broke = True
@@ -178,7 +230,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
                 tgt = self._opp_target(d, b_entry, self._k, bdir)
                 if tgt is None:
                     tgt = b_entry + bdir * abs(b_entry - b_stop) * 2
-                return self._enter("BREAK", bdir, b_entry, b_stop, tgt)
+                return self._enter("BREAK", bdir, b_entry, b_stop, tgt, z)
             # FLIP — retest from broken side
             if z.broke and not z.flip_done and z.break_k is not None and self._k >= z.break_k + 2:
                 ft = (b.h >= z.bot and b.h <= z.top + 0.5) if d > 0 else (b.l <= z.top and b.l >= z.bot - 0.5)
@@ -190,7 +242,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
                     tgt = self._opp_target(d, f_entry, self._k, fdir)
                     if tgt is None:
                         tgt = f_entry + fdir * abs(f_entry - f_stop) * 2
-                    return self._enter("FLIP", fdir, f_entry, f_stop, tgt)
+                    return self._enter("FLIP", fdir, f_entry, f_stop, tgt, z)
                 if (b.c > z.top + 5) if d > 0 else (b.c < z.bot - 5):
                     z.flip_done = True   # ran away, no flip
         return []
