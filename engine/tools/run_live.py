@@ -77,6 +77,54 @@ def fetch_daily_bars(symbol: str = "ES=F", days: int = 320) -> list:
 
 
 _DAILY_CACHE: dict = {}
+_RTH_DAILY_CACHE: dict = {}
+
+
+def rth_daily_bars(sym: str) -> list:
+    """Daily RTH bars of the TRADED contract, aggregated from claude_bars_live.
+
+    The pivot grid used to be seeded from Yahoo ES=F -- a CONTINUOUS series, in
+    24-hour bars. Both are wrong for floor pivots: wrong instrument, wrong
+    session. On 2026-08-07 Yahoo's daily low was 18 points below the real RTH
+    low, putting PP 7 points and S1 14 points off, and a pivot entry fired with
+    price nowhere near a level.
+
+    Returns [] on any failure; the caller falls back to Yahoo and says so."""
+    if sym in _RTH_DAILY_CACHE:
+        return _RTH_DAILY_CACHE[sym]
+    out = []
+    try:
+        import pandas as pd
+
+        from engine.adapters.questdb import QuestDB
+        from engine.core.events import Bar
+        # Aggregate the RTH MINUTES explicitly. SAMPLE BY 1d WITH OFFSET '09:30'
+        # buckets 09:30 -> 09:30, which is still a 24-hour window carrying the
+        # whole overnight session -- the exact thing this function exists to
+        # exclude. It happened to give the right H/L on 2026-08-07 and the wrong
+        # close (7777.25 against the true 7783.25), which is how a bug like this
+        # survives a spot check.
+        df = QuestDB(timeout=90).df(
+            f"SELECT ts, h, l, c, vol FROM claude_bars_live "
+            f"WHERE symbol = '{sym}' ORDER BY ts")
+        if not len(df):
+            return []
+        et = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("America/New_York")
+        mod = et.dt.hour * 60 + et.dt.minute
+        rth = df[(mod >= 570) & (mod < 960)].copy()          # 09:30 <= t < 16:00
+        rth["day"] = et[(mod >= 570) & (mod < 960)].dt.strftime("%Y-%m-%d")
+        for day, g in rth.groupby("day", sort=True):
+            if len(g) < 200:                                  # partial session
+                continue
+            ts = int(pd.Timestamp(f"{day} 16:00", tz="America/New_York").value)
+            out.append(Bar(ts, "1d", float(g["c"].iloc[0]), float(g["h"].max()),
+                           float(g["l"].min()), float(g["c"].iloc[-1]),
+                           int(g["vol"].sum() or 0), sym))
+    except Exception as ex:                       # noqa: BLE001
+        print(f"  (RTH daily aggregation failed for {sym}: {ex})")
+        return []
+    _RTH_DAILY_CACHE[sym] = out
+    return out
 
 
 def daily_bars_for(sym: str) -> list:
@@ -188,36 +236,25 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing",
                                 regime_states=None, gamma=_gamma_or_none(symbol))
     if label == "opendrive":
-        return OpenDriveStrategy(symbol)
-    if label == "opendrive_gex":     # variant: entries only on short-gamma days
-        return OpenDriveStrategy(symbol, gamma=_gamma_or_none(symbol))
-    if label == "opendrive_orb":     # cleverer: opening-range break, refuses the
-        return OpenDriveStrategy(symbol, mode="orb", gamma=_gamma_or_none(symbol))
-        # counter-gamma break (short gamma -> won't buy the up-fakeout)
-    # RIDE-then-PROTECT twins: ride untouched, then leave on momentum death /
-    # range formation / retrace. Two families, because the arming rule is the
-    # open question and the record should settle it, not me:
-    #   _2p*      arm on 12x a trailing volatility ruler (the original)
-    #   _2pN      arm at a FIXED N points
-    # Measured on ~165 replay round-trips each of ESH5 and ESM5, arming distance
-    # swept 0.5-1200pt: the fixed distance beat the ruler at matched arm rate on
-    # every ESH5 cell and tied on ESM5, and both contracts peaked at 24-32 ES
-    # points improving total AND tail. That band was read off those same curves
-    # (in-sample, 30 sessions) so 16/24/32 all run and none is privileged.
+        # ORB, not the blind 10:00 entry: every window shape loses on the blind
+        # rule and the CLEAN drives lose worst (see tests/test_roster_decisions).
+        return OpenDriveStrategy(symbol, mode="orb")
     if label == "opendrive_2p":
-        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "decay", 0.1))
+        return OpenDriveStrategy(symbol, mode="orb",
+                                 two_phase=TwoPhaseExit(12.0, "decay", 0.1))
     if label == "opendrive_2p_range":
-        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "range", 0.25))
+        return OpenDriveStrategy(symbol, mode="orb",
+                                 two_phase=TwoPhaseExit(12.0, "range", 0.25))
     if label == "opendrive_2p_retrace":   # strongest OOS variant
-        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
+        return OpenDriveStrategy(symbol, mode="orb", two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
     if label == "opendrive_2p16":
-        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(
+        return OpenDriveStrategy(symbol, mode="orb", two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=16.0))
     if label == "opendrive_2p24":
-        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(
+        return OpenDriveStrategy(symbol, mode="orb", two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=24.0))
     if label == "opendrive_2p32":
-        return OpenDriveStrategy(symbol, two_phase=TwoPhaseExit(
+        return OpenDriveStrategy(symbol, mode="orb", two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=32.0))
     if label == "flow":              # adaptive z-score threshold (scale-invariant)
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
@@ -236,15 +273,20 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
                                      gate_utc=FLOW_GATE, gamma=_gamma_or_none(symbol))
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
-        return ZoneLifecycleStrategy(symbol, point_usd=pu)
+        # break setup and breakeven runner dropped -- see tests/test_roster_decisions
+        return ZoneLifecycleStrategy(symbol, point_usd=pu,
+                                     enable_break=False, runner=False)
     # timeframe sweep: 30m is the ES-validated default; these exist to find out
     # whether NQ wants a different bucket, not to be traded on faith.
     if label == "zones_15m":
-        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="15m")
+        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="15m",
+                                     enable_break=False, runner=False)
     if label == "zones_1h":
-        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="1h")
+        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="1h",
+                                     enable_break=False, runner=False)
     if label == "zones_4h":
-        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="4h")
+        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="4h",
+                                     enable_break=False, runner=False)
     if label == "zones_gap":         # variant: leave-and-return gap zones on
         return ZoneLifecycleStrategy(symbol, gap_thr=5.0, point_usd=pu)
     if label == "dipbuy":
@@ -257,26 +299,39 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return IBSSwingStrategy(symbol, gamma=_gamma_or_none(symbol))
     if label == "pivot":             # user-modeled: overnight bias + pivot fades
         return PivotStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
-    if label == "vwapbreak":         # study-motivated: trade the session-VWAP band break
-        return VwapBreakStrategy(symbol)
-    if label == "vwapbreak_retest":  # user-specified: limit AT the VWAP line,
-        # never chase the break. See VwapBreakStrategy.entry_mode.
+    if label == "vwapbreak":         # enter AT the line; chasing the break loses
         return VwapBreakStrategy(symbol, entry_mode="retest")
+    # the user's spec (2026-08-08): break the OPENING RANGE, extend one full
+    # range width, no close back through VWAP, then enter on the pullback.
+    if label == "vwapbreak_qual":       # strict reading: an exact touch of the line
+        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90)
+    if label == "vwapbreak_qual_tol":   # "(or close to it)" = half the opening range
+        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
+                                 retest_tol_frac=0.5)
+    # ABLATION: which of the three conditions actually carries the value
+    if label == "vwapbreak_q_noext":     # OR break + clean, NO extension needed
+        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
+                                 retest_tol_frac=0.5, qual_extension=False)
+    if label == "vwapbreak_q_noclean":   # OR break + extension, NO clean rule
+        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
+                                 retest_tol_frac=0.5, qual_clean=False)
+    if label == "vwapbreak_q_band":      # our sigma band instead of the OR
+        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
+                                 retest_tol_frac=0.5, qual_ref="band")
+    if label == "vwapbreak_q_bandnoext":  # band + clean only, no extension
+        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
+                                 retest_tol_frac=0.5, qual_ref="band",
+                                 qual_extension=False)
+    if label == "vwapbreak_qual_2p":
+        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
+                                 retest_tol_frac=0.5,
+                                 two_phase=TwoPhaseExit(arm_mult=2.4))
     if label == "vwapbreak_retest_2p":
         return VwapBreakStrategy(symbol, entry_mode="retest",
                                  two_phase=TwoPhaseExit(arm_mult=2.4))
-    if label == "vwapbreak_gex":     # variant: breaks only on short-gamma days
-        return VwapBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
-    if label == "vwapbreak_2p":      # ride-then-protect twin (gave back 142.25pt)
-        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(12.0, "decay", 0.1))
-    if label == "vwapbreak_2p_retrace":
-        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
     if label == "vwapbreak_2p24":    # fixed-distance arming (see opendrive_2pN)
         return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=24.0))
-    if label == "vwapbreak_2p32":
-        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(
-            rev_kind="range", rev_f=0.25, arm_pts=32.0))
     if label == "onbreak":           # study-motivated: overnight-range break
         return OvernightBreakStrategy(symbol)
     if label == "onbreak_gex":       # variant: breaks only on short-gamma days
@@ -353,20 +408,20 @@ FLOW_GATE = (13, 20)          # 09:00 -> 16:00 ET
 
 # every strategy + variant — the full paper roster (--paper all)
 ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
-              "opendrive_gex", "opendrive_orb", "flow", "flow_fixed", "flow_gex",
+              "flow", "flow_fixed", "flow_gex",
               "zones", "zones_gap", "ibs", 
-              "pivot", "vwapbreak", "vwapbreak_gex", "onbreak", "onbreak_gex",
+              "pivot", "vwapbreak", "onbreak", "onbreak_gex",
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
-              "opendrive_2p", "opendrive_2p_range", "opendrive_2p_retrace",
-              "onbreak_2p", "onbreak_2p_retrace",
-              "vwapbreak_2p", "vwapbreak_2p_retrace",
-              # fixed-distance arming twins — the variant that measured better
+                            "onbreak_2p", "onbreak_2p_retrace",
+                            # fixed-distance arming twins — the variant that measured better
               # than the volatility ruler; 16/24/32pt all run, none privileged
-              "opendrive_2p16", "opendrive_2p24", "opendrive_2p32",
+              "opendrive_2p24",
               "onbreak_2p24", "onbreak_2p32",
-              "vwapbreak_2p24", "vwapbreak_2p32",
-              "vwapbreak_retest", "vwapbreak_retest_2p",
+              "vwapbreak_2p24", "vwapbreak_qual", "vwapbreak_qual_tol", "vwapbreak_qual_2p",
+              "vwapbreak_q_noext", "vwapbreak_q_noclean",
+              "vwapbreak_q_band", "vwapbreak_q_bandnoext",
+              "vwapbreak_retest_2p",
               "zones_15m", "zones_1h", "zones_4h")
 
 
@@ -638,11 +693,17 @@ async def main() -> None:
     for sym, meta in lane_meta.items():
         pivs = [s for _, s in meta["roster"] if hasattr(s, "seed_history")]
         if pivs:
-            hist = daily_bars_for(sym)
-            for s in pivs:
-                s.seed_history(hist)
+            # RTH aggregates of the traded contract; Yahoo (continuous, 24h) only
+            # as a fallback, and never silently -- it puts the grid points out.
+            hist = rth_daily_bars(sym)
+            src = "RTH daily (traded contract)"
+            if not hist:
+                hist = daily_bars_for(sym)
+                src = "YAHOO CONTINUOUS 24h -- pivot levels will be OFF by points"
+            for st in pivs:
+                st.seed_history(hist)
             if hist:
-                print(f"seeded {len(hist)} daily bars -> {sym} pivot D/W/M grid")
+                print(f"seeded {len(hist)} bars -> {sym} pivot D/W/M grid [{src}]")
 
     paper_blot = None
     if a.record:

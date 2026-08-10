@@ -21,6 +21,7 @@ from .sizing import position_size
 SCALP = 4.0
 K_BARS = 16
 RISK = 2000.0
+RTH_OPEN_MIN, RTH_CLOSE_MIN = 9 * 60 + 30, 16 * 60   # entries only inside RTH
 
 
 # ── zone metadata on the fill ────────────────────────────────────────────────
@@ -193,6 +194,23 @@ class ZoneLifecycleStrategy(BaseStrategy):
                 if (b.h > z.top) if z.dir > 0 else (b.l < z.bot):
                     z.armed = True
         return orders
+
+    def _entry_window_open(self, ts: int) -> bool:
+        """RTH, in ET MINUTES.
+
+        This was `gate_utc[0] <= ns_to_utc(ts).hour < gate_utc[1]` with (13, 21)
+        -- UTC HOURS. 13:00 UTC is 09:00 ET in summer and 08:00 ET in winter, so
+        the entry window ran half an hour before the open, an hour past the
+        close, and slid by an hour at every DST change while the session stayed
+        put. The identical bug was fixed in engine/painters.py on 2026-08-06 and
+        left here, in the copy that actually places orders.
+
+        gate_utc=None still disables the gate entirely.
+        """
+        if self.gate_utc is None:
+            return True
+        m = et_minute_of_day(ts)
+        return RTH_OPEN_MIN <= m < RTH_CLOSE_MIN
 
     def _opp_target(self, want_dir: int, price: float, before_k: int, dir_sign: int) -> float | None:
         cands = [zz for zz in self.zones if zz.dir == want_dir and zz.k < before_k

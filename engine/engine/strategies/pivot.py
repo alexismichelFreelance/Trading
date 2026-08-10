@@ -72,6 +72,7 @@ class PivotStrategy(BaseStrategy):
     # ── per-session state ────────────────────────────────────────────────────
     def _reset_session(self) -> None:
         self.grid: list[float] = []             # merged D/W/M pivot prices, sorted
+        self._grid_sig: tuple | None = None     # rebuild when the PERIODS change
         self.labels: dict[float, str] = {}      # price -> 'D-S2' / 'W-PP' / 'M-R1'
         self._open: float | None = None         # session open (first RTH bar)
         self._prior_range = 0.0                 # prior-DAY range (deep-reversal scale)
@@ -97,9 +98,14 @@ class PivotStrategy(BaseStrategy):
         """Prime the D/W/M pivot periods from historical (e.g. daily) bars so the
         weekly/monthly grid is correct from the FIRST live session, instead of
         taking a week/month of live bars to fill. Feeds the period tracker only;
-        emits nothing. Call once, before the engine runs."""
+        emits nothing. Call once, before the engine runs.
+
+        These bars are already whole sessions, so they bypass the RTH filter that
+        live intraday bars go through. That makes their PROVENANCE critical: they
+        must be RTH aggregates of the traded contract. Seeding from a 24h
+        continuous series put the 2026-08-07 daily low 18 points wrong."""
         for b in bars:
-            self.mp.update(b.ts, b.h, b.l, b.c)
+            self.mp.update(b.ts, b.h, b.l, b.c, rth_only=False)
 
     def reset_for_live(self) -> None:
         self.trade = None
@@ -143,14 +149,22 @@ class PivotStrategy(BaseStrategy):
         if bar.tf != "1m":
             return []
         day = et_session_date(bar.ts)
-        self.mp.update(bar.ts, bar.h, bar.l, bar.c)     # track D/W/M H/L/C
-        if day != self._day:                     # roll session -> refresh the grid
+        self.mp.update(bar.ts, bar.h, bar.l, bar.c)     # track D/W/M H/L/C (RTH only)
+        if day != self._day:                     # new session -> reset trade state
             self._day = day
             self._reset_session()
+        # The grid follows the PERIOD ROLL, not the calendar day. Now that
+        # MultiPivots ignores overnight bars, the daily period rolls at the first
+        # RTH bar -- while et_session_date rolls at ET midnight. Keying the
+        # rebuild to the calendar day therefore ran it BEFORE the period had
+        # rolled, and the grid stayed empty for the entire session.
+        sig = tuple(sorted(self.mp.prior.items()))
+        if sig != self._grid_sig:
+            self._grid_sig = sig
             self.labels = self.mp.grid()
             self.grid = sorted(self.labels)
-            pd = self.mp.prior.get("D")
-            self._prior_range = (pd[0] - pd[1]) if pd else 0.0
+            pr = self.mp.prior.get("D")
+            self._prior_range = (pr[0] - pr[1]) if pr else 0.0
 
         m = et_minute_of_day(bar.ts)
         if m < RTH_START:                        # overnight: accumulate the bias read

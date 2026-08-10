@@ -119,7 +119,21 @@ class MultiPivots:
             return f"{iso[0]}-W{iso[1]:02d}"
         return t.strftime("%Y-%m")
 
-    def update(self, ts: int, h: float, l: float, c: float) -> None:
+    def update(self, ts: int, h: float, l: float, c: float,
+               rth_only: bool = True) -> None:
+        # RTH ONLY. Classic floor pivots are defined on the prior RTH session --
+        # this class's own docstring says so, and SessionLevels.update_bar has
+        # always filtered. This one did not, so every overnight Globex bar was
+        # folded into the D/W/M periods the sleeve trades. On 2026-08-07 that put
+        # the daily low 18 points below the real RTH low, PP 7 points off and S1
+        # 14 points off, and a pivot entry fired with price nowhere near a level.
+        # A monthly period built from one overnight spike stays wrong for a month.
+        # rth_only=False is for bars that are ALREADY whole-session aggregates
+        # (the daily history seed): they carry a session's H/L/C and are stamped
+        # at the session close, which is not itself an RTH minute, so filtering
+        # them would reject the entire seed.
+        if rth_only and not is_rth(ts):
+            return
         for tf in self._TFS:
             key = self._key(tf, ts)
             cur = self._cur.get(tf)
