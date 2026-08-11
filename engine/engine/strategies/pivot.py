@@ -23,7 +23,7 @@ comparing its daily call to the user's actual trades (paper only). The execution
 from __future__ import annotations
 
 from ..core.events import Bar
-from ..core.orders import Order
+from ..core.orders import Order, OrderType
 from ..core.timeutil import et_minute_of_day, et_session_date
 from ..features.pivots import MultiPivots
 from .base import BaseStrategy
@@ -246,7 +246,19 @@ class PivotStrategy(BaseStrategy):
             return []
         self.trade = {"dir": d, "entry": entry, "target": target, "stop": stop,
                       "size": size, "tag": tag}
-        return [Order(self.symbol, d, size, tag=f"{tag}-entry")]
+        # A LIMIT AT THE LEVEL, not a market order. The docstring has always said
+        # "resting limit-style entries at pivots"; the code sprayed at the market
+        # and then recorded `entry` = the pivot anyway, so stop and target were
+        # derived from a price the trade never had. Measured on 5 ES sessions:
+        # piv-entry fills sat a median 6.67 points off the nearest level, one of
+        # them 21.75 -- which is not a fade, and a stop of piv + STOP_BUF taken
+        # 21 points away is not the risk it claims.
+        #
+        # The touch test that got us here (bar.h >= piv short, bar.l <= piv long)
+        # is exactly the condition under which a limit resting at `piv` fills, so
+        # the level was reachable on this bar by construction.
+        return [Order(self.symbol, d, size, type=OrderType.LIMIT,
+                      limit_price=entry, tag=f"{tag}-entry")]
 
     # ── management ───────────────────────────────────────────────────────────
     def _manage(self, bar: Bar) -> list[Order]:
