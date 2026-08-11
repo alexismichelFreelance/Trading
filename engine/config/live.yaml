@@ -34,5 +34,5 @@ instruments:
     # tools/sleeve_audit.py, where all 6 pairs matched exactly. Duplicates burn
     # compute and, worse, look like independent agreement in a twin comparison.
     # Re-add them only once an NDX-based GammaRegime exists.
-    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,opendrive_orb,flow,vwapbreak,onbreak"
+    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,flow,vwapbreak,onbreak"
     live: ""

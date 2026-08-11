@@ -36,6 +36,10 @@ from engine.core.live_engine import LiveEngine                      # noqa: E402
 from engine.core.risk import RiskConfig, RiskSupervisor             # noqa: E402
 from engine.painters import PaintController                         # noqa: E402
 
+# Module logger. _spec() and build_roster() both call log.*; without this they
+# raise NameError at the exact moment they are trying to report a problem.
+log = logging.getLogger("engine.runner")
+
 # How often the engine re-asks whether its gamma snapshot can answer for today.
 # Cheap: pure snapshot arithmetic unless the answer is no.
 GAMMA_CHECK_S = 300
@@ -527,10 +531,25 @@ def build_roster(paper: str, flow_th: int = 30, symbol: str = SYMBOL,
     labels = list(ALL_LABELS) if paper.strip() in ("all", "") else \
         [x for x in paper.split(",") if x]
     roster = []
+    dropped = []
     for lb in labels:
-        s = _make(lb, flow_th, symbol, hmm_path)
+        # A stale name must cost its own sleeve and nothing else. On 2026-08-12
+        # 'opendrive_orb' -- removed from _make the day before as a duplicate --
+        # was still listed in config/live.yaml, and _make's SystemExit took the
+        # whole engine down at the open. Nine working sleeves stood down for a
+        # tenth that no longer existed. Same rule as dispatch isolation: the
+        # blast radius of a broken sleeve is that sleeve.
+        try:
+            s = _make(lb, flow_th, symbol, hmm_path)
+        except BaseException as ex:                  # SystemExit included
+            dropped.append(lb)
+            log.error("ROSTER: dropping unknown sleeve %r for %s (%s) -- the rest "
+                      "of the book still trades", lb, symbol, ex)
+            continue
         s.label = prefix + lb        # for display / paper reporting
         roster.append((prefix + lb, s))
+    if dropped and not roster:
+        raise SystemExit(f"no sleeves could be built for {symbol}: {dropped}")
     return roster
 
 

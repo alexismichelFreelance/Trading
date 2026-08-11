@@ -100,6 +100,8 @@ class LiveEngine:
         # Paper orders that are not MARKET wait here until the tape trades through
         # their level (see _check_resting). [(strategy, Order)]
         self._resting: list[tuple] = []
+        self._ticks: dict | None = None          # lazy instrument tick sizes
+        self._root = None
         # LIVE orders the broker transport refused (socket dead/stalled). Counted
         # so a silent routing outage is visible instead of looking like "no signals".
         self.failed_orders = 0
@@ -500,6 +502,49 @@ class LiveEngine:
         class name when the runner did not set one."""
         return getattr(s, "label", None) or type(s).__name__
 
+    def tick_for(self, symbol: str) -> float:
+        """Minimum price increment, from the instrument registry (ES/NQ 0.25,
+        GC 0.10). 0 disables snapping."""
+        if self._ticks is None:
+            self._ticks = {}
+            try:
+                from pathlib import Path as _P
+
+                from .config import load_instruments, root_symbol
+                specs = load_instruments(_P(__file__).resolve().parents[2]
+                                         / "config" / "instruments.yaml")
+                self._ticks = {k: float(v.tick) for k, v in specs.items()}
+                self._root = root_symbol
+            except Exception:                        # noqa: BLE001
+                self._root = None
+        if not self._ticks:
+            return 0.0
+        key = self._root(symbol) if self._root else symbol
+        return self._ticks.get(key, 0.0)
+
+    def _snap_limit(self, o):
+        """Put a limit on the tick grid, rounding AWAY from the fill.
+
+        Pivot levels are (H+L+C)/3 and VWAP is a weighted mean, so both produce
+        prices that cannot exist in the book -- the pivot sleeve rested orders at
+        7757.08. Harmless while a resting limit filled at the trigger price; now
+        that it fills at its OWN price, an unsnapped limit books a fill the
+        exchange could never have printed.
+
+        A buy rounds DOWN and a sell rounds UP: never to a price the order could
+        not have been resting at."""
+        import math
+        t = self.tick_for(o.symbol)
+        if not t or o.limit_price is None:
+            return o
+        px = (math.floor(o.limit_price / t) * t if o.side > 0
+              else math.ceil(o.limit_price / t) * t)
+        px = round(px, 10)
+        if px == o.limit_price:
+            return o
+        import dataclasses
+        return dataclasses.replace(o, limit_price=px)
+
     async def _paper_submit(self, s, o) -> None:
         """Route a paper order: MARKET fills now, STOP/LIMIT RESTS until the market
         trades through its level.
@@ -513,6 +558,8 @@ class LiveEngine:
         stop can only be beaten by a genuine gap, which is real market risk rather
         than the engine not looking."""
         if o.type in (OrderType.STOP, OrderType.LIMIT):
+            if o.type is OrderType.LIMIT:
+                o = self._snap_limit(o)
             self._resting.append((s, o))
             return
         await self._fill_paper(s, o, self.px_for(o.symbol),
@@ -568,7 +615,19 @@ class LiveEngine:
             if not hit:
                 still.append((s, o))
                 continue
-            await self._fill_paper(s, o, px, ts)     # the price that triggered it
+            # A STOP becomes a MARKET order, so the price that actually traded
+            # beyond the level is the fill and a gap is real slippage. A LIMIT is
+            # already resting in the book at its own price: for the tape to print
+            # beyond it, it must first trade THROUGH the order. So the fill is the
+            # LIMIT price -- 7500 stays 7500 even when the next print is 7480.
+            #
+            # Filling a limit at the trigger handed the resting side the
+            # aggressor's price improvement, every time, in the strategy's
+            # favour. On the pivot sleeve that was ~1 point per entry of profit
+            # that cannot exist live, and it is invisible in P&L because it just
+            # looks like the sleeve trading well.
+            fill_px = px if o.type is OrderType.STOP else o.limit_price
+            await self._fill_paper(s, o, fill_px, ts)
         self._resting = still
 
     async def _fill_paper(self, s, o, price: float, ts: int) -> None:
