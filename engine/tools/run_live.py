@@ -77,11 +77,14 @@ def fetch_daily_bars(symbol: str = "ES=F", days: int = 320) -> list:
 
 
 _DAILY_CACHE: dict = {}
-_RTH_DAILY_CACHE: dict = {}
+_SESSION_DAILY_CACHE: dict = {}
 
 
-def rth_daily_bars(sym: str) -> list:
-    """Daily RTH bars of the TRADED contract, aggregated from claude_bars_live.
+def session_daily_bars(sym: str) -> list:
+    """Daily bars of the TRADED contract on the ET CALENDAR DAY -- the session
+    NT8's Pivots indicator uses on the user's chart (verified: chart PP 7779.44
+    vs 7779.42 for 00:00-24:00 ET, against 7778.92 for Globex and 7778.83 for
+    RTH on 2026-08-11).
 
     The pivot grid used to be seeded from Yahoo ES=F -- a CONTINUOUS series, in
     24-hour bars. Both are wrong for floor pivots: wrong instrument, wrong
@@ -90,15 +93,15 @@ def rth_daily_bars(sym: str) -> list:
     price nowhere near a level.
 
     Returns [] on any failure; the caller falls back to Yahoo and says so."""
-    if sym in _RTH_DAILY_CACHE:
-        return _RTH_DAILY_CACHE[sym]
+    if sym in _SESSION_DAILY_CACHE:
+        return _SESSION_DAILY_CACHE[sym]
     out = []
     try:
         import pandas as pd
 
         from engine.adapters.questdb import QuestDB
         from engine.core.events import Bar
-        # Aggregate the RTH MINUTES explicitly. SAMPLE BY 1d WITH OFFSET '09:30'
+        # Aggregate the RTH MINUTES explicitly. -- aggregated in pandas, not SAMPLE BY 1d WITH OFFSET '09:30'
         # buckets 09:30 -> 09:30, which is still a 24-hour window carrying the
         # whole overnight session -- the exact thing this function exists to
         # exclude. It happened to give the right H/L on 2026-08-07 and the wrong
@@ -111,19 +114,19 @@ def rth_daily_bars(sym: str) -> list:
             return []
         et = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("America/New_York")
         mod = et.dt.hour * 60 + et.dt.minute
-        rth = df[(mod >= 570) & (mod < 960)].copy()          # 09:30 <= t < 16:00
-        rth["day"] = et[(mod >= 570) & (mod < 960)].dt.strftime("%Y-%m-%d")
-        for day, g in rth.groupby("day", sort=True):
-            if len(g) < 200:                                  # partial session
+        df = df.copy()
+        df["day"] = et.dt.strftime("%Y-%m-%d")
+        for day, g in df.groupby("day", sort=True):
+            if len(g) < 300:                                  # partial session
                 continue
-            ts = int(pd.Timestamp(f"{day} 16:00", tz="America/New_York").value)
+            ts = int(pd.Timestamp(f"{day} 23:59", tz="America/New_York").value)
             out.append(Bar(ts, "1d", float(g["c"].iloc[0]), float(g["h"].max()),
                            float(g["l"].min()), float(g["c"].iloc[-1]),
                            int(g["vol"].sum() or 0), sym))
     except Exception as ex:                       # noqa: BLE001
         print(f"  (RTH daily aggregation failed for {sym}: {ex})")
         return []
-    _RTH_DAILY_CACHE[sym] = out
+    _SESSION_DAILY_CACHE[sym] = out
     return out
 
 
@@ -695,8 +698,8 @@ async def main() -> None:
         if pivs:
             # RTH aggregates of the traded contract; Yahoo (continuous, 24h) only
             # as a fallback, and never silently -- it puts the grid points out.
-            hist = rth_daily_bars(sym)
-            src = "RTH daily (traded contract)"
+            hist = session_daily_bars(sym)
+            src = "ET-calendar-day (traded contract)"
             if not hist:
                 hist = daily_bars_for(sym)
                 src = "YAHOO CONTINUOUS 24h -- pivot levels will be OFF by points"

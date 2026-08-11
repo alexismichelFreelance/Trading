@@ -120,18 +120,25 @@ class MultiPivots:
         return t.strftime("%Y-%m")
 
     def update(self, ts: int, h: float, l: float, c: float,
-               rth_only: bool = True) -> None:
-        # RTH ONLY. Classic floor pivots are defined on the prior RTH session --
-        # this class's own docstring says so, and SessionLevels.update_bar has
-        # always filtered. This one did not, so every overnight Globex bar was
-        # folded into the D/W/M periods the sleeve trades. On 2026-08-07 that put
-        # the daily low 18 points below the real RTH low, PP 7 points off and S1
-        # 14 points off, and a pivot entry fired with price nowhere near a level.
-        # A monthly period built from one overnight spike stays wrong for a month.
-        # rth_only=False is for bars that are ALREADY whole-session aggregates
-        # (the daily history seed): they carry a session's H/L/C and are stamped
-        # at the session close, which is not itself an RTH minute, so filtering
-        # them would reject the entire seed.
+               rth_only: bool = False) -> None:
+        # SESSION = THE ET CALENDAR DAY, which is what et_session_date already
+        # keys on -- and what NT8's Pivots indicator uses with "Calculation mode:
+        # intraday data" on the user's chart. Verified against it on 2026-08-11:
+        #
+        #   chart PP                     7779.44
+        #   00:00->24:00 ET  H 7798.00 L 7764.50 C 7775.75 -> 7779.42   MATCH
+        #   18:00->17:00 ET (Globex)     -> 7778.92
+        #   09:30->16:00 ET (RTH)        -> 7778.83
+        #
+        # The 0.02 is rounding of the thirds. The distinguishing value is the
+        # LOW: 7764.50, not the 7763.00 overnight low, because that print falls
+        # outside a midnight-to-midnight day.
+        #
+        # I briefly filtered this to RTH on 2026-08-10 -- the class docstring
+        # says "prior RTH session" and SessionLevels does filter -- which moved
+        # the grid a median 7.42 points off the chart (max 24.42) across 39
+        # sessions. The docstring was wrong, not the code. rth_only stays as an
+        # opt-in for callers that genuinely want an RTH grid.
         if rth_only and not is_rth(ts):
             return
         for tf in self._TFS:
