@@ -15,7 +15,7 @@ from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date, ns_to_utc
 from ..features.bars import BarAggregator
 from ..features.zones import ZoneDetector
-from .base import BaseStrategy
+from .base import BaseStrategy, level_fill
 from .sizing import position_size
 
 SCALP = 4.0
@@ -280,33 +280,42 @@ class ZoneLifecycleStrategy(BaseStrategy):
         d = t.dir
         t.bars_left -= 1
 
-        def close(qty: int, tag: str, done: bool) -> list[Order]:
+        def close(qty: int, tag: str, done: bool,
+                  at: float | None = None) -> list[Order]:
+            """`at` = the level that triggered this exit, so the fill is priced
+            there instead of at this bar's close (see base.level_fill)."""
             qty = min(qty, t.remaining)
             if done:
                 self.trade = None
-            return [Order(self.symbol, -d, qty, tag=tag, reduce_only=True)] if qty > 0 else []
+            return [Order(self.symbol, -d, qty, tag=tag, reduce_only=True,
+                          trigger_price=at)] if qty > 0 else []
 
         if not t.scalped:
             scalp_hit = (b.h >= t.scalp_px) if d > 0 else (b.l <= t.scalp_px)
             stop_hit = (b.l <= t.stop) if d > 0 else (b.h >= t.stop)
             if scalp_hit:                       # scalp wins intrabar tie
+                px = level_fill(b, t.scalp_px, rising=d > 0)
                 if not self.runner:             # take it all; no breakeven leg
-                    return close(t.remaining, "scalp", done=True)
+                    return close(t.remaining, "scalp", done=True, at=px)
                 t.scalped = True
                 t.stop = t.entry                # runner to breakeven
                 scalp_qty = t.size // 2
                 t.remaining -= scalp_qty
-                return close(scalp_qty, "scale", done=(t.remaining <= 0)) if scalp_qty > 0 else []
+                return close(scalp_qty, "scale", done=(t.remaining <= 0),
+                             at=px) if scalp_qty > 0 else []
             if stop_hit:
-                return close(t.remaining, "stop", done=True)
+                return close(t.remaining, "stop", done=True,
+                             at=level_fill(b, t.stop, rising=d < 0))
         else:
             target_hit = (b.h >= t.target) if d > 0 else (b.l <= t.target)
             be_hit = (b.l <= t.stop) if d > 0 else (b.h >= t.stop)
             if target_hit:
-                return close(t.remaining, "target", done=True)
+                return close(t.remaining, "target", done=True,
+                             at=level_fill(b, t.target, rising=d > 0))
             if be_hit:
-                return close(t.remaining, "be", done=True)
-        if t.bars_left <= 0:
+                return close(t.remaining, "be", done=True,
+                             at=level_fill(b, t.stop, rising=d < 0))
+        if t.bars_left <= 0:                    # no level: genuinely at the market
             return close(t.remaining, "timeout", done=True)
         return []
 

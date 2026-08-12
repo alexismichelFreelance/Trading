@@ -13,6 +13,27 @@ SESSION_FLAT_MIN = 15 * 60 + 59      # 15:59 ET — last minute an intraday slee
 SESSION_OPEN_MIN = 18 * 60           # 18:00 ET — Globex opens; a NEW session begins
 
 
+def level_fill(bar: Bar, level: float, rising: bool) -> float:
+    """The honest fill price for an exit triggered by the tape reaching `level`.
+
+    `rising` — the level sits ABOVE and was reached by price going up (a short's
+    stop, a long's target). False for the mirror.
+
+    Every sleeve detects its stop and target on the BAR (`bar.l <= stop`,
+    `bar.h >= target`) and then sends a market order, which fills at the engine's
+    last price — that bar's CLOSE. So a stop tripped by a wick that closed back
+    on the good side books BETTER than the stop, and a target touched and given
+    back books WORSE than the target. The first case is the common shape of a
+    stop run, so the net bias flatters. Live on 2026-08-12 ES:pivot booked +4.00
+    points on a stopped-out long.
+
+    The level is the fill. The exception is a GAP: if the bar OPENED already
+    beyond the level there was never a print at it, so the open is the fill and
+    the gap is slippage that really would have been paid."""
+    beyond = bar.o >= level if rising else bar.o <= level
+    return float(bar.o if beyond else level)
+
+
 class BaseStrategy:
     symbol: str = ""
     gamma = None          # optional GammaRegime — a STRATEGY choice, not an engine gate

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from .blotter import Blotter
 from .dispatch import _wants, dispatch_broker, dispatch_market
@@ -179,6 +180,28 @@ class LiveEngine:
         self.on_lane_stale = None                    # async (lane, seconds)
         self.stale_after_s = 120.0                   # warn if a lane goes quiet
         self._processed = 0                          # market events dispatched
+        # ── HOW FAR BEHIND THE TAPE IS THE ENGINE? ────────────────────────
+        # On 2026-08-12 the engine restarted at 09:45 ET and did not go live
+        # until 10:48:55 wall clock, on an event stamped 09:39:39 -- it was
+        # deciding on data 69 minutes old. Nothing said so. The staleness check
+        # above cannot see this by construction: it compares each event to the
+        # NEWEST ONE THAT LANE HAS SEEN, and a uniformly delayed stream ascends
+        # perfectly, so it looks exactly like a healthy feed.
+        #
+        # Both mechanisms I could measure are ruled out: bar dispatch runs at
+        # ~256 bars/s (NT8's 5100-bar backfill costs 20 seconds) and trade
+        # dispatch at ~892/s, six times live NQ -- tools/dispatch_throughput.py.
+        # So the cause is still unknown, and the only way to stop rebuilding it
+        # from log archaeology afterwards is for the engine to carry the number
+        # while it is happening.
+        #
+        # This is a MEASUREMENT, not a watchdog: it changes no behaviour, gates
+        # no order and restarts nothing. Off by default (a replay's synthetic
+        # timestamps are years from the wall clock and would report nonsense);
+        # the live runner turns it on -- one opt-in at one call site.
+        self.lag_report_s = 0.0
+        self.feed_lag_s = 0.0                        # last measured, per engine
+        self._lag_logged = 0.0
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
 
@@ -639,6 +662,12 @@ class LiveEngine:
                 return                               # nothing to reduce
             qty = min(qty, abs(pos))
         self._owner[o.order_id] = s
+        # A level-triggered exit is priced at ITS LEVEL, not at the market. The
+        # sleeve detected the hit on a bar and sends MARKET so the exit cannot
+        # rest -- but the fill belongs at the price that caused it, which the
+        # sleeve states (gap-adjusted) on the order. See Order.trigger_price.
+        if o.trigger_price is not None:
+            price = float(o.trigger_price)
         # Stamp with the EVENT that priced this fill, never the wall clock: the
         # two must not come from different clocks (see _last_ts). Falls back to
         # clock.now() only before any market event has arrived.
@@ -795,6 +824,8 @@ class LiveEngine:
                     self._processed += 1          # progress, for wait_processed
                     sym = getattr(ev, "symbol", "")
                     self.clock.set(ev.ts)
+                    if not (self._processed & 0x3FF):
+                        self._note_lag(ev.ts)     # every 1024 events; see __init__
                     if isinstance(ev, Trade):
                         self._last_px[sym] = self._last_px[""] = ev.price
                         self._last_ts[sym] = self._last_ts[""] = ev.ts
@@ -943,6 +974,41 @@ class LiveEngine:
             await asyncio.gather(sinker, return_exceptions=True)
             self._report_unapplied_restores()
         return self.blotter
+
+    def _note_lag(self, ev_ts: int) -> None:
+        """Record how far behind the tape this engine is, and say so.
+
+        Two numbers, because they separate the two possible faults:
+          LAG   wall clock minus the timestamp of the event being dispatched.
+                Where the engine is in market time.
+          QUEUE depth of the dispatch queue. If LAG is large and QUEUE is
+                large, the engine is the bottleneck and the backlog is ours.
+                If LAG is large and QUEUE is EMPTY, the events are arriving
+                late -- the delay is upstream (NT8 replaying, socket, relay),
+                and no amount of engine tuning touches it.
+
+        On 2026-08-12 nobody could tell which, because neither was recorded."""
+        self.feed_lag_s = max(0.0, (time.time_ns() - ev_ts) / 1e9)
+        now = time.monotonic()
+        # Measuring is free (one clock read per 1024 events) and the field is
+        # always there for a diagnostic. REPORTING is what has to be opt-in:
+        # replay drives timestamps years from the wall clock and would fill the
+        # log with alarm about a five-year lag on a 2020 backtest.
+        if not self.lag_report_s or now - self._lag_logged < self.lag_report_s:
+            return
+        self._lag_logged = now
+        depth = self._q.qsize()
+        if self.feed_lag_s < 60.0:
+            log.info("engine lag %.1fs behind the tape, dispatch queue %d",
+                     self.feed_lag_s, depth)
+            return
+        log.error("ENGINE %.1f MINUTES BEHIND THE TAPE (dispatch queue %d). "
+                  "%s Orders are being decided on that-old data.",
+                  self.feed_lag_s / 60.0, depth,
+                  "The backlog is OURS -- dispatch is not keeping up."
+                  if depth > 1000 else
+                  "The queue is nearly empty, so the events are ARRIVING late: "
+                  "the delay is upstream of the engine (feed/relay/replay).")
 
     def _report_unapplied_restores(self) -> None:
         """Restores are applied at the warmup->live flip and nowhere else, so a

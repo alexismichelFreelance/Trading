@@ -766,6 +766,11 @@ async def main() -> None:
     eng = LiveEngine(feeds, brokers, strategies, WallClock(), blot,
                      warmup_gate=not a.no_warmup_gate, risk=risk,
                      live_owners=live_owners)
+    # THE one opt-in for absolute lag reporting: a live feed's timestamps are
+    # wall-clock, so the difference means something here and nowhere else.
+    # See LiveEngine._note_lag -- on 2026-08-12 the engine spent 69 minutes an
+    # hour behind the tape and no number in the log said so.
+    eng.lag_report_s = 60.0
     live_lbls = sorted(lb for lb, s in roster if id(s) in live_owners)
     paper_lbls = sorted(lb for lb, s in roster if id(s) not in live_owners)
     print(f"roster ({len(roster)}): LIVE->NT8 {live_lbls or '(none)'}  |  "

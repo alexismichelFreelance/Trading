@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from ..core.events import Bar
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
-from .base import BaseStrategy
+from .base import BaseStrategy, level_fill
 from .sizing import position_size
 
 RTH_START, RTH_END = 570, 960          # ET minutes
@@ -166,31 +166,37 @@ class DipBuyStrategy(BaseStrategy):
         d = t.dir
         t.age += 1
 
-        def close(qty: int, tag: str, done: bool) -> list[Order]:
+        def close(qty: int, tag: str, done: bool,
+                  at: float | None = None) -> list[Order]:
             qty = min(qty, t.remaining)
             if done:
                 self.trade = None
                 self._cool = 60                       # 1h cooldown, like the study
-            return [Order(self.symbol, -d, qty, tag=tag, reduce_only=True)] if qty > 0 else []
+            return [Order(self.symbol, -d, qty, tag=tag, reduce_only=True,
+                          trigger_price=at)] if qty > 0 else []
 
+        # MOC / time stop have no level -- they really are at the market.
         if m >= MOC_MIN or t.age >= TIME_STOP:
             return close(t.remaining, "dip-moc", done=True)
         stop_hit = (bar.l <= t.stop) if d > 0 else (bar.h >= t.stop)
         if stop_hit:
-            return close(t.remaining, "dip-stop", done=True)
+            return close(t.remaining, "dip-stop", done=True,
+                         at=level_fill(bar, t.stop, rising=d < 0))
         if not t.scalped:
             scalp_hit = (bar.h >= t.scalp_px) if d > 0 else (bar.l <= t.scalp_px)
             if scalp_hit:
+                px = level_fill(bar, t.scalp_px, rising=d > 0)
                 t.scalped = True
                 t.stop = t.entry                      # runner to breakeven
                 half = t.size // 2
                 if half > 0:
                     t.remaining -= half
-                    return close(half, "dip-scale", done=(t.remaining <= 0))
+                    return close(half, "dip-scale", done=(t.remaining <= 0), at=px)
         else:
             run_hit = (bar.h >= t.runner_tgt) if d > 0 else (bar.l <= t.runner_tgt)
             if run_hit:
-                return close(t.remaining, "dip-vwap", done=True)
+                return close(t.remaining, "dip-vwap", done=True,
+                             at=level_fill(bar, t.runner_tgt, rising=d > 0))
         return []
 
 

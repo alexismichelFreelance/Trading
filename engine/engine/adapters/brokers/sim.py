@@ -96,10 +96,16 @@ class SimBroker:
         if qty <= 0:
             return
         if order.type is OrderType.MARKET:
-            if self.ref_price is None:
+            # A level-triggered exit prices at its level, not at ref_price (the
+            # last close). Replay has to agree with live here or the scorecard
+            # measures a different engine from the one that trades. See
+            # Order.trigger_price.
+            base = order.trigger_price if order.trigger_price is not None \
+                else self.ref_price
+            if base is None:
                 log.warning("market order with no reference price; dropped: %s", order)
                 return
-            self._execute(order, self.ref_price, is_limit=False, qty=qty)
+            self._execute(order, base, is_limit=False, qty=qty)
         else:
             # marketable-on-arrival? fill immediately, else rest
             if self.ref_price is not None:

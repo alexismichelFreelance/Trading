@@ -26,7 +26,7 @@ from ..core.events import Bar
 from ..core.orders import Order, OrderType
 from ..core.timeutil import et_minute_of_day, et_session_date
 from ..features.pivots import MultiPivots
-from .base import BaseStrategy
+from .base import BaseStrategy, level_fill
 
 # ── session windows (ET minutes) ─────────────────────────────────────────────
 RTH_START = 9 * 60 + 30      # 09:30 — US open; bias is frozen here
@@ -266,20 +266,27 @@ class PivotStrategy(BaseStrategy):
         d = t["dir"]
         target_hit = bar.h >= t["target"] if d > 0 else bar.l <= t["target"]
         stop_hit = bar.l <= t["stop"] if d > 0 else bar.h >= t["stop"]
-        if target_hit:
-            return self._flatten("target")
+        # STOP FIRST. Both can be true on one bar, and the bar does not say which
+        # came first. Assuming the target is a free win on every wide bar; the
+        # stop is the honest assumption.
         if stop_hit:
-            return self._flatten("stop")
+            return self._flatten("stop", level_fill(bar, t["stop"], rising=d < 0))
+        if target_hit:
+            return self._flatten("target", level_fill(bar, t["target"], rising=d > 0))
         return []
 
-    def _flatten(self, why: str) -> list[Order]:
+    def _flatten(self, why: str, at: float | None = None) -> list[Order]:
+        """`at` = the level that triggered this exit (None for a genuine market
+        exit: timeout, session flat). Priced by the engine at that level, so the
+        exit no longer books the close of whatever bar detected it."""
         if self.pos == 0 or self.trade is None:
             self.trade = None
             return []
         d = self.trade["dir"]
         qty = abs(self.pos)
         self.trade = None
-        return [Order(self.symbol, -d, qty, tag=f"piv-{why}", reduce_only=True)]
+        return [Order(self.symbol, -d, qty, tag=f"piv-{why}", reduce_only=True,
+                      trigger_price=at)]
 
 
 __all__ = ["PivotStrategy"]
