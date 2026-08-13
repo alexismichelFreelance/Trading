@@ -555,6 +555,11 @@ def build_roster(paper: str, flow_th: int = 30, symbol: str = SYMBOL,
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--feed-delay-s", type=float, default=600.0,
+                    help="seconds of delay the DATA SUBSCRIPTION imposes (this "
+                         "account is on a 10-minute delayed CME feed, so 600). "
+                         "Lag reporting alarms on the excess over this, never "
+                         "on the baseline itself. 0 for a real-time feed.")
     ap.add_argument("--paper", default="all",
                     help="roster that ALWAYS paper-trades (visible signals): 'all' (every "
                          "strategy + variant) or a comma list of labels. Default 'all'.")
@@ -768,9 +773,14 @@ async def main() -> None:
                      live_owners=live_owners)
     # THE one opt-in for absolute lag reporting: a live feed's timestamps are
     # wall-clock, so the difference means something here and nowhere else.
-    # See LiveEngine._note_lag -- on 2026-08-12 the engine spent 69 minutes an
-    # hour behind the tape and no number in the log said so.
+    # See LiveEngine._note_lag -- on 2026-08-12 the engine spent an hour behind
+    # the tape and no number in the log said so.
     eng.lag_report_s = 60.0
+    # ...and this account's data subscription is 10-minute DELAYED CME, so 600s
+    # of lag is the permanent, correct baseline. Alarming on it produced 173
+    # ERROR lines on 2026-08-13 for a condition that is just how the data
+    # arrives. Only the EXCESS over this is a fault.
+    eng.feed_delay_s = float(a.feed_delay_s)
     live_lbls = sorted(lb for lb, s in roster if id(s) in live_owners)
     paper_lbls = sorted(lb for lb, s in roster if id(s) not in live_owners)
     print(f"roster ({len(roster)}): LIVE->NT8 {live_lbls or '(none)'}  |  "

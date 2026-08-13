@@ -200,7 +200,13 @@ class LiveEngine:
         # timestamps are years from the wall clock and would report nonsense);
         # the live runner turns it on -- one opt-in at one call site.
         self.lag_report_s = 0.0
+        # The delay the DATA SUBSCRIPTION itself imposes, in seconds. This
+        # account is on a 10-minute delayed CME feed on purpose, so 600s of lag
+        # is the correct, permanent baseline and not a fault. Only the excess
+        # over it means anything. Set by the runner from config; 0 = real-time.
+        self.feed_delay_s = 0.0
         self.feed_lag_s = 0.0                        # last measured, per engine
+        self.excess_lag_s = 0.0                      # ...minus the known delay
         self._lag_logged = 0.0
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
@@ -987,8 +993,21 @@ class LiveEngine:
                 late -- the delay is upstream (NT8 replaying, socket, relay),
                 and no amount of engine tuning touches it.
 
-        On 2026-08-12 nobody could tell which, because neither was recorded."""
+        On 2026-08-12 nobody could tell which, because neither was recorded.
+
+        WHAT IS MEASURED IS NOT WHAT IS ALARMING. This account runs a 10-minute
+        DELAYED CME feed, deliberately and permanently, so the raw lag is 600s
+        all day every day. Reporting that is worse than reporting nothing: on
+        2026-08-13 it produced 173 ERROR lines for a condition that is simply
+        how the data arrives, and a line that cries every minute is a line
+        nobody reads -- which would have buried the ~59 minutes of REAL backlog
+        that sat on top of this same baseline on 2026-08-12.
+
+        So the alarm is on the EXCESS over the known delay. feed_delay_s is
+        what the subscription gives you; anything beyond it is the engine or
+        the relay falling behind, and that is the only part worth a log line."""
         self.feed_lag_s = max(0.0, (time.time_ns() - ev_ts) / 1e9)
+        self.excess_lag_s = max(0.0, self.feed_lag_s - self.feed_delay_s)
         now = time.monotonic()
         # Measuring is free (one clock read per 1024 events) and the field is
         # always there for a diagnostic. REPORTING is what has to be opt-in:
@@ -996,14 +1015,23 @@ class LiveEngine:
         # log with alarm about a five-year lag on a 2020 backtest.
         if not self.lag_report_s or now - self._lag_logged < self.lag_report_s:
             return
+        # A lane still in WARMUP is consuming NT8's backfill -- days of history
+        # by construction, and every order it produces is suppressed. Saying
+        # "orders are being decided on that-old data" there is simply false;
+        # 2026-08-13 opened with 4921 and 2978 minutes reported off 4,961
+        # backfill bars while 68 orders were being dropped exactly as intended.
+        if self.warmup_gate and not self._live_lanes:
+            return
         self._lag_logged = now
         depth = self._q.qsize()
-        if self.feed_lag_s < 60.0:
-            log.info("engine lag %.1fs behind the tape, dispatch queue %d",
-                     self.feed_lag_s, depth)
+        if self.excess_lag_s < 60.0:
+            log.info("engine lag %.1fs (%.0fs is the subscribed feed delay), "
+                     "dispatch queue %d", self.feed_lag_s, self.feed_delay_s,
+                     depth)
             return
-        log.error("ENGINE %.1f MINUTES BEHIND THE TAPE (dispatch queue %d). "
-                  "%s Orders are being decided on that-old data.",
+        log.error("ENGINE %.1f MINUTES BEHIND ON TOP OF THE %.0f-MINUTE FEED "
+                  "DELAY (total %.1f min, dispatch queue %d). %s",
+                  self.excess_lag_s / 60.0, self.feed_delay_s / 60.0,
                   self.feed_lag_s / 60.0, depth,
                   "The backlog is OURS -- dispatch is not keeping up."
                   if depth > 1000 else

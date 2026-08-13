@@ -123,7 +123,7 @@ def test_it_is_off_unless_the_runner_asks():
 def test_a_big_lag_is_logged_loudly(caplog):
     with caplog.at_level(logging.ERROR, logger="engine.live"):
         _run(69 * 60, report_s=0.001)
-    hits = [r for r in caplog.records if "BEHIND THE TAPE" in r.message]
+    hits = [r for r in caplog.records if "MINUTES BEHIND" in r.message]
     assert hits, "69 minutes behind and the log said nothing"
     assert "queue" in hits[0].getMessage().lower(), (
         "the lag alone does not say whose fault it is -- the queue depth "
@@ -148,3 +148,99 @@ def test_a_shallow_queue_blames_upstream_not_the_engine():
     out = buf.getvalue()
     assert "ARRIVING late" in out, (
         f"empty queue but the log blames the engine:\n{out[:500]}")
+
+
+# ── the KNOWN feed delay is a baseline, not a fault ──────────────────────────
+#
+# This account runs a 10-minute DELAYED CME subscription, deliberately and
+# permanently. On 2026-08-13 the alarm above fired 173 times in one session for
+# exactly that -- a rock-steady 10.0 minutes with an empty dispatch queue. A
+# line that cries every minute is a line nobody reads, and it would have buried
+# the ~59 minutes of REAL backlog that sat on top of this same baseline the day
+# before. The alarm belongs on the EXCESS.
+
+def _run_delayed(lag_s, delay_s, report_s=0.001, n=1100):
+    base = time.time_ns() - int(lag_s * NS)
+    evs = [Trade(base + i * 1_000_000, 7700.0 + i * 0.25, 1, BUY, "ES")
+           for i in range(n)]
+
+    async def go():
+        eng = LiveEngine(_Feed(evs), _Broker(), [_Quiet()], EventClock(),
+                         Blotter("ES", 50.0), live_owners=set(),
+                         warmup_gate=False)
+        eng.lag_report_s = report_s
+        eng.feed_delay_s = delay_s
+        await eng.run()
+        return eng
+
+    return asyncio.run(go())
+
+
+def _errors(fn):
+    import io
+    buf = io.StringIO()
+    h = logging.StreamHandler(buf)
+    h.setLevel(logging.ERROR)
+    log = logging.getLogger("engine.live")
+    log.addHandler(h)
+    try:
+        fn()
+    finally:
+        log.removeHandler(h)
+    return buf.getvalue()
+
+
+def test_the_subscribed_delay_alone_raises_nothing():
+    """THE 173-LINE REGRESSION. Ten minutes behind on a ten-minute feed is the
+    feed working as bought."""
+    out = _errors(lambda: _run_delayed(600.0, 600.0))
+    assert "BEHIND" not in out, (
+        f"alarmed on the baseline delay itself:\n{out[:300]}")
+
+
+def test_excess_over_the_delay_still_alarms():
+    """...and the thing it exists to catch must still get through. 2026-08-12
+    was ~59 minutes of real backlog sitting ON TOP of this same baseline."""
+    out = _errors(lambda: _run_delayed(600.0 + 59 * 60, 600.0))
+    assert "BEHIND" in out, "59 minutes of real backlog reported as normal"
+    assert "59" in out or "58" in out, (
+        f"the number reported must be the EXCESS, not the total:\n{out[:300]}")
+
+
+def test_a_real_time_feed_keeps_the_old_behaviour():
+    out = _errors(lambda: _run_delayed(69 * 60, 0.0))
+    assert "BEHIND" in out
+
+
+def test_excess_is_exposed_for_diagnostics():
+    eng = _run_delayed(600.0 + 300.0, 600.0, report_s=0.0)
+    assert abs(eng.excess_lag_s - 300.0) < 30.0, eng.excess_lag_s
+    assert eng.feed_lag_s > 800.0          # the raw number is still there
+
+
+def test_a_lane_still_in_warmup_reports_nothing():
+    """NT8 sends days of backfill on connect -- 4,961 bars on 2026-08-13 -- and
+    the warmup gate suppresses every order it produces. Reporting 'orders are
+    being decided on that-old data' there is simply untrue."""
+    from engine.core.events import Bar
+    base = time.time_ns() - 3 * 86400 * NS          # three days of backfill
+    # BARS, which is what NT8 actually replays on connect. Only a live TRADE
+    # flips a lane out of warmup, so a bar-only stream keeps it warming -- and
+    # an ascending trade would never register as stale, which is exactly why
+    # the warmup gate is a separate mechanism from the staleness check.
+    evs = [Bar(base + i * 60 * NS, "1m", 7700.0, 7701.0, 7699.0, 7700.0, 500, "ES")
+           for i in range(1100)]
+
+    def go():
+        async def _go():
+            eng = LiveEngine(_Feed(evs), _Broker(), [_Quiet()], EventClock(),
+                             Blotter("ES", 50.0), live_owners=set(),
+                             warmup_gate=True)          # never flips: all stale
+            eng.lag_report_s = 0.001
+            await eng.run()
+        asyncio.run(_go())
+
+    out = _errors(go)
+    assert "BEHIND" not in out, (
+        f"alarmed while still consuming backfill, with every order "
+        f"suppressed:\n{out[:300]}")
