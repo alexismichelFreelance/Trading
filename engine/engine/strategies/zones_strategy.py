@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core.events import Bar
-from ..core.orders import Order
+from ..core.orders import Order, OrderType
 from ..core.timeutil import et_minute_of_day, et_session_date, ns_to_utc
 from ..features.bars import BarAggregator
 from ..features.zones import ZoneDetector
@@ -220,7 +220,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
         return min(z.bot for z in cands) if dir_sign > 0 else max(z.top for z in cands)
 
     def _enter(self, setup: str, d: int, entry: float, stop: float, target: float,
-               z: "_ZoneRec | None" = None) -> list[Order]:
+               z: "_ZoneRec | None" = None, bar: Bar | None = None) -> list[Order]:
         risk = abs(entry - stop)
         size = position_size(RISK, risk, self.point_usd, 30)
         if size <= 0:
@@ -229,7 +229,52 @@ class ZoneLifecycleStrategy(BaseStrategy):
                             entry + d * SCALP, remaining=size)
         tag = (zone_tag(setup, z.dep, z.base_s, z.touches, self.tf) if z is not None
                else f"{setup.lower()}-entry")
-        return [Order(self.symbol, d, size, tag=tag)]
+        # PRICED AT THE EDGE. This recorded `entry` -- the zone edge -- and then
+        # sprayed at the market, so stop, target, scalp_px and the post-scalp
+        # breakeven stop were all measured from a price the trade never had. It
+        # showed up as an impossibility: over 25 ES sessions ES:zones_gap booked
+        # 26 BREAKEVEN exits worth -12,225, a mean of -$470 each. `be` flattens
+        # at t.stop = t.entry, so a breakeven exit that loses $470 is not a
+        # result, it is the entry price being wrong.
+        #
+        # NOT a resting LIMIT, which is what I tried first and the replay threw
+        # out: ES:zones and ES:zones_15m went from 9 and 12 trading days to ZERO,
+        # zones_gap from 25 to 2. The touch that produces the signal happens
+        # DURING the bar being closed, so a limit resting from the close onward
+        # can only fill if price comes back -- on a 30m bar it does not. That
+        # converts "enter at the level" into "enter on a re-touch", a different
+        # strategy, not a fill-price correction. (Same mistake as the vwapbreak
+        # retest bug: moving the ORDER instead of the PRICE.)
+        #
+        # The bar's own range contains the level, by the condition that fired:
+        #     FADE d>0  b.l <= z.top      reached from above
+        #     FLIP d>0  b.h >= z.bot      reached from below
+        # so the trade happens on this bar, at that level -- exactly how a
+        # resting order would have been filled inside it. `bar` also carries the
+        # GAP case: an open already beyond the level means there was never a
+        # print at it, and the open is the honest fill (base.level_fill).
+        #
+        # BREAK keeps no level at all: its entry is b.c, the close of the bar
+        # that broke the zone. The entry price IS the market there, and claiming
+        # a level would invent one the setup does not have.
+        # ...but ONLY if the zone existed BEFORE this bar. `_on_tf_bar` appends
+        # zones from det.update(b) and then calls _scan(b), so a zone can be
+        # detected and faded on the same bar -- and a zone is created by its
+        # DEPARTURE bar, whose extreme IS the edge. Pricing those at the edge is
+        # lookahead: the level was not knowable until the bar closed, by which
+        # time price was at the close. Measured on the recorded ES tape
+        # (strategy_lab/zone_entry_lookahead.py): 8 of 33 entries are same-bar,
+        # and all 8 are FADE -- two thirds of every fade the sleeve takes. Those
+        # keep the market price, which is what they could actually have got.
+        same_bar = z is not None and z.k >= self._k
+        if setup == "BREAK" or bar is None or z is None or same_bar:
+            return [Order(self.symbol, d, size, tag=tag)]
+        # `d` here is the TRADE direction (for FLIP that is -z.dir, not the
+        # zone's). In both setups a SHORT is entered at a level above, which
+        # price rises into, and a LONG at a level below, which it falls into --
+        # so the one test covers fade and flip and both zone directions.
+        return [Order(self.symbol, d, size, tag=tag,
+                      trigger_price=level_fill(bar, entry, rising=d < 0))]
 
     def _scan(self, b: Bar) -> list[Order]:
         for z in self.zones:
@@ -245,7 +290,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
                         stop0 = z.bot - 1 if d > 0 else z.top + 1
                         tgt = z.prox + d * abs(z.prox - stop0) * 2
                     return self._enter("FADE", d, z.prox, z.bot - 1 if d > 0 else z.top + 1,
-                                   tgt, z)
+                                   tgt, z, b)
             # detect break
             if not z.broke and ((b.c < z.bot - 1) if d > 0 else (b.c > z.top + 1)):
                 z.broke = True
@@ -257,7 +302,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
                 if tgt is None:
                     tgt = b_entry + bdir * abs(b_entry - b_stop) * 2
                 if self.enable_break:
-                    return self._enter("BREAK", bdir, b_entry, b_stop, tgt, z)
+                    return self._enter("BREAK", bdir, b_entry, b_stop, tgt, z, b)
             # FLIP — retest from broken side
             if z.broke and not z.flip_done and z.break_k is not None and self._k >= z.break_k + 2:
                 ft = (b.h >= z.bot and b.h <= z.top + 0.5) if d > 0 else (b.l <= z.top and b.l >= z.bot - 0.5)
@@ -269,7 +314,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
                     tgt = self._opp_target(d, f_entry, self._k, fdir)
                     if tgt is None:
                         tgt = f_entry + fdir * abs(f_entry - f_stop) * 2
-                    return self._enter("FLIP", fdir, f_entry, f_stop, tgt, z)
+                    return self._enter("FLIP", fdir, f_entry, f_stop, tgt, z, b)
                 if (b.c > z.top + 5) if d > 0 else (b.c < z.bot - 5):
                     z.flip_done = True   # ran away, no flip
         return []
