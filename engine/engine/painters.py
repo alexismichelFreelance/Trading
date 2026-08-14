@@ -104,6 +104,30 @@ class ZoneView:
         return res, sup
 
 
+def gamma_label(price: float, flip: float | None, net_sign: int) -> str:
+    """The regime AT PRICE, for the chart.
+
+    This was `"long-gamma" if net_sign > 0 else "SHORT-gamma"` -- net_sign being
+    the sign of the WHOLE option book. Across the 44 rebuilt CBOE payloads that
+    disagreed with the regime where price actually sat on 25 of 44 sessions
+    (57%), and every disagreement was the same way round: book LONG, local
+    SHORT. Spot sat below the flip continuously from 2026-08-06 to 08-13 on both
+    SPX and NDX, so the chart said "pinning" through a fortnight that was
+    structurally amplifying.
+
+    Above the flip cumulative dealer gamma is positive (hedging damps moves);
+    below it negative (hedging amplifies). With no flip in the book there is no
+    boundary and the book sign is the only answer available -- 14 of the 44
+    sessions were like that. With no price yet, say so rather than guess: a
+    fallback to net_sign is precisely the bug being removed.
+    """
+    if not price:
+        return "regime unknown"
+    if flip is None:
+        return "long-gamma" if net_sign > 0 else "SHORT-gamma"
+    return "long-gamma" if price > flip else "SHORT-gamma"
+
+
 class PaintController:
     def __init__(self, painter: NTChartPainter, strategies: list,
                  panel_pos: str = "bottomleft") -> None:
@@ -267,7 +291,7 @@ class PaintController:
         if not g or bucket == self._gamma_bucket:  # recover after a chart refresh
             return                                  # (static levels; cheap, 3 objects)
         self._gamma_bucket = bucket
-        reg = "long-gamma" if g["net_sign"] > 0 else "SHORT-gamma"
+        reg = gamma_label(self._last_px, g.get("flip"), g["net_sign"])
         rows = [("eng-gex-pw", g["put_wall"], GEX_PUT, "put wall"),
                 ("eng-gex-cw", g["call_wall"], GEX_CALL, "call wall")]
         if g.get("flip") is not None:
