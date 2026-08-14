@@ -350,20 +350,27 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return OvernightBreakStrategy(symbol)
     if label == "onbreak_gex":       # variant: breaks only on short-gamma days
         return OvernightBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
-    # onbreak_2p and onbreak_2p32 REMOVED: the same entry with a decay/range
-    # two-phase exit differing only in arming distance, and correlated
-    # +0.92 to +0.98 with onbreak_2p24 over 33 pinned ES sessions. On
-    # 2026-08-14 all five onbreak rows entered at 10:22 and the family booked
-    # +3,650 of a +4,665 day -- one bet counted five times. 2p32 scored best
-    # (+2,712 vs 2p24's +1,075) and is deliberately NOT the survivor: picking
-    # the top of three ~0.95-correlated twins is selecting on the outcome, and
-    # 24 is the arming distance already retained on opendrive and vwapbreak.
+    # onbreak_2p and onbreak_2p24 REMOVED: the same entry with a decay/range
+    # two-phase exit differing only in arming distance. On 2026-08-14 all five
+    # onbreak rows entered at 10:22 and the family booked +3,650 of a +4,665
+    # day -- one bet counted five times.
+    #
+    # WHICH one survives was settled by the PAIRED daily difference, not by
+    # correlation and not by a convention. Correlation (+0.92..+0.98) says they
+    # are redundant; it cannot say which to keep, because it is high precisely
+    # BECAUSE they are identical on 26 of 29 days. Paired, over 29 ES sessions:
+    #     2p32 vs 2p24     differ on  3 days, 2p32 wins 3/3, mean +546, t=7.67
+    #     2p32 vs 2p       differ on  6 days, wins 4/6,      mean  +58, t=0.17
+    # so 2p24 is dominated -- it never wins on a day where they differ -- and 2p
+    # is indistinguishable. Arming further out (32 vs 24) means not arming on
+    # smaller moves, so winners run; that only bites on the few days with a move
+    # big enough, and on every one of those it paid.
+    if label == "onbreak_2p32":
+        return OvernightBreakStrategy(symbol, two_phase=TwoPhaseExit(
+            rev_kind="range", rev_f=0.25, arm_pts=32.0))
     if label == "onbreak_2p_retrace":
         return OvernightBreakStrategy(symbol,
                                       two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
-    if label == "onbreak_2p24":      # fixed-distance arming (see opendrive_2pN)
-        return OvernightBreakStrategy(symbol, two_phase=TwoPhaseExit(
-            rev_kind="range", rev_f=0.25, arm_pts=24.0))
     if label == "sweepfade":         # MBO-derived: fade deep aggressive sweeps
         return SweepFollowStrategy(symbol, min_span_ticks=6, hold_s=15.0)
     if label == "sweepfade_deep":    # higher conviction, fewer signals
@@ -433,7 +440,7 @@ ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
                             # fixed-distance arming twins — the variant that measured better
               # than the volatility ruler; 16/24/32pt all run, none privileged
               "opendrive_2p24",
-              "onbreak_2p24",
+              "onbreak_2p32",
               "vwapbreak_2p24", "vwapbreak_qual", "vwapbreak_qual_tol", "vwapbreak_qual_2p",
               "vwapbreak_q_noext", "vwapbreak_q_noclean",
               "vwapbreak_q_band", "vwapbreak_q_bandnoext",
@@ -452,9 +459,23 @@ def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
     from engine.adapters.questdb import QuestDB as _Q
     from engine.features.gamma_levels import GammaLevels
     und = gexc.get("underlying", "SPX")
-    basis = gex_basis_override if (sym == "ES" and gex_basis_override is not None) \
-        else float(gexc.get("basis", 0.0))
-    lv = GammaLevels(_Q(timeout=30), underlying=und).levels_prev(day, basis=basis)
+    q = _Q(timeout=30)
+    # MEASURED, not configured. The yaml constants (ES 42.0, NQ 181.0) were each
+    # a single reading on 2026-07-20 with a comment saying to re-measure, and
+    # nothing did -- a comment is not a mechanism. The basis DECAYS as the front
+    # contract approaches expiry: ES 47.6 -> 22.5 and NQ 225.1 -> 99.5 over 13
+    # stored sessions. By 2026-08-15 the configured values were 21.7 (ES) and
+    # 81.5 (NQ) points out, so every wall and flip was drawn that far from where
+    # it belongs, worsening daily until the roll. A constant is the wrong SHAPE
+    # for the quantity. The yaml value is now only a fallback for when there is
+    # nothing to measure, and it says so when it is used.
+    if sym == "ES" and gex_basis_override is not None:
+        basis = gex_basis_override
+    else:
+        from engine.features.gamma_basis import BasisSeries
+        basis = BasisSeries.load(q, und, sym,
+                                 float(gexc.get("basis", 0.0))).for_day(day)
+    lv = GammaLevels(q, underlying=und).levels_prev(day, basis=basis)
     return lv, und, basis
 
 

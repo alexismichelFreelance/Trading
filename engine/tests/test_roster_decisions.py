@@ -114,32 +114,53 @@ def test_disabling_the_runner_takes_the_whole_position_at_the_scalp():
 def test_only_one_of_the_correlated_onbreak_twins_is_deployed():
     """ONBREAK: three twins were the same bet counted three times.
 
-    Pinned replay, 33 ES sessions, pairwise daily-P&L correlation:
-        onbreak_2p24 ~ onbreak_2p32   +0.983
-        onbreak_2p   ~ onbreak_2p32   +0.925
-        onbreak_2p   ~ onbreak_2p24   +0.920
-    All three are the SAME entry with a decay/range two-phase exit differing
-    only in arming distance. On 2026-08-14 all five onbreak rows entered at
-    10:22 and the family booked +3,650 of a +4,665 day -- one signal inflating
-    the total fivefold and making the book look diversified.
+    2p, 2p24 and 2p32 are the SAME entry with a decay/range two-phase exit
+    differing only in arming distance. On 2026-08-14 all five onbreak rows
+    entered at 10:22 and the family booked +3,650 of a +4,665 day -- one signal
+    inflating the total fivefold and making the book look diversified.
 
-    KEPT and why:
-      onbreak          the raw entry, no two-phase. It LOSES (-1,488 over 23
-                       sessions) while every two-phase twin makes money, which
-                       is the contrast that says the exit is doing the work.
-                       A control that disagrees with the deployed config is
-                       worth more than a fourth copy that agrees.
-      onbreak_2p24     one representative of the cluster.
-      onbreak_2p_retrace  a genuinely different exit family (retrace, not
-                       decay/range) -- absent from the >0.9 list.
-      onbreak_gex      a different question: does the gamma gate help.
+    WHICH ONE SURVIVES was settled by the PAIRED daily difference. Correlation
+    (+0.92 to +0.98) established only that they are redundant; it cannot choose
+    between them, and reasoning from it led me straight to the wrong answer. It
+    is high precisely BECAUSE they are identical on 26 of 29 days -- so it is a
+    statistic about the 26, while the decision lives entirely in the 3.
 
-    2p32 scored best on this sample (+2,712 against 2p24's +1,075) and is NOT
-    the one kept. Choosing the top scorer out of three ~0.95-correlated twins
-    is selecting on the outcome; 24 is the arming distance already used as the
-    retained control on opendrive and vwapbreak, so it is the choice made for a
-    reason that is not this sample."""
-    for gone in ("onbreak_2p", "onbreak_2p32"):
-        assert gone not in ALL_LABELS, f"{gone} is a duplicate of onbreak_2p24"
-    for kept in ("onbreak", "onbreak_2p24", "onbreak_2p_retrace", "onbreak_gex"):
+    Paired over 29 pinned ES sessions, positive = 2p32 better:
+        vs 2p24    differ on  3 days   2p32 wins 3/3   mean +546   t = 7.67
+        vs 2p      differ on  6 days   wins 4/6        mean  +58   t = 0.17
+        vs retrace differ on 12 days   wins 7/12       mean +132   t = 0.54
+        vs raw     differ on 15 days   wins 7/15       mean +280   t = 1.23
+
+    2p24 is DOMINATED -- on every day where the two diverge, 2p32 wins, by a
+    similar amount each time. That is not the signature of noise, and the
+    mechanism is plain: arming at 32 rather than 24 means not arming on smaller
+    moves, so a winner keeps running. It only bites on days with a move large
+    enough, and on all three of those it paid.
+
+    I first kept 2p24 and retired 2p32 on the grounds that picking the top
+    scorer of three correlated twins is selecting on the outcome, and that 24
+    matched the arming distance retained on opendrive and vwapbreak. Both halves
+    were wrong. If the difference is noise the right conclusion is indifference,
+    not a preference for the worse one; and an arming distance has no reason to
+    port between sleeves with different ranges. The anti-overfitting instinct
+    was applied to reach a conclusion it does not support, in place of a
+    measurement that was already available.
+
+    KEPT:
+      onbreak             raw entry, no two-phase. It LOSES (-1,488 over 23
+                          sessions) while every twin makes money -- the contrast
+                          showing the EXIT does the work. A control that
+                          disagrees with the deployed config is worth more than
+                          another copy that agrees.
+      onbreak_2p32        the cluster's representative, on the evidence above.
+      onbreak_2p_retrace  a different exit family: it diverges on 12 of 29 days
+                          against 2p24's 3, and is not distinguishable in
+                          outcome (t = 0.54). Genuinely a second opinion.
+      onbreak_gex         a different question -- does the gamma gate help.
+    """
+    for gone in ("onbreak_2p", "onbreak_2p24"):
+        assert gone not in ALL_LABELS, (
+            f"{gone} is redundant with onbreak_2p32 (paired t=7.67 against "
+            f"2p24, t=0.17 against 2p)")
+    for kept in ("onbreak", "onbreak_2p32", "onbreak_2p_retrace", "onbreak_gex"):
         assert kept in ALL_LABELS, f"{kept} should still be deployed"
