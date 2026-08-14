@@ -43,10 +43,25 @@ sys.path.insert(0, str(ROOT / "tools"))
 from run_live import ALL_LABELS, _make  # noqa: E402
 
 
-def test_zones_label_disables_break_and_runner():
+def test_zones_label_disables_break_but_keeps_the_runner():
+    """RE-DERIVED on corrected fills, 23 sessions. Both cuts in 3f42771 were
+    made on numbers produced by the broken fill model -- stops priced at the bar
+    close, entries at the market while every managed level was measured from the
+    zone edge:
+
+        break   14 trips  -2,112  50% win     (the old numbers said -1,938 / 25%)
+        runner  11 scaled trades: half off at +4 +7,262, RUNNER LEG +1,850
+
+    The runner was cut for "gives back more than it makes" (-2,100 / 25% win).
+    It makes +1,850. That cut was wrong and is reversed.
+
+    Break still loses, so it stays off -- but as a small loss at a coin-flip win
+    rate, not the 1-in-4 outlier the original number made it look like."""
     s = _make("zones", symbol="ES")
-    assert s.enable_break is False, "the BREAK setup is 1-for-4 and still enabled"
-    assert s.runner is False, "the breakeven runner is 1-for-4 and still enabled"
+    assert s.enable_break is False, "the BREAK setup loses and is still enabled"
+    assert s.runner is True, (
+        "the runner is still disabled on the pre-fix numbers; the runner leg is "
+        "+1,850 over 11 scaled trades once the fills are priced honestly")
 
 
 def test_vwapbreak_label_enters_at_the_line():
@@ -94,3 +109,37 @@ def test_disabling_the_runner_takes_the_whole_position_at_the_scalp():
     assert out, "scalp level touched but nothing closed"
     assert out[0].qty == 4, f"closed {out[0].qty} of 4 -- a runner was left behind"
     assert s.trade is None, "trade still open after a full scalp exit"
+
+
+def test_only_one_of_the_correlated_onbreak_twins_is_deployed():
+    """ONBREAK: three twins were the same bet counted three times.
+
+    Pinned replay, 33 ES sessions, pairwise daily-P&L correlation:
+        onbreak_2p24 ~ onbreak_2p32   +0.983
+        onbreak_2p   ~ onbreak_2p32   +0.925
+        onbreak_2p   ~ onbreak_2p24   +0.920
+    All three are the SAME entry with a decay/range two-phase exit differing
+    only in arming distance. On 2026-08-14 all five onbreak rows entered at
+    10:22 and the family booked +3,650 of a +4,665 day -- one signal inflating
+    the total fivefold and making the book look diversified.
+
+    KEPT and why:
+      onbreak          the raw entry, no two-phase. It LOSES (-1,488 over 23
+                       sessions) while every two-phase twin makes money, which
+                       is the contrast that says the exit is doing the work.
+                       A control that disagrees with the deployed config is
+                       worth more than a fourth copy that agrees.
+      onbreak_2p24     one representative of the cluster.
+      onbreak_2p_retrace  a genuinely different exit family (retrace, not
+                       decay/range) -- absent from the >0.9 list.
+      onbreak_gex      a different question: does the gamma gate help.
+
+    2p32 scored best on this sample (+2,712 against 2p24's +1,075) and is NOT
+    the one kept. Choosing the top scorer out of three ~0.95-correlated twins
+    is selecting on the outcome; 24 is the arming distance already used as the
+    retained control on opendrive and vwapbreak, so it is the choice made for a
+    reason that is not this sample."""
+    for gone in ("onbreak_2p", "onbreak_2p32"):
+        assert gone not in ALL_LABELS, f"{gone} is a duplicate of onbreak_2p24"
+    for kept in ("onbreak", "onbreak_2p24", "onbreak_2p_retrace", "onbreak_gex"):
+        assert kept in ALL_LABELS, f"{kept} should still be deployed"

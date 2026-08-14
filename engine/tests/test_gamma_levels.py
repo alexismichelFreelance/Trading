@@ -57,7 +57,26 @@ def test_painter_draws_three_gamma_lines():
     assert rp.hlines["eng-gex-cw"][0] == 7602.0
     assert rp.hlines["eng-gex-flip"][0] == 7625.0
     assert "put wall" in rp.texts["eng-gex-pw-t"][1]
-    assert "long-gamma" in rp.texts["eng-gex-flip-t"][1]
+    # No bar has been fed, so the painter has no price -- and the regime is a
+    # statement about where PRICE is. It used to answer from net_sign (the sign
+    # of the whole option book), which across 44 rebuilt CBOE payloads
+    # disagreed with the regime at spot on 25 of them.
+    assert "regime unknown" in rp.texts["eng-gex-flip-t"][1]
+
+
+def test_the_flip_label_follows_price_once_there_is_a_price():
+    """Below the flip is SHORT gamma however positive the book totals to; above
+    it is long. Same levels, two prices, two labels."""
+    for px, want in ((7600.0, "SHORT-gamma"), (7650.0, "long-gamma")):
+        rp = RecordPainter()
+        pc = PaintController(rp, [])
+        pc.set_gamma_levels(dict(put_wall=7552.0, call_wall=7602.0, flip=7625.0,
+                                 net_sign=1, basis=52.0))
+        pc._last_px = px
+        asyncio.run(pc._paint_gamma(123))
+        assert want in rp.texts["eng-gex-flip-t"][1], (
+            f"price {px} against a flip at 7625 labelled "
+            f"{rp.texts['eng-gex-flip-t'][1]!r}")
 
 
 def test_painter_short_gamma_no_flip_line():

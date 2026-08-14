@@ -280,20 +280,27 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
                                      gate_utc=FLOW_GATE, gamma=_gamma_or_none(symbol))
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
-        # break setup and breakeven runner dropped -- see tests/test_roster_decisions
-        return ZoneLifecycleStrategy(symbol, point_usd=pu,
-                                     enable_break=False, runner=False)
+        # BREAK stays off; the RUNNER is back on. Both were cut in 3f42771 on
+        # numbers produced by the broken fill model (stops priced at the bar
+        # close, entries at the market while every level was measured from the
+        # zone edge). Re-derived from corrected fills over 23 sessions:
+        #     break   14 trips  -2,112  50% win   (was -1,938 / 25%)
+        #     runner  11 scaled trades: half off at +4 +7,262, RUNNER LEG +1,850
+        # The runner was cut for "gives back more than it makes" (-2,100). It
+        # makes +1,850. Break still loses, so it stays off -- but it is a small
+        # loss at a coin-flip win rate, not the 1-in-4 outlier it was sold as.
+        return ZoneLifecycleStrategy(symbol, point_usd=pu, enable_break=False)
     # timeframe sweep: 30m is the ES-validated default; these exist to find out
     # whether NQ wants a different bucket, not to be traded on faith.
     if label == "zones_15m":
         return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="15m",
-                                     enable_break=False, runner=False)
+                                     enable_break=False)
     if label == "zones_1h":
         return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="1h",
-                                     enable_break=False, runner=False)
+                                     enable_break=False)
     if label == "zones_4h":
         return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="4h",
-                                     enable_break=False, runner=False)
+                                     enable_break=False)
     if label == "zones_gap":         # variant: leave-and-return gap zones on
         return ZoneLifecycleStrategy(symbol, gap_thr=5.0, point_usd=pu)
     if label == "dipbuy":
@@ -343,18 +350,20 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return OvernightBreakStrategy(symbol)
     if label == "onbreak_gex":       # variant: breaks only on short-gamma days
         return OvernightBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
-    if label == "onbreak_2p":        # ride-then-protect twin (gave back 74.75pt)
-        return OvernightBreakStrategy(symbol,
-                                      two_phase=TwoPhaseExit(12.0, "decay", 0.1))
+    # onbreak_2p and onbreak_2p32 REMOVED: the same entry with a decay/range
+    # two-phase exit differing only in arming distance, and correlated
+    # +0.92 to +0.98 with onbreak_2p24 over 33 pinned ES sessions. On
+    # 2026-08-14 all five onbreak rows entered at 10:22 and the family booked
+    # +3,650 of a +4,665 day -- one bet counted five times. 2p32 scored best
+    # (+2,712 vs 2p24's +1,075) and is deliberately NOT the survivor: picking
+    # the top of three ~0.95-correlated twins is selecting on the outcome, and
+    # 24 is the arming distance already retained on opendrive and vwapbreak.
     if label == "onbreak_2p_retrace":
         return OvernightBreakStrategy(symbol,
                                       two_phase=TwoPhaseExit(12.0, "retrace", 0.25))
     if label == "onbreak_2p24":      # fixed-distance arming (see opendrive_2pN)
         return OvernightBreakStrategy(symbol, two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=24.0))
-    if label == "onbreak_2p32":
-        return OvernightBreakStrategy(symbol, two_phase=TwoPhaseExit(
-            rev_kind="range", rev_f=0.25, arm_pts=32.0))
     if label == "sweepfade":         # MBO-derived: fade deep aggressive sweeps
         return SweepFollowStrategy(symbol, min_span_ticks=6, hold_s=15.0)
     if label == "sweepfade_deep":    # higher conviction, fewer signals
@@ -420,11 +429,11 @@ ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
               "pivot", "vwapbreak", "onbreak", "onbreak_gex",
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
-                            "onbreak_2p", "onbreak_2p_retrace",
+                            "onbreak_2p_retrace",
                             # fixed-distance arming twins — the variant that measured better
               # than the volatility ruler; 16/24/32pt all run, none privileged
               "opendrive_2p24",
-              "onbreak_2p24", "onbreak_2p32",
+              "onbreak_2p24",
               "vwapbreak_2p24", "vwapbreak_qual", "vwapbreak_qual_tol", "vwapbreak_qual_2p",
               "vwapbreak_q_noext", "vwapbreak_q_noclean",
               "vwapbreak_q_band", "vwapbreak_q_bandnoext",
