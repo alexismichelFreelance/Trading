@@ -39,12 +39,17 @@ level:
     FLIP  d>0:  b.h >= z.bot          -> price traded up to the flip level
 
 so the trade happens on that bar, at that level -- exactly how an order resting
-inside the bar would have been filled. That is `trigger_price`, the same
-mechanism the exits use, and it leaves the trade COUNT alone.
+at the edge since the zone was DETECTED would have been filled. The two are the
+same thing, which is why no cancellation machinery is needed: the sleeve's "first
+touch of a fresh zone" condition IS the resting order's first fillable bar.
+
+And where no order could have been resting -- a zone created by the very bar
+being traded -- there is NO TRADE. Not a worse price: a limit fills at its price
+or not at all. See the last two tests in this file.
 
 BREAK is deliberately left a bare MARKET order. Its entry is `b.c`, the close of
-the bar that broke the zone -- there is no level, the entry price IS the market,
-and claiming one would invent a fill the setup never had.
+the bar that broke the zone -- there is no level to rest at, the entry price IS
+the market, and claiming one would invent a fill the setup never had.
 """
 from __future__ import annotations
 
@@ -125,9 +130,12 @@ def test_a_fade_entry_is_priced_at_the_zone_edge():
         "breakeven are all measured from a price the trade never had")
 
 
-def test_the_entry_does_not_rest(caplog):
-    """The correction to my own first fix. A resting order on a 30m timeframe
-    misses the touch that created the signal and the sleeve stops trading."""
+def test_the_order_is_not_left_resting_across_bars(caplog):
+    """A LIMIT emitted AFTER the touch bar closed is not the same order. It can
+    only fill on a RE-touch, which on a 30m bar does not come: that version took
+    ES:zones from 9 trading days to 0. The fill is evaluated on the bar that
+    reached the level, which is what a genuinely resting order would have done,
+    so no order is left outstanding and nothing needs cancelling."""
     s, entries = _sleeve_with_entries()
     for o in entries:
         assert o.type == OrderType.MARKET, (
@@ -195,34 +203,41 @@ def test_a_breakeven_exit_is_actually_breakeven():
 # recorded ES tape 8 of 33 entries are same-bar, and all 8 are FADE -- two
 # thirds of every fade the sleeve takes (strategy_lab/zone_entry_lookahead.py).
 
-def test_a_zone_traded_on_the_bar_that_created_it_gets_no_level():
-    """THE SECOND REGRESSION, mine. Priced at the edge, this turned the ES
-    replay from +67,000 to +135,050 -- every trade improving in the same
-    direction, which is what lookahead looks like, not what a fix looks like."""
+# ── a fill at the level, or no trade ─────────────────────────────────────────
+#
+# "If I put a limit order at a zone at 7700 there is no way I should get a fill
+# at 7703. Never."  -- and that settles it. Filling a same-bar zone at the bar
+# CLOSE (the patch below this one) was still a fill at a price the order never
+# had. There was no order: the zone did not exist until the bar closed.
+#
+# A limit resting from the moment the zone is detected would fill on the first
+# bar whose range reaches the level -- which is the sleeve's own "first touch of
+# a fresh zone" condition, so the two are the same thing and no cancellation
+# machinery is needed. The only case that differs is the zone created BY the bar
+# being traded, and there the honest answer is not a worse price. It is no trade.
+
+def test_a_zone_created_by_this_bar_produces_no_trade_at_all():
+    """THE RULE. Not 'fill it at the close' -- there was nothing resting to
+    fill. On the recorded ES tape this is 8 of 33 entries, all of them FADE."""
     from engine.core.events import Bar as _Bar
     from engine.strategies.zones_strategy import _ZoneRec
 
     s = ZoneLifecycleStrategy("ES", point_usd=50.0)
     s._k = 7
-    fresh = _ZoneRec(k=7, dir=1, top=7000.0, bot=6990.0)      # born THIS bar
+    fresh = _ZoneRec(k=7, dir=1, top=7000.0, bot=6990.0)
     b = _Bar(0, "30m", 6995.0, 7010.0, 6988.0, 7008.0, 500, "ES")
-    o = s._enter("FADE", 1, fresh.prox, 6989.0, 7020.0, fresh, b)[0]
-    assert o.trigger_price is None, (
-        f"claimed a fill at {o.trigger_price} on a zone created by this very "
-        f"bar -- the level did not exist until the bar closed at {b.c}")
+    assert s._enter("FADE", 1, fresh.prox, 6989.0, 7020.0, fresh, b) == [], (
+        "traded a zone that did not exist when the bar opened")
+    assert s.trade is None, "recorded a trade it never placed an order for"
 
 
-def test_an_older_zone_still_prices_at_its_edge():
-    """The legitimate case must survive the guard: a zone from an earlier bar
-    could genuinely have had an order resting on it."""
+def test_an_older_zone_trades_at_its_edge():
     from engine.core.events import Bar as _Bar
     from engine.strategies.zones_strategy import _ZoneRec
 
     s = ZoneLifecycleStrategy("ES", point_usd=50.0)
     s._k = 12
-    old = _ZoneRec(k=4, dir=1, top=7000.0, bot=6990.0)        # eight bars ago
+    old = _ZoneRec(k=4, dir=1, top=7000.0, bot=6990.0)
     b = _Bar(0, "30m", 7006.0, 7010.0, 6996.0, 7008.0, 500, "ES")
     o = s._enter("FADE", 1, old.prox, 6989.0, 7020.0, old, b)[0]
-    assert o.trigger_price == 7000.0, (
-        f"an eight-bar-old zone priced {o.trigger_price}; an order could have "
-        f"rested at 7000.00 the whole time")
+    assert o.trigger_price == 7000.0

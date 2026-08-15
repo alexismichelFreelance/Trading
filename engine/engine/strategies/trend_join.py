@@ -130,6 +130,12 @@ class TrendJoinStrategy(BaseStrategy):
             d = -1
         else:
             return []
+        # Near a gamma pocket edge a continuation entry is taken into
+        # reversion (VR30 0.86 there against 1.25 deep). Checked BEFORE any
+        # trade state is written, so a declined entry leaves the sleeve
+        # genuinely flat rather than tracking a position it never opened.
+        if not self.pocket_entry_ok(b.c):
+            return []
         self._trade = {"dir": d, "entry": b.c, "ts": b.ts}
         self._bars_held = 0
         if self.two_phase is not None:

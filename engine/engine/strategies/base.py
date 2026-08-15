@@ -37,6 +37,17 @@ def level_fill(bar: Bar, level: float, rising: bool) -> float:
 class BaseStrategy:
     symbol: str = ""
     gamma = None          # optional GammaRegime — a STRATEGY choice, not an engine gate
+    # Optional GammaCurve (engine/features/gamma_curve.py). None = no filter.
+    pocket = None
+    pocket_min_edge = 0.0   # points from a pocket edge; 0 disables that filter
+    # The last price this sleeve was shown. The local-sign gate needs a price and
+    # BookFlow carries none, so flow's gate -- which fires on a book event --
+    # would silently fall back to the percentile and make its twin a copy.
+    last_seen_px: float | None = None
+    # Per-VARIANT override of the regime a sleeve asks for. None =
+    # the call site decides (its natural want). Set on a twin to test
+    # the opposite classification without touching the sleeve.
+    regime_want: str | None = None
 
     # OPT-OUT, deliberately. A sleeve that says nothing is flattened at the
     # session boundary; only a genuine swing sleeve sets this True. The audit on
@@ -62,18 +73,73 @@ class BaseStrategy:
         December), so a UTC gate silently moves twice a year."""
         return SESSION_FLAT_MIN <= et_minute_of_day(ts) < SESSION_OPEN_MIN
 
-    def gamma_entry_ok(self, ts: int, want: str) -> bool:
-        """Dealer-gamma ENTRY filter, opt-in per strategy (set self.gamma).
-        want='short': enter only on short-gamma days (trend sleeves earn there —
-        gamma/GEX_FINDINGS.md D); want='long': only on mid/long-gamma days
-        (mean-reversion). Exits are never filtered (call this only on entries).
-        Fail-open: unknown regime (no GEX row) allows."""
+    def gamma_entry_ok(self, ts: int, want: str, price: float | None = None) -> bool:
+        """Dealer-gamma ENTRY filter, opt-in per strategy.
+
+        TWO SOURCES, and they disagree almost always.
+
+        `self.gamma` (GammaRegime) reads `gexp` -- a 252-day percentile of the
+        AGGREGATE book from SqueezeMetrics. It answers "is today's total gamma
+        large relative to the past year". Measured against the regime where
+        price actually sat, over 25 sessions with both available, it agreed
+        7/25 (28%) -- it printed LONG on 18 of 25 while price was in a
+        short-gamma pocket on 23 of 25.
+
+        `self.pocket` (GammaCurve) reads the sign of cumulative gamma AT PRICE.
+        That is the quantity the hedging argument is actually about: below the
+        flip dealers hedge with the move (amplify), above it against (pin).
+
+        When a curve AND a price are available the local sign wins, because it
+        is the thing the mechanism describes. Otherwise this falls back to the
+        percentile, and to True if neither is present -- an absent regime must
+        never stop a sleeve trading.
+
+        want='short': continuation sleeves, which need moves to compound.
+        want='long':  mean-reversion sleeves. Exits are never filtered."""
+        want = self.regime_want or want
+        px = price if price is not None else self.last_seen_px
+        if self.pocket is not None and px is not None:
+            a = self.pocket.at(px)
+            if a is not None and a.get("local_sign", 0) != 0:
+                sg = a["local_sign"] < 0
+                return sg if want == "short" else not sg
         if self.gamma is None:
             return True
         sg = self.gamma.is_short_gamma(et_session_date(ts))
         if sg is None:
             return True
         return sg if want == "short" else not sg
+
+
+    def pocket_entry_ok(self, price: float) -> bool:
+        """Stand down for a CONTINUATION entry taken near a gamma pocket edge.
+
+        Measured per bar over 30 ES / 20 NQ sessions
+        (strategy_lab/gamma_pocket_behaviour.py), variance ratio at 30 bars:
+
+            deep in a SHORT pocket   1.25 ES / 1.34 NQ   moves compound
+            near the pocket EDGE     0.86 ES / 0.73 NQ   moves revert
+            deep in a LONG pocket    0.84 ES / 0.50 NQ   moves revert
+
+        and the same split on the trades the sleeves already made
+        (strategy_lab/gamma_gate_check.py):
+
+            trend sleeves, SHORT, deep        442 trips  +50,722
+            trend sleeves, SHORT, near edge   105 trips  -15,212
+
+        Near the boundary price stops trending in BOTH regimes, so a
+        continuation entry there is taken into mean reversion. This filters that
+        one case and nothing else.
+
+        Fail-open: no curve, no threshold, or a book with no crossing at all (8
+        of 28 SPX sessions) allows the entry. Exits are never filtered."""
+        if self.pocket is None or self.pocket_min_edge <= 0.0:
+            return True
+        a = self.pocket.at(price)
+        if a is None:
+            return True
+        d = a.get("dist_to_flip")
+        return d is None or abs(d) >= self.pocket_min_edge
 
     def on_trade(self, e: Trade) -> list[Order]:
         return []

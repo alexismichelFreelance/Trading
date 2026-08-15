@@ -172,6 +172,8 @@ class OpenDriveStrategy(BaseStrategy):
         if d == 0:
             return []                           # keep waiting for an allowed break
         self.entered = True
+        if not self.pocket_entry_ok(px):        # see BaseStrategy.pocket_entry_ok
+            return []
         self.side = d
         self.entry_px = px
         rng = max(1e-9, self._or_hi - self._or_lo)

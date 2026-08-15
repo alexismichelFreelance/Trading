@@ -156,11 +156,43 @@ def test_only_one_of_the_correlated_onbreak_twins_is_deployed():
       onbreak_2p_retrace  a different exit family: it diverges on 12 of 29 days
                           against 2p24's 3, and is not distinguishable in
                           outcome (t = 0.54). Genuinely a second opinion.
-      onbreak_gex         a different question -- does the gamma gate help.
+      onbreak_gex         REMOVED 2026-08-15 with the rest of the _gex family
+                          -- see test_the_gex_family_is_gone.
     """
     for gone in ("onbreak_2p", "onbreak_2p24"):
         assert gone not in ALL_LABELS, (
             f"{gone} is redundant with onbreak_2p32 (paired t=7.67 against "
             f"2p24, t=0.17 against 2p)")
-    for kept in ("onbreak", "onbreak_2p32", "onbreak_2p_retrace", "onbreak_gex"):
+    for kept in ("onbreak", "onbreak_2p32", "onbreak_2p_retrace"):
         assert kept in ALL_LABELS, f"{kept} should still be deployed"
+
+
+def test_the_gex_family_is_gone():
+    """The _gex sleeves gated on a quantity that does not describe the market
+    they trade.
+
+    GammaRegime reads `gexp` -- a 252-day percentile of the AGGREGATE option
+    book from SqueezeMetrics. The hedging argument it claims to implement is
+    about the sign of cumulative gamma AT PRICE. Measured over the 25 sessions
+    where both were available, they agreed 7 times (28%): gexp said LONG on 18
+    while price sat in a short-gamma pocket on 23.
+
+    Worse, two of the three could never be checked. ignition and flow need
+    per-second book pressure, the replay reconstructed no BookFlow, and both
+    produced NO ROWS -- an absent result that reads exactly like a flat one. So
+    ignition_gex and flow_gex sat in the roster for weeks with their gate never
+    once evaluated against a counterfactual. (Fixed separately; see
+    tests/test_replay_bookflow.py.)
+
+    The local-sign twins that replace them are NOT yet better -- onbreak_lg
+    scored -3,800 against raw -1,488, a difference of one filtered day worth
+    +2,312. They are kept because they gate on the right quantity and are
+    measured from our own data, not because they have earned anything.
+
+    The blocker is the sample: 23 of 25 sessions were short-gamma, so a
+    short-gamma filter is nearly a no-op and a long-gamma filter stands the
+    sleeve down almost always. Neither can be distinguished from no gate at all
+    until a stretch with real regime variety."""
+    assert not [lb for lb in ALL_LABELS if lb.endswith("_gex")],         [lb for lb in ALL_LABELS if lb.endswith("_gex")]
+    for lg in ("ignition_lg", "flow_lg", "onbreak_lg"):
+        assert lg in ALL_LABELS, f"{lg} replaces its _gex twin and is missing"

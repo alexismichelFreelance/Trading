@@ -20,7 +20,10 @@ def test_live_flow_closes_at_1600_et_not_1700():
     assert FLOW_GATE == (13, 20)
     assert _et(FLOW_GATE[0]) == "09:00"
     assert _et(FLOW_GATE[1]) == "16:00"      # inside the session, not its edge
-    for lb in ("flow", "flow_gex"):
+    # flow_gex was removed 2026-08-15 with the rest of the _gex family (it
+    # gated on a percentile that described the regime at price 28% of the time);
+    # flow_lg replaces it and must inherit the same window.
+    for lb in ("flow", "flow_lg"):
         assert _make(lb, symbol="ES").gate_utc == FLOW_GATE
 
 

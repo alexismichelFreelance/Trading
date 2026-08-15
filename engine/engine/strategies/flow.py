@@ -77,6 +77,7 @@ class FlowFollowingStrategy(BaseStrategy):
         return th, 15.0 * th
 
     def on_trade(self, t: Trade) -> list[Order]:
+        self.last_seen_px = t.price     # for the local-gamma gate
         self._adelta += t.aggressor * t.size
         return []
 

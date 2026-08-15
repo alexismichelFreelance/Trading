@@ -109,7 +109,7 @@ class OvernightBreakStrategy(BaseStrategy):
             side = -1
         else:
             return []
-        if not self.gamma_entry_ok(ts, "short"):     # continuation needs short gamma
+        if not self.gamma_entry_ok(ts, "short", c):  # continuation needs short gamma
             return []
         self.used.add(side)
         stop = max(self.stop_floor, self.stop_mult * rng)

@@ -138,7 +138,7 @@ class IgnitionStrategy(BaseStrategy):
         if self.gate_utc is not None and \
                 not (self.gate_utc[0] <= ns_to_utc(ts).hour < self.gate_utc[1]):
             return []
-        if not self.gamma_entry_ok(ts, "short"):
+        if not self.gamma_entry_ok(ts, "short", getattr(self.feats, "pxc", None)):
             return []
         f = self.feats
         if f.strength is None:

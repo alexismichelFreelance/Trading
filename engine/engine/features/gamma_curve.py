@@ -57,9 +57,14 @@ class GammaCurve:
             self._calls = sorted(self._call_rank)
             self._puts = sorted(self._put_rank)
             self._curve = [(k + self.basis, n, c) for k, n, c in self._prof["curve"]]
+            # every strike ranked by |net|, carrying the net so direction is
+            # decidable at a strike that tops both the call and the put list
+            self._walls = sorted(((k + self.basis, n) for k, n, _ in
+                                  self._prof["curve"]),
+                                 key=lambda x: -abs(x[1]))[:8]
         else:
             self._flips = self._calls = self._puts = self._curve = []
-            self._call_rank = self._put_rank = []
+            self._call_rank = self._put_rank = self._walls = []
 
     # ── construction ─────────────────────────────────────────────────────
     @classmethod
@@ -123,6 +128,12 @@ class GammaCurve:
             call_wall=self._call_rank[0] if self._call_rank else None,
             put_wall=self._put_rank[0] if self._put_rank else None,
             call_walls=list(self._call_rank), put_walls=list(self._put_rank),
+            # (price, net_gex) ranked by SIZE of the net. A strike can top BOTH
+            # ranked lists -- SPX on 2026-08-14 had 7800 and 8000 in each -- so
+            # "is this support or resistance" cannot be answered from the lists.
+            # The NET at the strike answers it: call-heavy caps, put-heavy
+            # supports. Consumers that need a direction must read this.
+            walls=list(self._walls),
             wall_above=self._calls[ca] if ca < len(self._calls) else None,
             wall_below=self._puts[pb - 1] if pb > 0 else None,
             underlying=self.underlying,

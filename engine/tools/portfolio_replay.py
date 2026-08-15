@@ -42,7 +42,7 @@ sys.path.insert(0, str(ROOT))
 from engine.adapters.questdb import QuestDB                      # noqa: E402
 from engine.core.blotter import Blotter                          # noqa: E402
 from engine.core.clock import EventClock                         # noqa: E402
-from engine.core.events import BUY, SELL, Bar, Trade             # noqa: E402
+from engine.core.events import BUY, SELL, Bar, BookFlow, Trade             # noqa: E402
 from engine.core.live_engine import LiveEngine                   # noqa: E402
 from tools.flow_replication import session_days                  # noqa: E402
 from tools.run_live import ALL_LABELS, _make                     # noqa: E402
@@ -141,11 +141,22 @@ def _events_from(df: pd.DataFrame, symbol: str) -> list:
     out = []
     for i in order:
         t = int(ts[i])
-        if kind[i] == 1:
+        k = int(kind[i])
+        if k == 1:
             out.append(Trade(t, float(a[i]), int(b[i]), int(c[i]), symbol))
-        else:
+        elif k == 0:
             out.append(Bar(t, "1m", float(a[i]), float(b[i]), float(c[i]),
                            float(d[i]), int(e[i]), symbol))
+        elif k == 2:
+            # per-second book pressure. Without this ignition and flow see no
+            # BookFlow at all and produce NO ROWS -- an absent result that reads
+            # exactly like a flat one, which is how their gate went unverified.
+            out.append(BookFlow(t, float(a[i]), float(b[i]), float(c[i]),
+                                float(d[i]), symbol))
+        else:
+            # `else means Bar` is what hid the missing kind. An unknown kind is
+            # a decoder bug; mis-typing it into the tape is worse than stopping.
+            raise ValueError(f"unknown replay event kind {k!r} at ts {t}")
     return out
 
 
@@ -203,9 +214,28 @@ def _fetch_live(qdb: QuestDB, symbol: str, day: str):
                 f"WHERE symbol='{symbol}' "
                 f"AND ts >= '{_lo}' "
                 f"AND ts <  '{_hi}' ORDER BY ts")
+    # PER-SECOND BOOK PRESSURE. Recorded since 2026-07-14 for exactly this and
+    # never wired in, so ignition and flow saw no BookFlow, took no trades and
+    # produced no rows -- an ABSENT result that reads like a flat one. That is
+    # how their gamma gate sat in the roster for weeks without ever being
+    # evaluated against a counterfactual.
+    sec = qdb.df("SELECT ts, bid_cancel, ask_cancel, bid_add, ask_add "
+                 "FROM claude_sec_live "
+                 f"WHERE symbol='{symbol}' "
+                 f"AND ts >= '{_lo}' "
+                 f"AND ts <  '{_hi}' ORDER BY ts")
     if tr.empty and br.empty:
         return None
     parts = []
+    if len(sec):
+        parts.append(pd.DataFrame({
+            "ts": pd.to_datetime(sec["ts"]).astype("int64"),
+            "kind": 2,
+            "a": sec["bid_cancel"].astype(float),
+            "b": sec["ask_cancel"].astype(float),
+            "c": sec["bid_add"].astype(float),
+            "d": sec["ask_add"].astype(float),
+            "e": 0}))
     if len(tr):
         parts.append(pd.DataFrame({
             "ts": pd.to_datetime(tr["ts"]).astype("int64"),
@@ -292,6 +322,40 @@ def build_strategies(symbol, labels, peer_map):
     return out
 
 
+_CURVE_CACHE: dict = {}
+
+
+def _attach_curves(qdb, strats, symbol: str, day: str) -> None:
+    """Give every pocket-gated sleeve the curve for `day`, or None.
+
+    Cached per (symbol, day) so a 30-session replay does not re-read the strike
+    table once per sleeve. Fail-open: any failure leaves pocket=None, which
+    BaseStrategy.pocket_entry_ok treats as no filter."""
+    want = [s for s in strats if getattr(s, "pocket_min_edge", 0.0) > 0.0
+            or getattr(s, "_wants_curve", False)
+            or type(s).__name__ == "WallFadeStrategy"]
+    if not want:
+        return
+    key = (symbol, day)
+    if key not in _CURVE_CACHE:
+        try:
+            from engine.core.config import root_symbol
+            from engine.features.gamma_basis import BasisSeries
+            from engine.features.gamma_curve import GammaCurve
+            root = root_symbol(symbol)
+            und = {"ES": "SPX", "NQ": "NDX"}.get(root)
+            if und is None:
+                _CURVE_CACHE[key] = None
+            else:
+                basis = BasisSeries.load(qdb, und, root, 0.0).for_day(day)
+                c = GammaCurve.load_prev(qdb, day, basis, underlying=und)
+                _CURVE_CACHE[key] = c if c.ok else None
+        except Exception:                              # noqa: BLE001
+            _CURVE_CACHE[key] = None
+    for s in want:
+        s.pocket = _CURVE_CACHE[key]
+
+
 async def run_day(qdb, symbol, day, labels, peer_map, source="mbo",
                   min_events=10_000, strats=None):
     ev = load_events(qdb, symbol, day, source)
@@ -299,6 +363,10 @@ async def run_day(qdb, symbol, day, labels, peer_map, source="mbo",
         return None
     if strats is None:                      # standalone use keeps old behaviour
         strats = build_strategies(symbol, labels, peer_map)
+    # Hand the pocket-gated sleeves the PRIOR session's curve. Strategy objects
+    # persist across the replay (see build_strategies), so the curve has to be
+    # refreshed per session or every day would be gated on the first day's book.
+    _attach_curves(qdb, strats, symbol, day)
     eng = LiveEngine(HistFeed(ev), NullBroker(), strats, EventClock(),
                      Blotter(symbol, POINT_USD_OF.get(symbol, POINT_USD),
                              ), warmup_gate=False,
@@ -397,12 +465,20 @@ def _select(only: str) -> list[str]:
     return sel
 
 
-async def main_async(symbol, ndays, peer_map, source="mbo", only=""):
+async def main_async(symbol, ndays, peer_map, source="mbo", only="", until=""):
     qdb = QuestDB(timeout=240.0)
     labels = _select(only)
     rows, allflat = [], []
     days = (_live_days(qdb, symbol) if source == "live"
             else session_days(symbol, None, None))
+    # PIN THE WINDOW. --days N alone takes the last N sessions PRESENT IN THE
+    # DATABASE, which moves every time a new session is recorded. Two runs a day
+    # apart then cover different days, and the difference gets read as an effect
+    # of whatever code changed in between: on 2026-08-13 that made nine sleeves
+    # I had not touched appear to move, and sent me hunting for a coupling bug
+    # that did not exist. An A/B against a rolling window is not an A/B.
+    if until:
+        days = [d for d in days if d <= until]
     # live capture has far fewer events than mbo_events; do not skip real days
     minev = 500 if source == "live" else 10_000
     strats = build_strategies(symbol, labels, peer_map)
@@ -437,6 +513,10 @@ def main() -> None:
                     help="'live' rebuilds from claude_ticks_live/claude_bars_live "
                          "(symbol ES/NQ) -- use this to regenerate the corrupted "
                          "claude_paper_fills record")
+    ap.add_argument("--until", default="",
+                    help="last session date to include (YYYY-MM-DD). Pins the "
+                         "window so two runs are comparable; without it --days "
+                         "slides forward as new sessions are recorded.")
     ap.add_argument("--labels", default="",
                     help="replay only these sleeves (exact names or prefixes, "
                          "comma separated). Default: the whole roster.")
@@ -447,7 +527,7 @@ def main() -> None:
     for part in filter(None, a.peer_exit.split(",")):
         k, _, v = part.partition(":")
         pm[k] = [x for x in v.split("|") if x]
-    asyncio.run(main_async(a.symbol, a.days, pm, a.source, a.labels))
+    asyncio.run(main_async(a.symbol, a.days, pm, a.source, a.labels, a.until))
 
 
 if __name__ == "__main__":

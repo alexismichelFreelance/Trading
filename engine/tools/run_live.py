@@ -44,6 +44,11 @@ log = logging.getLogger("engine.runner")
 # Cheap: pure snapshot arithmetic unless the answer is no.
 GAMMA_CHECK_S = 300
 
+# Minimum distance from a gamma pocket edge for a CONTINUATION entry.
+# Trend sleeves made +115/trip deep in a short pocket and lost -145/trip
+# within this distance of the boundary (442 vs 105 trips, pinned replay).
+POCKET_EDGE_PTS = 15.0
+
 HMM_PATH = str(ROOT / "config" / "hmm_es_1h.json")
 SYMBOL = "ES"
 INSTRUMENTS = load_instruments(ROOT / "config" / "instruments.yaml")
@@ -239,9 +244,6 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing", regime_states=None)
     if label == "ignition_fixed":    # variant: fixed/regime exits instead of trailing
         return IgnitionStrategy(symbol, hmm_path, exit_mode="fixed", regime_states=None)
-    if label == "ignition_gex":      # variant: entries only on short-gamma days
-        return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing",
-                                regime_states=None, gamma=_gamma_or_none(symbol))
     if label == "opendrive":
         # ORB, not the blind 10:00 entry: every window shape loses on the blind
         # rule and the CLEAN drives lose worst (see tests/test_roster_decisions).
@@ -275,9 +277,6 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         # bands) are. Retuning th or adapt_k cannot fix that; diagnosing which
         # condition starves the sleeve is its own piece of work.
         return FlowFollowingStrategy(symbol, maxp=5, adaptive=False, th=flow_th)
-    if label == "flow_gex":          # variant: increases only on short-gamma days
-        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
-                                     gate_utc=FLOW_GATE, gamma=_gamma_or_none(symbol))
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
         # BREAK stays off; the RUNNER is back on. Both were cut in 3f42771 on
@@ -346,10 +345,36 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     if label == "vwapbreak_2p24":    # fixed-distance arming (see opendrive_2pN)
         return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=24.0))
+    if label == "opendrive_pk":      # POCKET-GATED twin of `opendrive`
+        from engine.strategies.open_drive import OpenDriveStrategy as _OD
+        s = _OD(symbol, mode="orb")
+        s.pocket_min_edge = POCKET_EDGE_PTS
+        return s
+    # LOCAL-SIGN twins of the _gex trio. Same sleeves, same want="short" gate,
+    # but the regime comes from the sign of cumulative gamma AT PRICE instead of
+    # gexp -- a 252-day percentile of the AGGREGATE book. Over 25 sessions with
+    # both available the two agreed 7 times (28%): gexp said LONG on 18 while
+    # price sat in a short-gamma pocket on 23. The curve is also OUR data,
+    # measured daily, rather than a second unmonitored external feed.
+    if label in ("ignition_lg", "flow_lg", "onbreak_lg"):
+        base = label[:-3]
+        s = _make(base, flow_th, symbol, hmm_path)
+        s.gamma = None                 # the curve replaces the percentile
+        s._wants_curve = True          # attach_curves() gives it the curve
+        if label == "onbreak_lg":
+            # FLIPPED to want="long". Under want="short" this scored -3,800 on
+            # 22 of 29 days (p=0.974 against a random cull) while the 7 days it
+            # REJECTED made +5,488 (p=0.033). onbreak breaks the OVERNIGHT
+            # range; classifying it as a continuation sleeve may simply have
+            # pointed the gate the wrong way. Running forward to find out --
+            # see tests/test_regime_want.py for why this is not yet a result.
+            s.regime_want = "long"
+        return s
+    if label == "wallfade":          # fade gamma walls, LONG-gamma pockets only
+        from engine.strategies.wall_fade import WallFadeStrategy
+        return WallFadeStrategy(symbol, point_usd=pu)
     if label == "onbreak":           # study-motivated: overnight-range break
         return OvernightBreakStrategy(symbol)
-    if label == "onbreak_gex":       # variant: breaks only on short-gamma days
-        return OvernightBreakStrategy(symbol, gamma=_gamma_or_none(symbol))
     # onbreak_2p and onbreak_2p24 REMOVED: the same entry with a decay/range
     # two-phase exit differing only in arming distance. On 2026-08-14 all five
     # onbreak rows entered at 10:22 and the family booked +3,650 of a +4,665
@@ -393,6 +418,10 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         stop = float(tj.get("stop_pts", 6.0))
         if label == "trendjoin":                 # clock exit -- the control
             return TrendJoinStrategy(symbol, conf_pts=conf, stop_pts=stop)
+        if label == "trendjoin_pk":              # POCKET-GATED twin of the above
+            s = TrendJoinStrategy(symbol, conf_pts=conf, stop_pts=stop)
+            s.pocket_min_edge = POCKET_EDGE_PTS
+            return s
         if label == "trendjoin_narrow":          # half the confirmation
             return TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
         if label in ("trendjoin_2p24", "trendjoin_2p32"):
@@ -430,10 +459,11 @@ FLOW_K = 2.0
 FLOW_GATE = (13, 20)          # 09:00 -> 16:00 ET
 
 # every strategy + variant — the full paper roster (--paper all)
-ALL_LABELS = ("ignition", "ignition_fixed", "ignition_gex", "opendrive",
-              "flow", "flow_fixed", "flow_gex",
+ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
+              "flow", "flow_fixed",
               "zones", "zones_gap", "ibs", 
-              "pivot", "vwapbreak", "onbreak", "onbreak_gex",
+              "pivot", "vwapbreak", "onbreak",               "trendjoin_pk", "opendrive_pk", "wallfade",
+              "ignition_lg", "flow_lg", "onbreak_lg",
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
                             "onbreak_2p_retrace",
@@ -552,6 +582,46 @@ def load_open_paper_positions(qdb, symbols) -> dict:
                 last_ts = int(pd.Timestamp(g["ts"].iloc[-1]).value)
                 out[str(sl)] = (pos, avg, last_ts)
     return out
+
+
+def attach_curves(sleeves, symbol: str, day: str, curve=None) -> None:
+    """Give every curve-wanting sleeve the PRIOR session's gamma curve.
+
+    _wants_curve was set on the twins and read only by portfolio_replay, so live
+    they ran with pocket=None -- no gate, identical to their originals, and any
+    "evidence" they accumulated was meaningless. The same wire-never-connected
+    failure as the 2025 _gex twins.
+
+    Fail-open: on any error the sleeve keeps its existing pocket (None), which
+    gamma_entry_ok and pocket_entry_ok both treat as no filter."""
+    want = [s for s in sleeves
+            if getattr(s, "_wants_curve", False)
+            or getattr(s, "pocket_min_edge", 0.0) > 0.0
+            or type(s).__name__ == "WallFadeStrategy"]
+    if not want:
+        return
+    if curve is None:
+        try:
+            from engine.adapters.questdb import QuestDB
+            from engine.core.config import root_symbol
+            from engine.features.gamma_basis import BasisSeries
+            from engine.features.gamma_curve import GammaCurve
+            root = root_symbol(symbol)
+            und = {"ES": "SPX", "NQ": "NDX"}.get(root)
+            if und is None:
+                return
+            q = QuestDB(timeout=30)
+            basis = BasisSeries.load(q, und, root, 0.0).for_day(day)
+            c = GammaCurve.load_prev(q, day, basis, underlying=und)
+            curve = c if c.ok else None
+        except Exception as ex:                        # noqa: BLE001
+            log.warning("no gamma curve for %s on %s (%s); the curve-gated "
+                        "sleeves trade UNGATED today", symbol, day, ex)
+            return
+    for s in want:
+        s.pocket = curve
+    log.info("gamma curve attached to %d sleeve(s) for %s %s (sess %s)",
+             len(want), symbol, day, getattr(curve, "sess", "-") if curve else "none")
 
 
 def build_roster(paper: str, flow_th: int = 30, symbol: str = SYMBOL,
@@ -879,6 +949,11 @@ async def main() -> None:
                 try:
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     lv, und, basis = lane_gamma_levels(sym, today, a.gex_basis)
+                    # the CURVE for the curve-gated sleeves of this lane. Without
+                    # this they run with pocket=None -- ungated, identical to
+                    # their originals, and every session of "evidence" is void.
+                    attach_curves([s for lb, s in roster if lb.startswith(f"{sym}:")
+                                   or ":" not in lb], sym, today)
                     if lv:
                         lane_pc.set_gamma_levels(lv)
                         print(f"gamma S/R levels ON [{sym}<-{und}] ({lv['sess']}, "
@@ -960,6 +1035,12 @@ async def main() -> None:
                 if ok and lv3 and lv3[0]:
                     lv, und, _basis = lv3
                     lane_pc.set_gamma_levels(lv)
+                    # the curve is a PRIOR-session snapshot, so it has to be
+                    # re-attached every rollover; otherwise a multi-day run
+                    # gates forever on the book from the day it started.
+                    attach_curves([s for lb, s in roster
+                                   if lb.startswith(f"{sym}:") or ":" not in lb],
+                                  sym, new_day)
                     print(f"[{new_day}] {sym}<-{und} walls -> putW "
                           f"{lv['put_wall']:.0f} callW {lv['call_wall']:.0f} "
                           f"({'long' if lv['net_sign']>0 else 'SHORT'}-gamma)")

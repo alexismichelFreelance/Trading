@@ -107,11 +107,19 @@ class ZoneLifecycleStrategy(BaseStrategy):
         # zone, which is a different trade, not the same one scaled.
         self.tf = tf
         self.agg = BarAggregator((tf,))
-        # Defaults keep the validated behaviour so tests/parity stays valid; the
-        # roster turns these off on 36 ES sessions of evidence.
-        #   BREAK setup   4 trips  -1,938  25% win   (fade +6,412/86%, flip +7,288/100%)
-        #   the RUNNER    4 trips  -2,100  25% win   -- half comes off at +4 and
-        #     what is left, held to breakeven, gives back more than it makes.
+        # Defaults keep the validated behaviour so tests/parity stays valid.
+        # The roster turns BREAK off and leaves the RUNNER on, re-derived from
+        # fills the engine could actually have got (23 sessions):
+        #   BREAK   14 trips  -2,112  50% win
+        #   FADE    20 trips +12,425  45% win     FLIP  17 trips  +3,938  47%
+        #   RUNNER  11 scaled trades: half off at +4 +7,262, RUNNER LEG +1,850
+        #
+        # The numbers that originally justified cutting both -- break -1,938 at
+        # 25% win, runner -2,100 at 25%, fade 86% and flip 100% win -- came out
+        # of the broken fill model: stops priced at the bar close, entries at
+        # the market while stop/target/scalp/breakeven were all measured from
+        # the zone edge. The runner cut was simply wrong; the runner leg makes
+        # money. Break still loses, but as a coin flip, not a 1-in-4 outlier.
         self.enable_break = enable_break
         self.runner = runner
         # gap_thr>0: also detect RTH-open gap zones, faded only after a
@@ -266,8 +274,15 @@ class ZoneLifecycleStrategy(BaseStrategy):
         # (strategy_lab/zone_entry_lookahead.py): 8 of 33 entries are same-bar,
         # and all 8 are FADE -- two thirds of every fade the sleeve takes. Those
         # keep the market price, which is what they could actually have got.
-        same_bar = z is not None and z.k >= self._k
-        if setup == "BREAK" or bar is None or z is None or same_bar:
+        # ...and if it did not, there is NO TRADE. Not a worse price -- a limit
+        # fills at its price or not at all, and here there was no order: the
+        # zone did not exist when the bar opened. Filling those at the bar close
+        # (the first version of this guard) was still claiming a fill nothing
+        # was resting for. 8 of 33 entries on the recorded ES tape, all FADE.
+        if z is not None and z.k >= self._k and setup != "BREAK":
+            self.trade = None
+            return []
+        if setup == "BREAK" or bar is None or z is None:
             return [Order(self.symbol, d, size, tag=tag)]
         # `d` here is the TRADE direction (for FLIP that is -z.dir, not the
         # zone's). In both setups a SHORT is entered at a level above, which
