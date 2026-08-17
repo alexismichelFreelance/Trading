@@ -314,37 +314,33 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return PivotStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
     if label == "vwapbreak":         # enter AT the line; chasing the break loses
         return VwapBreakStrategy(symbol, entry_mode="retest")
-    # the user's spec (2026-08-08): break the OPENING RANGE, extend one full
-    # range width, no close back through VWAP, then enter on the pullback.
-    if label == "vwapbreak_qual":       # strict reading: an exact touch of the line
-        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90)
-    if label == "vwapbreak_qual_tol":   # "(or close to it)" = half the opening range
-        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
-                                 retest_tol_frac=0.5)
-    # ABLATION: which of the three conditions actually carries the value
-    if label == "vwapbreak_q_noext":     # OR break + clean, NO extension needed
-        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
-                                 retest_tol_frac=0.5, qual_extension=False)
-    if label == "vwapbreak_q_noclean":   # OR break + extension, NO clean rule
-        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
-                                 retest_tol_frac=0.5, qual_clean=False)
-    if label == "vwapbreak_q_band":      # our sigma band instead of the OR
-        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
-                                 retest_tol_frac=0.5, qual_ref="band")
-    if label == "vwapbreak_q_bandnoext":  # band + clean only, no extension
-        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
-                                 retest_tol_frac=0.5, qual_ref="band",
-                                 qual_extension=False)
-    if label == "vwapbreak_qual_2p":
-        return VwapBreakStrategy(symbol, entry_mode="qualified", retest_ttl=90,
-                                 retest_tol_frac=0.5,
-                                 two_phase=TwoPhaseExit(arm_mult=2.4))
-    if label == "vwapbreak_retest_2p":
-        return VwapBreakStrategy(symbol, entry_mode="retest",
-                                 two_phase=TwoPhaseExit(arm_mult=2.4))
-    if label == "vwapbreak_2p24":    # fixed-distance arming (see opendrive_2pN)
-        return VwapBreakStrategy(symbol, two_phase=TwoPhaseExit(
-            rev_kind="range", rev_f=0.25, arm_pts=24.0))
+    # NINE vwapbreak variants REMOVED 2026-08-16: qual, qual_tol, qual_2p,
+    # q_noext, q_noclean, q_band, q_bandnoext, retest_2p, 2p24.
+    #
+    # Measured across FOUR independent windows -- ES 2026 (46 sessions), NQ 2026
+    # (26), ESM5 2025 (51), ESH5 2025 (22). The family is negative in three of
+    # the four on every single variant:
+    #     vwapbreak_qual        0/4   -7,862
+    #     vwapbreak_qual_tol    1/4  -21,285
+    #     vwapbreak_q_noclean   1/4  -16,447
+    #     vwapbreak_qual_2p     1/4  -11,470
+    #     vwapbreak_q_bandnoext 1/4  -10,508
+    #     vwapbreak_retest_2p   1/4  -10,348
+    #     vwapbreak             1/4   -7,397
+    #     vwapbreak_q_band      1/4  +20,979  <- ALL of it from one ESM5 window
+    # Ten labels for one bet, and the bet loses. q_band's apparent profit is the
+    # same single-window artifact that made opendrive_2p24 look like the best
+    # sleeve on the board the day before.
+    #
+    # These included the ablation twins built to find which of the three
+    # qualified-break conditions carried the value. The answer, across four
+    # windows, is none of them: the conditions were being ranked against each
+    # other inside a family that does not work.
+    #
+    # `vwapbreak` (entry AT the line) survives as a PAPER CONTROL so the idea
+    # stays measurable if the rule is re-specified. What four windows disprove
+    # is THIS IMPLEMENTATION, not the trade -- the manual version reads
+    # confluence and context that none of these variants encode.
     if label == "opendrive_pk":      # POCKET-GATED twin of `opendrive`
         from engine.strategies.open_drive import OpenDriveStrategy as _OD
         s = _OD(symbol, mode="orb")
@@ -471,10 +467,8 @@ ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
               # than the volatility ruler; 16/24/32pt all run, none privileged
               "opendrive_2p24",
               "onbreak_2p32",
-              "vwapbreak_2p24", "vwapbreak_qual", "vwapbreak_qual_tol", "vwapbreak_qual_2p",
-              "vwapbreak_q_noext", "vwapbreak_q_noclean",
-              "vwapbreak_q_band", "vwapbreak_q_bandnoext",
-              "vwapbreak_retest_2p",
+              # NINE vwapbreak variants REMOVED 2026-08-16 -- see _make().
+              # `vwapbreak` alone stays, as a paper control.
               "zones_15m", "zones_1h", "zones_4h")
 
 

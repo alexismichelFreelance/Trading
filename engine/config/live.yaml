@@ -34,5 +34,22 @@ instruments:
     # tools/sleeve_audit.py, where all 6 pairs matched exactly. Duplicates burn
     # compute and, worse, look like independent agreement in a twin comparison.
     # Re-add them only once an NDX-based GammaRegime exists.
-    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,flow,vwapbreak,onbreak"
+    # trendjoin ADDED 2026-08-16. It is the best sleeve on NQ by a wide margin
+    # and had never been deployed there, while instruments.yaml has carried
+    # NQ-calibrated parameters for it all along (conf_pts 186, stop_pts 53,
+    # sized off NQ's own ~465pt median range rather than copied from ES).
+    # Replay, 23 recorded NQ sessions:
+    #     trendjoin_narrow  +36,925  1,605/day  70% of days positive
+    #     opendrive_2p24    +20,430    888/day  91%
+    #     zones_gap         +15,215  2,174/day  57%  (7 days only)
+    # Normalised for size it captures ~17% of NQ's daily range against ~9.5% on
+    # ES, so it is genuinely better here and not merely bigger.
+    #
+    # `narrow` (half the confirmation distance) is the variant with the most
+    # activity -- 23 of 23 sessions against 19 for the others -- and is chosen
+    # for that, not for topping this window: trendjoin_2p32 scored higher
+    # (+42,635) and picking it would be selecting on the outcome of the only
+    # sample we have. Both run in paper; the deployed choice can move once a
+    # paired difference over more sessions says something.
+    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,flow,vwapbreak,onbreak,trendjoin,trendjoin_narrow"
     live: ""

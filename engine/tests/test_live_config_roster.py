@@ -116,3 +116,44 @@ def test_a_good_roster_is_unchanged():
     from run_live import build_roster
     r = build_roster("zones,pivot,vwapbreak", symbol="ES")
     assert [lb for lb, _ in r] == ["zones", "pivot", "vwapbreak"]
+
+
+def test_nq_runs_trendjoin():
+    """trendjoin is the best sleeve on NQ and was never deployed there.
+
+    Replay over 23 recorded NQ sessions, de-duplicated to one sleeve per bet
+    (strategy_lab/book_candidates.py):
+
+        NQ:trendjoin_narrow   23 days  +36,925  1,605/day  70% positive
+        NQ:opendrive_2p24     23       +20,430    888/day  91%
+        NQ:zones_gap           7       +15,215  2,174/day  57%
+        NQ:flow               17        +7,760    456/day  65%
+
+    against the whole ES book at 717/day. Normalised for size -- NQ ranges ~465
+    points a session against ES's ~65 -- trendjoin captures ~17% of the daily
+    range on NQ and ~9.5% on ES, so this is a real difference and not just a
+    bigger instrument.
+
+    instruments.yaml has carried NQ-specific trend_join parameters (conf_pts
+    186, stop_pts 53, derived from NQ's own range) since the multi-instrument
+    work. They had never been used by anything.
+
+    NOT claimed: that this survives. 23 sessions is one month, the same window
+    the ES book was measured on, and ES:opendrive_2p24 went from the top sleeve
+    to nothing when 13 sessions were added. This is deployed to PAPER."""
+    import yaml
+    cfg = yaml.safe_load(open(ROOT / "config" / "live.yaml", encoding="utf-8"))
+    nq = cfg["instruments"]["NQ"]["paper"]
+    labels = [x.strip() for x in nq.split(",")]
+    assert "trendjoin" in labels, f"NQ roster has no trendjoin: {labels}"
+    assert "trendjoin_narrow" in labels
+    assert nq_lane_builds(labels)
+
+
+def nq_lane_builds(labels) -> bool:
+    """Every NQ label must actually construct -- a stale name takes the whole
+    lane down at the open (2026-08-12, 'opendrive_orb')."""
+    from run_live import _make
+    for lb in labels:
+        _make(lb, symbol="NQ")
+    return True

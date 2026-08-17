@@ -47,26 +47,44 @@ PAIRS = [
 ]
 
 
-def daily(rows, sleeve, pv=50.0):
-    pos, avg = 0, 0.0
-    out = collections.Counter()
+def daily(rows, sleeve, pv):
+    """Per-day P&L, position RESET each session -- matching portfolio_replay's
+    own report(), which calls pnl_of() on one day's fills at a time.
+
+    Carrying position across days looks more correct and is not: a single
+    session that ends non-flat mis-pairs every entry that follows it, and the
+    error cascades for the rest of the window. ES:opendrive_2p24 has exactly one
+    such day and read +13,344 carried against +700 reset -- the entire apparent
+    edge was one dangling contract propagating through 40 sessions.
+
+    The cost of resetting is that genuine overnight sleeves (ibs, rsi2) are
+    unmeasurable here, which portfolio_replay.build_strategies already documents
+    and which is why they report 0 rather than a number."""
+    import collections as _c
+    byday = _c.defaultdict(list)
     for r in rows:
         if r["sleeve"] != sleeve:
             continue
-        q = int(float(r["side"])) * int(float(r["qty"]))
-        px = float(r["price"])
         day = dt.datetime.fromtimestamp(int(float(r["ts"])) / 1e9,
                                         ET).strftime("%Y-%m-%d")
-        if pos and (q > 0) != (pos > 0):
-            m = min(abs(q), abs(pos))
-            out[day] += (px - avg) * (1 if pos > 0 else -1) * m * pv
-            new = pos + q
-            if new and (new > 0) != (pos > 0):
-                avg = px
-            pos = new
-        else:
-            avg = (avg * abs(pos) + px * abs(q)) / (abs(pos) + abs(q)) if pos else px
-            pos += q
+        byday[day].append(r)
+    out = _c.Counter()
+    for day, fs in byday.items():
+        pos, avg = 0, 0.0
+        for r in fs:
+            q = int(float(r["side"])) * int(float(r["qty"]))
+            px = float(r["price"])
+            if pos and (q > 0) != (pos > 0):
+                m = min(abs(q), abs(pos))
+                out[day] += (px - avg) * (1 if pos > 0 else -1) * m * pv
+                new = pos + q
+                if new and (new > 0) != (pos > 0):
+                    avg = px
+                pos = new
+            else:
+                avg = ((avg * abs(pos) + px * abs(q)) / (abs(pos) + abs(q))
+                       if pos else px)
+                pos += q
     return out
 
 
@@ -79,7 +97,8 @@ def main(sym: str = "ES") -> None:
           f"{'random mean':>12} {'sd':>8} {'p':>7}   verdict")
     print("-" * 92)
     for filt, raw, _what in PAIRS:
-        fd, rd = daily(rows, filt), daily(rows, raw)
+        pv = point_usd(sym)
+        fd, rd = daily(rows, filt, pv), daily(rows, raw, pv)
         if not rd or not fd:
             print(f"{filt:22} {'-':>5} {'-':>4}   (no trades on one side)")
             continue
