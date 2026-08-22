@@ -98,9 +98,20 @@ class TrendJoinStrategy(BaseStrategy):
         # decision uses the same bar the price is read from ──────────────────
         # Ordered by KIND per core/exits.py: THESIS first, INSURANCE last. The
         # stop and the clock are what is left over when nothing else fired.
+        if self.day_range is not None:
+            self.day_range.note(b.ts, b.c)
+
         if self.pos != 0 and self._trade is not None:
             self._bars_held += 1
             d = self._trade["dir"]
+            # SCALE OUT before any exit rule fires. The day's opportunity being
+            # spent is not a reason to be flat -- it is a reason to be smaller.
+            # See BaseStrategy.scale_out_qty for the evidence and the limits.
+            n = self.scale_out_qty(b.c, self._trade["entry"], d, self.pos)
+            if n:
+                self._scaled = True
+                return [Order(self.symbol, -d, n, tag="trendjoin-scale",
+                              reduce_only=True)]
             if self.two_phase is not None:
                 hit = self.two_phase.check(ExitCtx(
                     ts=b.ts, price=b.c, dir=d, entry_px=self._trade["entry"],
@@ -138,6 +149,7 @@ class TrendJoinStrategy(BaseStrategy):
             return []
         self._trade = {"dir": d, "entry": b.c, "ts": b.ts}
         self._bars_held = 0
+        self.scale_reset()
         if self.two_phase is not None:
             self.two_phase.start(d, b.c)
         return [Order(self.symbol, d, self.qty, tag="trendjoin-entry")]

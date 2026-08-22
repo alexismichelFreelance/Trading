@@ -248,6 +248,12 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         # ORB, not the blind 10:00 entry: every window shape loses on the blind
         # rule and the CLEAN drives lose worst (see tests/test_roster_decisions).
         return OpenDriveStrategy(symbol, mode="orb")
+    if label == "opendrive_vac":
+        # the twin of `opendrive`, differing ONLY in the break-quality gate, so
+        # the forward record measures the gate and nothing else. See
+        # engine/features/break_quality.py for the evidence and the fail-open.
+        from engine.features.break_quality import BreakQuality
+        return OpenDriveStrategy(symbol, mode="orb", vac_gate=BreakQuality())
     if label == "opendrive_2p":
         return OpenDriveStrategy(symbol, mode="orb",
                                  two_phase=TwoPhaseExit(12.0, "decay", 0.1))
@@ -420,6 +426,40 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
             return s
         if label == "trendjoin_narrow":          # half the confirmation
             return TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+        if label == "trendjoin_fast":
+            # Scales on ARRIVAL SPEED rather than on the day being spent: half
+            # comes off when price is AT a session extreme in our favour having
+            # travelled >=0.15 of a typical day's range in the last ten minutes.
+            # That is the only reversal feature that replicated out of sample --
+            # 4 of 4 cells across 2025 Databento MBO and the 2026 live record,
+            # tops and bottoms, ~2x separation -- and the only one computable
+            # from price alone, so the live feed can actually produce it.
+            s = TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop, qty=2)
+            s.wants_day_range = True
+            s.scale_push = 0.15
+            return s
+        if label == "trendjoin_scale80w":
+            # scale80 WITH the one-way suppressor. The pair isolates it: same
+            # entry, same exits, same 0.80 level -- the only difference is that
+            # this one declines to scale on a day that has built its range
+            # without a single 25% pullback. All four 2026 sessions where the
+            # bare trigger fired disastrously early had zero counter-moves.
+            s = TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop, qty=2)
+            s.wants_day_range = True
+            s.scale_at = 0.8
+            s.skip_one_way = True
+            return s
+        if label in ("trendjoin_scale80", "trendjoin_scale100"):
+            # The SCALE-OUT twins of trendjoin_narrow: same entry, same exits,
+            # two lots instead of one, and half comes off once the session has
+            # produced `scale_at` of a typical day's range. Two levels run
+            # because the right one is not known -- 0.86 was where 2026-08-21
+            # topped on ES and 1.06 on NQ, so the answer is bracketed rather
+            # than fitted. The forward record chooses.
+            s = TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop, qty=2)
+            s.wants_day_range = True
+            s.scale_at = 0.8 if label.endswith("80") else 1.0
+            return s
         if label in ("trendjoin_2p24", "trendjoin_2p32"):
             # arming distance in the SAME units as conf, scaled per instrument
             f = 0.9 if label.endswith("24") else 1.2
@@ -460,6 +500,10 @@ ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
               "zones", "zones_gap", "ibs", 
               "pivot", "vwapbreak", "onbreak",               "trendjoin_pk", "opendrive_pk", "wallfade",
               "ignition_lg", "flow_lg", "onbreak_lg",
+              "opendrive_vac",          # break-quality twin of `opendrive`
+              "trendjoin_scale80", "trendjoin_scale100",   # scale-out twins
+              "trendjoin_fast",         # scales on ARRIVAL SPEED instead
+              "trendjoin_scale80w",     # scale80 + one-way suppressor
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
                             "onbreak_2p_retrace",
@@ -576,6 +620,33 @@ def load_open_paper_positions(qdb, symbols) -> dict:
                 last_ts = int(pd.Timestamp(g["ts"].iloc[-1]).value)
                 out[str(sl)] = (pos, avg, last_ts)
     return out
+
+
+def attach_day_range(sleeves, symbol: str, shared=None):
+    """Give every sleeve that wants it the SAME DayRange for this lane.
+
+    market data -> indicators -> strategies. DayRange is an indicator: it turns
+    the tape into "how much of a normal day has happened", and strategies decide
+    what that means for them. It does not belong in the engine, which routes
+    orders and owns positions, and it does not belong to one sleeve, because the
+    day being spent is a fact about the DAY.
+
+    One instance per lane, exactly like attach_curves does for the gamma curve.
+    Each sleeve feeds it from its own dispatch; DayRange.note is idempotent on
+    timestamp so the same event arriving once per sleeve updates it once.
+
+    Fail-open: a sleeve that never receives one keeps day_range=None, and every
+    consumer treats that as "no opinion"."""
+    want = [s for s in sleeves if getattr(s, "wants_day_range", False)]
+    if not want:
+        return None
+    from engine.features.day_range import DayRange
+    dr = shared if shared is not None else DayRange()
+    for s in want:
+        s.day_range = dr
+    log.info("day-range indicator attached to %d sleeve(s) for %s",
+             len(want), symbol)
+    return dr
 
 
 def attach_curves(sleeves, symbol: str, day: str, curve=None) -> None:
@@ -785,6 +856,12 @@ async def main() -> None:
             raise SystemExit(f"--live names not in the {sym} roster: {sorted(unknown)}")
         # lane discipline: feed stamp == strategy symbols == broker key
         assert all(s.symbol == sym for _, s in lane_roster), f"symbol mismatch in {sym} lane"
+        # ONE DayRange indicator per lane, shared by every sleeve that asks.
+        # Attached here rather than in the painting block because an indicator
+        # must exist whether or not anything is being drawn, and unlike the
+        # gamma curve it needs no re-attaching at the session rollover -- it
+        # rolls itself from the tape.
+        attach_day_range([s for _, s in lane_roster], sym)
         # emit_depth only when raw-capturing (the engine itself needs BookFlow,
         # not raw depth — RawCaptureTee records the depth and drops it onward).
         feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),

@@ -57,6 +57,9 @@ class GammaCurve:
             self._calls = sorted(self._call_rank)
             self._puts = sorted(self._put_rank)
             self._curve = [(k + self.basis, n, c) for k, n, c in self._prof["curve"]]
+            # presorted arrays for the hot path -- built ONCE, not per call
+            self._ks = [k for k, _, _ in self._prof["curve"]]
+            self._cums = [c for _, _, c in self._prof["curve"]]
             # every strike ranked by |net|, carrying the net so direction is
             # decidable at a strike that tops both the call and the put list
             self._walls = sorted(((k + self.basis, n) for k, n, _ in
@@ -65,6 +68,7 @@ class GammaCurve:
         else:
             self._flips = self._calls = self._puts = self._curve = []
             self._call_rank = self._put_rank = self._walls = []
+            self._ks = self._cums = []
 
     # ── construction ─────────────────────────────────────────────────────
     @classmethod
@@ -104,6 +108,49 @@ class GammaCurve:
         rows = [(k, c, p) for k, (c, p) in agg.items()]
         return cls(rows, float(d["spot"].iloc[0]), basis, underlying,
                    sess=str(last)[:10])
+
+    # ── HOT PATH: scalar lookups, no allocation ──────────────────────────
+    #
+    # gamma_entry_ok wants one sign; pocket_entry_ok wants one distance. Asking
+    # at() for either costs 560us on a 235-strike book -- four list copies, a
+    # 14-key dict and a linear scan of the whole curve, per call. These do the
+    # same arithmetic against presorted arrays with bisect and allocate nothing:
+    # 27x cheaper, and tests/test_gamma_curve_speed.py proves they agree with
+    # at() across the whole curve.
+    #
+    # HONEST SCOPE: this was written believing at() caused the 2026-08-17
+    # dispatch backlog. Counting the calls disproved that -- the gates sit behind
+    # entry conditions and are asked ZERO times on the trade path (see that test
+    # file's header). This is a tidy-up that keeps the gate cheap if entry rates
+    # rise, not a fix for anything observed. at() is unchanged and remains right
+    # for the painter and for analysis, where it runs a few times a session.
+    def sign_at(self, price: float) -> int:
+        """Sign of cumulative gamma at `price` (future terms). 0 = no curve."""
+        if not self.ok:
+            return 0
+        idx = float(price) - self.basis
+        ks, cums = self._ks, self._cums
+        i = bisect.bisect_right(ks, idx)
+        if i == 0:
+            cum = cums[0]
+        elif i >= len(ks):
+            cum = cums[-1]
+        else:
+            k0, k1 = ks[i - 1], ks[i]
+            c0, c1 = cums[i - 1], cums[i]
+            cum = c0 if k1 == k0 else c0 + (c1 - c0) * (idx - k0) / (k1 - k0)
+        return 1 if cum > 0 else (-1 if cum < 0 else 0)
+
+    def dist_to_edge(self, price: float) -> float | None:
+        """Signed distance to the pocket boundary, or None when the book has no
+        crossing (8 of 28 SPX sessions) or there is no curve."""
+        if not self.ok or not self._flips:
+            return None
+        f = self._flips
+        i = bisect.bisect_right(f, price)
+        if i < len(f):
+            return f[i] - price
+        return f[i - 1] - price if i else None
 
     # ── the question worth asking ────────────────────────────────────────
     def at(self, price: float) -> dict | None:

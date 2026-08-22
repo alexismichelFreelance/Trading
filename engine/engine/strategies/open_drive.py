@@ -29,8 +29,18 @@ class OpenDriveStrategy(BaseStrategy):
     def __init__(self, symbol: str, *, stop_mult: float = 1.0, trail_mult: float = 1.5,
                  stop_floor: float = 5.0, trail_floor: float = 8.0,
                  gamma=None, mode: str = "drive",
-                 two_phase: TwoPhaseExit | None = None) -> None:
+                 two_phase: TwoPhaseExit | None = None,
+                 vac_gate=None) -> None:
         self.symbol = symbol
+        # Optional BreakQuality (engine/features/break_quality.py). When set, an
+        # ORB break is REFUSED if the move into it happened on opposing delta --
+        # price slid through a book that was cancelled rather than hit, so nothing
+        # changed hands and nobody holds the new price. Measured over 45 breaks /
+        # 24 sessions: traded-into breaks +19,220$ at 65% won, air breaks +3,128$
+        # at 50%, same ordering on ES and NQ separately. It is None by default;
+        # the gated variant is a separate roster entry so the forward record
+        # compares them side by side rather than replacing the original.
+        self.vac_gate = vac_gate
         # optional GammaRegime: entries only on short-gamma days (strategy choice)
         self.gamma = gamma
         # mode="drive" (default, PARITY): blind 10:00 entry in the 9:30->10:00
@@ -65,6 +75,10 @@ class OpenDriveStrategy(BaseStrategy):
 
     # price ticks arrive as per-second trades (replay/live) — drive on pxc
     def on_trade(self, t: Trade) -> list[Order]:
+        # feed the break-quality accumulator BEFORE stepping, so the break bar's
+        # own aggression counts toward the move that produced it
+        if self.vac_gate is not None:
+            self.vac_gate.on_trade(t.ts, t.price, t.size, t.aggressor)
         return self._step(t.ts, t.price)
 
     def on_bar(self, b: Bar) -> list[Order]:
@@ -174,6 +188,9 @@ class OpenDriveStrategy(BaseStrategy):
         self.entered = True
         if not self.pocket_entry_ok(px):        # see BaseStrategy.pocket_entry_ok
             return []
+        # was this break TRADED into, or did price fall through air?
+        if self.vac_gate is not None and not self.vac_gate.ok(d):
+            return []                           # stand down for the day
         self.side = d
         self.entry_px = px
         rng = max(1e-9, self._or_hi - self._or_lo)

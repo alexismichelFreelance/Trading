@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 
 from engine.core.dispatch import dispatch_market   # noqa: E402
 from engine.core.events import Bar                 # noqa: E402
+from engine.features.gamma_curve import GammaCurve  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "tools"))
 import run_live                                    # noqa: E402
@@ -71,8 +72,20 @@ def main() -> None:
     symbol = sys.argv[2] if len(sys.argv) > 2 else "ES"
     roster = run_live.build_roster("all", symbol=symbol)
     strategies = [s for _, s in roster] if isinstance(roster[0], tuple) else list(roster)
+
+    # ATTACH THE CURVES. Without this the tool measures a roster whose gates all
+    # return True on the first line (pocket is None), which is why it did not
+    # catch the 2026-08-17 regression: the gate cost lives entirely in the curve
+    # lookup. Injected, not loaded -- no DB, and the size is what matters.
+    rows = [(7000.0 + i * 5.0, 10.0 - abs(i - 120) * 0.05,
+             -(10.0 - abs(i - 110) * 0.05)) for i in range(235)]
+    curve = GammaCurve.from_rows(rows, spot=7600.0, basis=20.0, underlying="SPX")
+    run_live.attach_curves(strategies, symbol, "2026-08-11", curve=curve)
+    gated = sum(1 for s in strategies if getattr(s, "pocket", None) is not None)
+
     bars = synth_bars(n, symbol)
-    print(f"{len(strategies)} sleeves, {n} bars ({symbol})")
+    print(f"{len(strategies)} sleeves ({gated} curve-gated, {len(rows)} strikes), "
+          f"{n} bars ({symbol})")
 
     t0 = time.perf_counter()
     for b in bars:

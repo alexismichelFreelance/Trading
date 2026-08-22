@@ -51,5 +51,14 @@ instruments:
     # (+42,635) and picking it would be selecting on the outcome of the only
     # sample we have. Both run in paper; the deployed choice can move once a
     # paired difference over more sessions says something.
-    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,flow,vwapbreak,onbreak,trendjoin,trendjoin_narrow"
+    # opendrive_vac is the break-quality TWIN of opendrive: identical entry and
+    # exit, refusing only the breaks whose move happened on opposing delta (see
+    # engine/features/break_quality.py). It belongs here more than on ES --
+    # NQ:opendrive is where the losses are (2026-08-19 -$2,190, 2026-08-21
+    # -$4,465, the latter 94% of that day's loss), and until now the gated twin
+    # ran only on the ES lane, where there was nothing much to refuse.
+    # It fails OPEN for its first 5 sessions while the threshold warms, so
+    # expect it to trade identically to opendrive at first -- that is the
+    # design, not a fault.
+    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,opendrive_vac,flow,vwapbreak,onbreak,trendjoin,trendjoin_narrow"
     live: ""

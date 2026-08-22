@@ -99,9 +99,11 @@ class BaseStrategy:
         want = self.regime_want or want
         px = price if price is not None else self.last_seen_px
         if self.pocket is not None and px is not None:
-            a = self.pocket.at(px)
-            if a is not None and a.get("local_sign", 0) != 0:
-                sg = a["local_sign"] < 0
+            # sign_at, NOT at(): the rich lookup costs 560us and this runs on
+            # every qualifying event. See tests/test_gamma_curve_speed.py.
+            sgn = self.pocket.sign_at(px)
+            if sgn != 0:
+                sg = sgn < 0
                 return sg if want == "short" else not sg
         if self.gamma is None:
             return True
@@ -110,6 +112,84 @@ class BaseStrategy:
             return True
         return sg if want == "short" else not sg
 
+
+    # ── scaling out ──────────────────────────────────────────────────────
+    # Optional DayRange (engine/features/day_range.py) and the fraction of a
+    # typical session's range at which HALF the position comes off. 0 disables,
+    # which is every sleeve unless it opts in.
+    # Set True by a sleeve that wants the shared DayRange indicator; the
+    # runner hands the lane's single instance to everyone who asks.
+    wants_day_range = False
+    day_range = None
+    scale_at = 0.0
+    # Second, independent reason to halve: price is AT a session extreme in our
+    # favour and arrived there fast. 0 disables. See DayRange.fast_extreme.
+    scale_push = 0.0
+    # Suppress the day-spent trigger on a day that has built its range with NO
+    # meaningful pullback. Those keep expanding, and scaling into one costs half
+    # the remaining move. See DayRange.one_way for the evidence and its limits.
+    skip_one_way = False
+    _scaled = False
+
+    def scale_out_qty(self, price: float, entry_px: float, my_dir: int,
+                      pos: int) -> int:
+        """Contracts to shed NOW because the day's opportunity is largely spent.
+        0 = hold everything.
+
+        WHY THIS EXISTS. Every sleeve was one lot with a single exit, so the only
+        choices were all-in or flat. On 2026-08-21 nine long sleeves reached
+        maximum profit in the same minute -- 11:53, the exact minute of the RTH
+        high in both instruments -- and held. The book had $18,565 of open
+        profit and booked -$4,668: it gave back $23,232, and five sleeves were
+        still holding four hours later when the 15:59 clock closed them.
+
+        WHY HALF AND NOT ALL. Measured over 10 live sessions, at high extension
+        the MEDIAN forward outcome barely moves while the left tail deteriorates
+        badly (p25 fell from +0.022 to -0.124 of a daily range at 60 minutes).
+        That is a reason to REDUCE, not to flatten: the middle of the
+        distribution still says the move may continue, so a full exit pays for
+        tail protection with the whole remaining run. Taking half keeps the
+        upside on the days the range expands -- and those days exist, which is
+        exactly why a hard exit here would be wrong.
+
+        HONEST STATUS: that tail finding did NOT reproduce on 88 sessions of
+        2025 ES data (strategy_lab/exhaustion_mbo.py). What survives without it
+        is the plain arithmetic of `range_used` -- holding past a spent day is
+        holding for a shrinking remainder against an undiminished downside --
+        and the fact that a partial exit is strictly more expressive than the
+        all-or-nothing the roster had. The forward record decides the level.
+
+        Fails closed on purpose: no DayRange, no threshold, an unwarmed ruler or
+        a position under two lots all return 0 and change nothing."""
+        if self.day_range is None or self._scaled:
+            return 0
+        if self.scale_at <= 0.0 and self.scale_push <= 0.0:
+            return 0                       # sleeve has not opted in
+        if abs(pos) < 2:
+            return 0                       # nothing to halve
+        if (price - entry_px) * my_dir <= 0:
+            return 0                       # never scale a loser: this is
+                                           # profit-taking, not risk management
+        # TWO INDEPENDENT REASONS, either sufficient.
+        #  1. the day's opportunity is spent -- holding on for a shrinking
+        #     remainder against an undiminished downside
+        #  2. price is AT a session extreme in our favour and got there FAST.
+        #     Fast-arriving extremes reverse about twice as hard as slow ones,
+        #     the only reversal feature that replicated out of sample (4 of 4
+        #     cells across 2025 MBO and 2026 live, tops and bottoms).
+        spent = self.scale_at > 0.0 and self.day_range.extended(self.scale_at)
+        if spent and self.skip_one_way and self.day_range.one_way():
+            spent = False              # a day that has never pulled back is not
+                                       # finished, whatever its range says
+        fast = (self.scale_push > 0.0
+                and self.day_range.fast_extreme(my_dir, self.scale_push))
+        if not (spent or fast):
+            return 0
+        return abs(pos) // 2
+
+    def scale_reset(self) -> None:
+        """Call on every new entry, or one trade's scale blocks the next."""
+        self._scaled = False
 
     def pocket_entry_ok(self, price: float) -> bool:
         """Stand down for a CONTINUATION entry taken near a gamma pocket edge.
@@ -135,10 +215,7 @@ class BaseStrategy:
         of 28 SPX sessions) allows the entry. Exits are never filtered."""
         if self.pocket is None or self.pocket_min_edge <= 0.0:
             return True
-        a = self.pocket.at(price)
-        if a is None:
-            return True
-        d = a.get("dist_to_flip")
+        d = self.pocket.dist_to_edge(price)      # scalar, allocation-free
         return d is None or abs(d) >= self.pocket_min_edge
 
     def on_trade(self, e: Trade) -> list[Order]:
