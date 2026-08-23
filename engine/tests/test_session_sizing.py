@@ -25,6 +25,9 @@ Ships OFF by default anyway -- 34 and 28 sessions, 13 and 10 up-sized days, and
 ES/NQ are the same calendar days so they are not independent. Doubling size
 doubles the bad days too (-1,212 and -2,500 are in there).
 
+Everything else tried on 2026-08-22 failed. strategy_lab/TOP_DETECTION_NEGATIVE.md
+has the list and the reasons.
+
 WITHDRAWN, and why it is not used here: an "overnight range" version measured
 +0.52/+0.51 and was LOOKAHEAD -- the cache files run 00:00-16:59 ET, so a window
 of (et<09:30)|(et>=16:00) swallowed the hour AFTER the close, which sits near the

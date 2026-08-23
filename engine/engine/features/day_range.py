@@ -159,6 +159,14 @@ class DayRange:
         up-sized days. ES and NQ are the SAME calendar days, so they are not
         independent samples.
 
+        This is the ONLY survivor of a day spent trying to make the sleeve
+        reduce near session extremes. The top/bottom conjunction, the
+        volume-weighted slice, drift-vs-climax extreme types, the give-back cap,
+        the ten-minute scratch and every time-of-day gate were built, measured
+        and thrown away -- strategy_lab/TOP_DETECTION_NEGATIVE.md records what
+        each one measured and the three traps that made them look like they
+        worked. Read it before rebuilding any of them.
+
         WHY SIZING AND NOT A FILTER. trendjoin's P&L is 3 trades on ES and 5 on
         NQ, so a filter either misses them or kills them, and an exit rule
         changes which trades exist at all -- the 10-minute scratch predicted
