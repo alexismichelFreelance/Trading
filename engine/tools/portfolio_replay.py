@@ -45,7 +45,7 @@ from engine.core.clock import EventClock                         # noqa: E402
 from engine.core.events import BUY, SELL, Bar, BookFlow, Trade             # noqa: E402
 from engine.core.live_engine import LiveEngine                   # noqa: E402
 from tools.flow_replication import session_days                  # noqa: E402
-from tools.run_live import ALL_LABELS, _make                     # noqa: E402
+from tools.run_live import ALL_LABELS, _make, attach_day_range                     # noqa: E402
 
 from zoneinfo import ZoneInfo as _ZI
 _ET = _ZI("America/New_York")
@@ -363,10 +363,18 @@ async def run_day(qdb, symbol, day, labels, peer_map, source="mbo",
         return None
     if strats is None:                      # standalone use keeps old behaviour
         strats = build_strategies(symbol, labels, peer_map)
+        attach_day_range(strats, symbol)
     # Hand the pocket-gated sleeves the PRIOR session's curve. Strategy objects
     # persist across the replay (see build_strategies), so the curve has to be
     # refreshed per session or every day would be gated on the first day's book.
     _attach_curves(qdb, strats, symbol, day)
+    # DayRange is attached ONCE, outside the per-day loop, and deliberately so:
+    # it carries PRIOR sessions' ranges, so re-creating it per day would leave
+    # it permanently cold -- size_mult would always fail closed to one lot and
+    # the sizing twin would be indistinguishable from the plain sleeve. The
+    # strategy objects persist across the replay for the same reason (see
+    # build_strategies), and the indicator rolls its own session on the first
+    # event of a new day.
     eng = LiveEngine(HistFeed(ev), NullBroker(), strats, EventClock(),
                      Blotter(symbol, POINT_USD_OF.get(symbol, POINT_USD),
                              ), warmup_gate=False,
@@ -482,6 +490,7 @@ async def main_async(symbol, ndays, peer_map, source="mbo", only="", until=""):
     # live capture has far fewer events than mbo_events; do not skip real days
     minev = 500 if source == "live" else 10_000
     strats = build_strategies(symbol, labels, peer_map)
+    attach_day_range(strats, symbol)
     for d in days[-ndays:]:
         try:
             r = await run_day(qdb, symbol, d, labels, peer_map, source, minev,

@@ -106,6 +106,71 @@ class DayRange:
         n = len(s)
         return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
+    def prior_wide(self) -> bool | None:
+        """Was the LAST COMPLETED session wider than the ones before it?
+
+        The one clean day-level signal found on 2026 live: prior-session range
+        correlates +0.54 (ES) / +0.61 (NQ) with today's range, and it is a
+        strictly prior measurement -- unlike an "overnight range" version that
+        measured +0.52/+0.51 and turned out to be lookahead, because the cache
+        files run to 16:59 ET and the window swallowed the hour after the close.
+        Cleaned, that one is +0.16 / -0.06. This one cannot have that problem.
+
+        Compared against the median of the sessions BEFORE it, not including
+        itself: a median containing the day being judged pulls toward it and
+        blunts the comparison.
+
+        None while cold, which callers must read as "no opinion"."""
+        if len(self.hist) < self.min_sessions + 1:
+            return None
+        h = list(self.hist)
+        prior, base = h[-1], sorted(h[:-1])
+        n = len(base)
+        med = base[n // 2] if n % 2 else 0.5 * (base[n // 2 - 1] + base[n // 2])
+        if not med or med <= 0:
+            return None
+        return prior > med
+
+    def size_mult(self, wide: float = 2.0, narrow: float = 1.0) -> float:
+        """Size multiplier for TODAY, decided before the open.
+
+        MEASURED by portfolio_replay, 2026 live, trendjoin_daysize (2 lots on a
+        day after a wide session) against trendjoin_narrow:
+
+                                        ES            NQ
+          trades (IDENTICAL both ways)  213           127
+          contracts                     213 -> 305    127 -> 174
+          P&L PER CONTRACT              +39 -> +74    +275 -> +367
+                                        (+91%)        (+34%)
+          up-sized days, pos/neg        8 / 5         8 / 2
+          best day's share of the gain  35%           28%
+
+        The identical trade counts are the proof that sizing changed nothing
+        about WHICH trades happened -- that is the property being relied on.
+
+        16 up-sized days positive against 7 negative across both instruments,
+        with no single day carrying it. This is the only intervention tried on
+        2026-08-22 that survived every check; a fixed-ledger estimate over a
+        smaller 20-session window was more pessimistic on ES (3/6 days, 62% one
+        session) and more optimistic on NQ, so trust the replay, not the ledger.
+
+        The cost is real: doubling size doubles the bad days too (-1,212 and
+        -2,500 among them), and this is 34 and 28 sessions with 13 and 10
+        up-sized days. ES and NQ are the SAME calendar days, so they are not
+        independent samples.
+
+        WHY SIZING AND NOT A FILTER. trendjoin's P&L is 3 trades on ES and 5 on
+        NQ, so a filter either misses them or kills them, and an exit rule
+        changes which trades exist at all -- the 10-minute scratch predicted
+        +3,575 on ES from a fixed ledger and delivered -6,262 in replay because
+        the sleeve went from 213 trades to 293. Scaling quantity changes no
+        entry, no exit and no sequence, so the measurement above is arithmetic
+        rather than extrapolation.
+
+        Fails to `narrow` while cold: an unwarmed ruler must never size UP."""
+        w = self.prior_wide()
+        return wide if w is True else narrow
+
     def today(self) -> float | None:
         if self.hi is None or self.lo is None:
             return None

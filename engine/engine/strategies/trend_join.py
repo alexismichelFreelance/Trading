@@ -86,6 +86,10 @@ class TrendJoinStrategy(BaseStrategy):
         self.pos = 0
         self._trade: dict | None = None
         self._bars_held = 0
+        # Lots to take on a day FOLLOWING a wider-than-usual session. 0 = off.
+        # Needs a DayRange; see DayRange.size_mult for the measurement and for
+        # why sizing is the only lever a fixed-ledger measurement can justify.
+        self.size_wide = 0.0
 
     def on_bar(self, b: Bar) -> list[Order]:
         if b.tf != "1m":
@@ -152,7 +156,23 @@ class TrendJoinStrategy(BaseStrategy):
         self.scale_reset()
         if self.two_phase is not None:
             self.two_phase.start(d, b.c)
-        return [Order(self.symbol, d, self.qty, tag="trendjoin-entry")]
+        return [Order(self.symbol, d, self._entry_qty(), tag="trendjoin-entry")]
+
+    def _entry_qty(self) -> int:
+        """Lots for THIS entry, from the prior session's range.
+
+        The decision is taken once, before the open, and applies to the whole
+        day -- it does not look at this trade, this minute or this price, so it
+        cannot alter which trades the sleeve takes. That is the entire reason it
+        is trustworthy where a filter or an exit rule is not: the 10-minute
+        scratch predicted +3,575 on ES from a fixed ledger and delivered -6,262
+        because it changed the sleeve from 213 trades to 293.
+
+        Off unless size_wide is set. See DayRange.size_mult."""
+        if self.size_wide <= 0.0 or self.day_range is None:
+            return self.qty
+        return int(self.qty * self.day_range.size_mult(wide=self.size_wide,
+                                                       narrow=1.0))
 
     def _flatten(self, why: str) -> list[Order]:
         if self.pos == 0 or self._trade is None:

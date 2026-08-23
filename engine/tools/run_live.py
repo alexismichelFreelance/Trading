@@ -426,6 +426,17 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
             return s
         if label == "trendjoin_narrow":          # half the confirmation
             return TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+        if label == "trendjoin_daysize":
+            # trendjoin_narrow sized by the PRIOR session's range: two lots on a
+            # day following a wider-than-usual session, one otherwise. Same
+            # entries, same exits, same sequence -- only the quantity moves,
+            # which is why this is the one intervention a fixed-ledger
+            # measurement can justify. See DayRange.size_mult, and note the
+            # ES/NQ split recorded there: NQ replicates, ES does not.
+            s = TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+            s.wants_day_range = True
+            s.size_wide = 2.0
+            return s
         if label == "trendjoin_fast":
             # Scales on ARRIVAL SPEED rather than on the day being spent: half
             # comes off when price is AT a session extreme in our favour having
@@ -504,6 +515,7 @@ ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
               "trendjoin_scale80", "trendjoin_scale100",   # scale-out twins
               "trendjoin_fast",         # scales on ARRIVAL SPEED instead
               "trendjoin_scale80w",     # scale80 + one-way suppressor
+              "trendjoin_daysize",      # narrow, sized by the prior session
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
                             "onbreak_2p_retrace",
