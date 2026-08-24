@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from run_live import _make  # noqa: E402
+from run_live import ALL_LABELS, _make  # noqa: E402
 
 CFG = ROOT / "config" / "live.yaml"
 
@@ -42,13 +42,22 @@ def test_every_configured_label_builds():
             spec = str(lane.get(key) or "")
             if spec in ("all", ""):
                 continue
-            for lb in (x.strip() for x in spec.split(",")):
-                if not lb:
+            for raw in (x.strip() for x in spec.split(",")):
+                if not raw or raw == "all":
+                    continue
+                # '-label' SUBTRACTS from the roster (see build_roster). It is
+                # not a sleeve to construct -- but it must still NAME one, or the
+                # cut silently does nothing. At runtime a typo is deliberately
+                # non-fatal, so this is the place that has to catch it.
+                if raw.startswith("-"):
+                    if raw[1:] not in ALL_LABELS:
+                        bad.append(f"{sym}.{key}: {raw!r} subtracts a sleeve "
+                                   f"that does not exist -- the cut is a no-op")
                     continue
                 try:
-                    _make(lb, symbol=sym)
+                    _make(raw, symbol=sym)
                 except BaseException as ex:            # SystemExit included
-                    bad.append(f"{sym}.{key}: {lb!r} -> {ex}")
+                    bad.append(f"{sym}.{key}: {raw!r} -> {ex}")
     assert not bad, "config/live.yaml names strategies that do not exist:\n  " + \
                     "\n  ".join(bad)
 
@@ -157,3 +166,39 @@ def nq_lane_builds(labels) -> bool:
     for lb in labels:
         _make(lb, symbol="NQ")
     return True
+
+
+# ── cutting a sleeve from a lane that runs 'all' ────────────────────────────
+# ES runs `paper: all` so it picks up new sleeves automatically. Cutting one
+# used to mean freezing the lane to a hand-written list, which drifts from
+# ALL_LABELS -- and this file already records what a stale roster name costs
+# (2026-08-12, one dead label took nine working sleeves down at the open).
+# `-label` subtracts instead, so the lane stays on 'all' and the exclusion is
+# explicit and auditable in config/live.yaml.
+def test_all_minus_a_label_drops_only_that_label():
+    from run_live import ALL_LABELS, build_roster
+    full = build_roster("all", symbol="ES")
+    cut = build_roster("all,-flow,-ignition", symbol="ES")
+    names_full = {lb for lb, _ in full}
+    names_cut = {lb for lb, _ in cut}
+    assert "flow" in names_full and "ignition" in names_full
+    assert "flow" not in names_cut and "ignition" not in names_cut
+    assert names_full - names_cut == {"flow", "ignition"}, \
+        "subtracting must remove EXACTLY the named labels"
+    # the variants survive: only the base sleeve was cut
+    assert "flow_lg" in names_cut and "ignition_fixed" in names_cut
+
+
+def test_subtraction_works_on_an_explicit_list_too():
+    from run_live import build_roster
+    r = build_roster("zones,pivot,flow,-flow", symbol="ES")
+    names = {lb for lb, _ in r}
+    assert names == {"zones", "pivot"}
+
+
+def test_dropping_an_unknown_label_is_not_fatal():
+    """Same rule as a stale positive label: it costs its own sleeve, nothing
+    more. A typo in a `-` entry must not silently take the lane down."""
+    from run_live import build_roster
+    r = build_roster("all,-definitely_not_a_sleeve", symbol="ES")
+    assert len(r) > 10

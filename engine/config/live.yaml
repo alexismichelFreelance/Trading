@@ -13,7 +13,20 @@ instruments:
     market_port: 36001
     broker_port: 36002
     draw_port: 36004
-    paper: all
+    # CUT 2026-08-25, on agreement between the full replay, the replay
+    # restricted to sessions the live record also covers, and the live record
+    # itself -- the only sleeves condemned by every slice of the data:
+    #   flow      replay -2,725 (23 sessions) / matched replay -875 / live
+    #             -5,650 over 17 sessions
+    #   ignition  replay -1,012 (18 sessions) / matched -750 / live -900 over 15
+    # Both are BASE variants whose exit-improved twins win under both methods
+    # (flow_lg, flow_gex, ignition_fixed, ignition_lg), so the family stays and
+    # only the broken exit goes.
+    # NOT cut, though they also showed losses: trendjoin_narrow and opendrive
+    # flip sign with the session set (ES trendjoin_narrow -6,738 on 13 matched
+    # sessions, +8,325 on 29), which is a statement about the sample, not the
+    # sleeve.
+    paper: "all,-flow,-ignition"
     live: ""
   NQ:
     market_port: 36011
@@ -60,5 +73,17 @@ instruments:
     # It fails OPEN for its first 5 sessions while the threshold warms, so
     # expect it to trade identically to opendrive at first -- that is the
     # design, not a fault.
-    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive,opendrive_vac,flow,vwapbreak,onbreak,trendjoin,trendjoin_narrow"
+    # opendrive CUT 2026-08-25. The clearest loser in the book: negative in the
+    # full replay (-12,265 over 24 sessions, median -375, still negative
+    # excluding its worst day), in the replay restricted to live-covered
+    # sessions (-20,095) and in the live record itself (-17,595) -- three
+    # measurements, similar magnitudes. NQ-specific: opendrive_2p24 (+6,535) and
+    # opendrive_vac (+8,205) take the SAME entries and win, so the entry is fine
+    # and the base exit is not.
+    # COST OF THIS CUT, stated because it is real: opendrive_vac was the paired
+    # TWIN of opendrive and existed to isolate the break-quality gate. Removing
+    # the control ends that comparison, and opendrive_vac had only ~10 mature
+    # sessions (it fails open for its first 5 while its threshold warms). Its
+    # forward record now has nothing to be compared against.
+    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive_vac,flow,vwapbreak,onbreak,trendjoin,trendjoin_narrow"
     live: ""

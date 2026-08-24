@@ -705,8 +705,27 @@ def build_roster(paper: str, flow_th: int = 30, symbol: str = SYMBOL,
                  hmm_path: str = HMM_PATH, prefix: str = ""):
     """Roster for one instrument lane. `prefix` namespaces labels in multi-
     instrument mode ('NQ:zones'); empty in the single-instrument default."""
-    labels = list(ALL_LABELS) if paper.strip() in ("all", "") else \
-        [x for x in paper.split(",") if x]
+    # 'all' or '' = the whole book; otherwise an explicit comma list. A
+    # '-label' entry SUBTRACTS, so a lane can stay on 'all' -- and keep picking
+    # up new sleeves automatically -- while recording exactly which sleeves have
+    # been cut, with the reason, in config/live.yaml. Freezing the lane to a
+    # hand-maintained list instead is how a stale name gets left in the config;
+    # see the loop below for what that cost on 2026-08-12.
+    toks = [x.strip() for x in paper.split(",") if x.strip()]
+    drop = {x[1:] for x in toks if x.startswith("-") and len(x) > 1}
+    keep = [x for x in toks if not x.startswith("-")]
+    labels = list(ALL_LABELS) if (not keep or "all" in keep) else keep
+    if drop:
+        unknown = drop - set(ALL_LABELS)
+        if unknown:
+            # a typo in a '-' entry costs nothing but itself, exactly like a
+            # stale positive label
+            log.warning("ROSTER: '-%s' names no sleeve for %s; ignored",
+                        ", -".join(sorted(unknown)), symbol)
+        cut = [x for x in labels if x in drop]
+        labels = [x for x in labels if x not in drop]
+        if cut:
+            log.info("ROSTER: %s CUT from %s", ", ".join(cut), symbol)
     roster = []
     dropped = []
     for lb in labels:
