@@ -14,6 +14,7 @@ batched <=100 rows (the /exec GET-URL limit).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 
@@ -28,6 +29,23 @@ log = logging.getLogger("engine.recorder")
 
 BATCH = 100
 SEC_BATCH = 30           # per-second rows per flush (~2 HTTP POSTs/min, not 60)
+
+# A flush gets this long and no longer. RECORDING IS AN OBSERVER: the engine
+# already rules that nothing an observer touches may apply backpressure to
+# trading (LiveEngine._emit_sink drops rather than wait), and the recorder was
+# the one observer still awaiting a database inline in the feed loop.
+#
+# On 2026-08-17 that cost the whole session: 29 flush failures, the loop dragged
+# from 2,198 ev/s to 47 against ~190 ev/s of demand, the engine 245 minutes
+# behind with 47,991 events queued, and ZERO session flats -- so every intraday
+# sleeve carried its position overnight. Reproduced in
+# tests/test_recorder_backpressure.py.
+#
+# 2.0s is well beyond a healthy write (single-digit ms) and far short of the
+# 60s client default, which is what turned a slow database into a stalled
+# engine. A row that cannot be written in two seconds is dropped: the recorded
+# library is worth less than the engine being current.
+FLUSH_TIMEOUT_S = 2.0
 
 
 def _ts(ns: int) -> str:
@@ -45,6 +63,7 @@ class RecorderTee:
         self.table = table
         self.record_sec = record_sec
         self.sec_table = sec_table
+        self.n_timeouts = 0
         self._buf: list[str] = []
         self._sbuf: list[str] = []
         self._live = False
@@ -63,25 +82,40 @@ class RecorderTee:
         self._ntr = 0
 
     async def _ensure_table(self) -> None:
-        await self.qdb.query(
+        # bounded for the same reason as _flush: a hung database must cost the
+        # RECORDING, never the feed. Uncapped, the tee never yields its first
+        # event and the engine never starts.
+        await asyncio.wait_for(self.qdb.query(
             f"CREATE TABLE IF NOT EXISTS {self.table} (symbol SYMBOL, ts TIMESTAMP, "
             f"o DOUBLE, h DOUBLE, l DOUBLE, c DOUBLE, vol LONG) "
-            f"TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, symbol)")
+            f"TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, symbol)"),
+            timeout=FLUSH_TIMEOUT_S)
 
     async def _ensure_sec_table(self) -> None:
-        await self.qdb.query(
+        await asyncio.wait_for(self.qdb.query(
             f"CREATE TABLE IF NOT EXISTS {self.sec_table} (symbol SYMBOL, ts TIMESTAMP, "
             f"pxc DOUBLE, adelta LONG, avol LONG, ntr LONG, bid_cancel LONG, "
             f"ask_cancel LONG, bid_add LONG, ask_add LONG) "
-            f"TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, symbol)")
+            f"TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, symbol)"),
+            timeout=FLUSH_TIMEOUT_S)
 
     async def _flush(self) -> None:
         if not self._buf:
             return
         rows, self._buf = self._buf[:BATCH], self._buf[BATCH:]
         try:
-            await self.qdb.query(f"INSERT INTO {self.table} VALUES " + ",".join(rows))
+            await asyncio.wait_for(
+                self.qdb.query(f"INSERT INTO {self.table} VALUES " + ",".join(rows)),
+                timeout=FLUSH_TIMEOUT_S)
             self.n_recorded += len(rows)
+        except asyncio.TimeoutError:
+            self.n_timeouts += 1
+            if self.n_timeouts in (1, 10) or self.n_timeouts % 100 == 0:
+                log.error("RECORDER ABANDONED A WRITE after %.1fs (%d rows dropped, "
+                          "%d timeouts). The database is not keeping up. Rows are "
+                          "being lost ON PURPOSE so the engine stays current -- see "
+                          "FLUSH_TIMEOUT_S.", FLUSH_TIMEOUT_S, len(rows),
+                          self.n_timeouts)
         except Exception as ex:                      # noqa: BLE001 - never break the feed
             log.warning("recorder flush failed (%d rows dropped): %s", len(rows), ex)
 
@@ -90,8 +124,12 @@ class RecorderTee:
             return
         rows, self._sbuf = self._sbuf[:BATCH], self._sbuf[BATCH:]
         try:
-            await self.qdb.query(f"INSERT INTO {self.sec_table} VALUES " + ",".join(rows))
+            await asyncio.wait_for(
+                self.qdb.query(f"INSERT INTO {self.sec_table} VALUES " + ",".join(rows)),
+                timeout=FLUSH_TIMEOUT_S)
             self.n_sec += len(rows)
+        except asyncio.TimeoutError:
+            self.n_timeouts += 1
         except Exception as ex:                      # noqa: BLE001
             log.warning("sec-recorder flush failed (%d rows dropped): %s", len(rows), ex)
 
