@@ -230,6 +230,9 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     engine gate: raw and gamma-aware variants paper-trade side by side and the
     user picks which routes live."""
     from engine.strategies.dip_buy import DipBuyStrategy
+    from engine.strategies.fade_turn import FadeTurnStrategy
+    from engine.strategies.fade_ladder import FadeLadderStrategy
+    from engine.strategies.macro_dip import MacroDipStrategy
     from engine.strategies.flow import FlowFollowingStrategy
     from engine.strategies.ibs_swing import IBSSwingStrategy
     from engine.strategies.ignition import IgnitionStrategy
@@ -310,6 +313,40 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return ZoneLifecycleStrategy(symbol, gap_thr=5.0, point_usd=pu)
     if label == "dipbuy":
         return DipBuyStrategy(symbol, point_usd=pu)
+    # The user's own intraday entry, encoded from the entry-context study:
+    # fade a 30-min move once the last 5 minutes turn back. `fadeturn` keeps the
+    # measured 08:00-11:00 ET window; `fadeturn_all` drops it. The PAIR is the
+    # test -- the study says outcomes split on the clock, and the only losing
+    # cell was deep fades outside the window.
+    if label == "fadeturn":
+        return FadeTurnStrategy(symbol, point_usd=pu)
+    if label == "fadeturn_all":          # control: the clock window dropped
+        return FadeTurnStrategy(symbol, point_usd=pu, use_window=False)
+    if label == "fadeturn_stp":          # control: the tight structural stop
+        return FadeTurnStrategy(symbol, point_usd=pu, stop_mode="structural")
+    # The ladder sleeve and its controls. `ladder_flat` is the SAME entry with
+    # no scaling in -- the pair isolates whether the ladder is the edge, which
+    # his own fills say carries 60% of his intraday P&L.
+    # Buy a 3-day dip below its trailing 250d 10th percentile. 16y, verified by
+    # driving the sleeve itself: 170 trades, +3,031 ES pts, +17.8/trade, 14/16
+    # years positive, top3 = 34%. `dip3_macro` adds the rates/breakeven gate,
+    # which looked decisive per DIP DAY and evaporated per TRADE -- it is kept
+    # only as the control that shows that.
+    if label == "dip3":
+        return MacroDipStrategy(symbol)
+    if label == "dip3_macro":
+        return MacroDipStrategy(symbol, require_gate=True)
+    if label == "ladder":
+        return FadeLadderStrategy(symbol, point_usd=pu)
+    if label == "ladder_flat":
+        return FadeLadderStrategy(symbol, point_usd=pu, ladder=False)
+    if label == "ladder_all":
+        return FadeLadderStrategy(symbol, point_usd=pu, use_window=False)
+    if label == "ladder_tgt":
+        return FadeLadderStrategy(symbol, point_usd=pu, target_atr=1.0)
+    if label == "fadeturn_allstp":
+        return FadeTurnStrategy(symbol, point_usd=pu, use_window=False,
+                                stop_mode="structural")
     if label == "dipbuy_gex":        # variant: entries only on mid/long-gamma days
         return DipBuyStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
     if label == "ibs":
@@ -426,6 +463,50 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
             return s
         if label == "trendjoin_narrow":          # half the confirmation
             return TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+        if label in ("trendjoin_d10", "trendjoin_d14"):
+            # The scale-free form of the pullback that actually replicated.
+            # Depth = 0.10 / 0.14 of a TYPICAL session's range instead of a point
+            # count: 8 ES pts and 40 NQ pts are 0.138 and 0.107 of their median
+            # RTH range, so the two constants that worked were approximately the
+            # same rule. Needs no per-instrument value and rescales with the
+            # regime. Bracketed rather than fitted; the record chooses.
+            s = TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+            s.wants_day_range = True
+            s.pullback_typ = 0.10 if label == "trendjoin_d10" else 0.14
+            return s
+        if label == "trendjoin_lvl":
+            # JOIN ON A PULLBACK TO STRUCTURE. Confirmation only arms; the fill
+            # waits for price to trade into whatever is actually there -- a
+            # pivot, prior-day H/L, a virgin zone edge, VWAP, a gamma wall --
+            # and the setup is DECLINED when nothing is within reach. No points
+            # constant anywhere: the reach is 0.25 of a typical session's range
+            # from DayRange, so it rescales with the regime and needs no
+            # per-instrument fudge. Fills are tagged with WHICH level was waited
+            # for, so the decision can be audited rather than trusted.
+            #
+            # The control is trendjoin_pb4/pb8, the magic-number version, and it
+            # is exactly why this exists: on 29 replayed ES sessions 8 points
+            # returned +13,862 against the baseline's +7,212 while 4 points
+            # returned +5,262 -- same idea, opposite verdicts, decided by a
+            # constant that describes nothing.
+            from engine.features.level_book import LevelBook
+            s = TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+            s.levels = LevelBook()
+            s.wants_day_range = True
+            s.pullback_frac = 0.25
+            return s
+        if label in ("trendjoin_pb4", "trendjoin_pb8"):
+            # JOIN ON A PULLBACK. Same entry signal as trendjoin_narrow, but
+            # confirmation only ARMS -- the fill waits for price to retrace
+            # 4 or 8 points from the extreme reached since arming, and a move
+            # that never retraces is declined. Two distances because the right
+            # one is not known; the forward record chooses. See
+            # TrendJoinStrategy.on_bar and tests/test_trendjoin_pullback.py.
+            s = TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+            s.pullback_pts = 4.0 if label == "trendjoin_pb4" else 8.0
+            if not symbol.startswith("ES"):           # NQ ranges ~5x ES
+                s.pullback_pts *= 5.0
+            return s
         if label == "trendjoin_daysize":
             # trendjoin_narrow sized by the PRIOR session's range: two lots on a
             # day following a wider-than-usual session, one otherwise. Same
@@ -516,6 +597,9 @@ ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
               "trendjoin_fast",         # scales on ARRIVAL SPEED instead
               "trendjoin_scale80w",     # scale80 + one-way suppressor
               "trendjoin_daysize",      # narrow, sized by the prior session
+              "trendjoin_pb4", "trendjoin_pb8",   # magic-number pullback (control)
+              "trendjoin_lvl",          # pull back to STRUCTURE (measured worse)
+              "trendjoin_d10", "trendjoin_d14",   # scale-free pullback DEPTH
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
                             "onbreak_2p_retrace",
@@ -525,7 +609,13 @@ ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
               "onbreak_2p32",
               # NINE vwapbreak variants REMOVED 2026-08-16 -- see _make().
               # `vwapbreak` alone stays, as a paper control.
-              "zones_15m", "zones_1h", "zones_4h")
+              "zones_15m", "zones_1h", "zones_4h",
+              "dip3")
+# fadeturn* are deliberately NOT in ALL_LABELS. They are built and replayable by
+# name, but they do not auto-enroll: measured 2026-08-29 over 205 ES + 160 NQ
+# sessions, every configuration loses (ES -51,838 / NQ -79,070 windowed and
+# stopless; the only positive totals are 3-trade tails). Keeping them here would
+# put a known loser into any lane running 'all'.
 
 
 def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
@@ -537,7 +627,7 @@ def lane_gamma_levels(sym: str, day: str, gex_basis_override=None):
     if not gexc:
         return None, None, None
     from engine.adapters.questdb import QuestDB as _Q
-    from engine.features.gamma_levels import GammaLevels
+    from engine.features.gamma_levels import DEFAULT_BASIS, GammaLevels
     und = gexc.get("underlying", "SPX")
     q = _Q(timeout=30)
     # MEASURED, not configured. The yaml constants (ES 42.0, NQ 181.0) were each
@@ -659,6 +749,43 @@ def attach_day_range(sleeves, symbol: str, shared=None):
     log.info("day-range indicator attached to %d sleeve(s) for %s",
              len(want), symbol)
     return dr
+
+
+def attach_level_books(sleeves, symbol: str, day: str, q=None) -> int:
+    """Put the PRIOR-SESSION gamma walls into every sleeve's LevelBook.
+
+    THE HOOK EXISTED AND NOTHING CALLED IT. LevelBook.set_gamma was written with
+    the walls in mind and never invoked, so the book held pivots and VWAP only:
+    97% of trendjoin_lvl entries fell back to a floor pivot and the walls -- the
+    structure most worth waiting for, and the one named explicitly when this was
+    asked for -- were absent from every decision. A level source that is wired
+    but never fed is worse than one that is missing, because the result looks
+    like a test of the idea.
+
+    Fail-open: no levels, no gamma in the book, and the sleeve simply has fewer
+    sources to find agreement between."""
+    want = [s for s in sleeves if getattr(s, "levels", None) is not None]
+    if not want:
+        return 0
+    lv = None
+    try:
+        from engine.core.config import root_symbol
+        from engine.features.gamma_basis import BasisSeries
+        from engine.features.gamma_levels import (DEFAULT_BASIS,
+                                                  GammaLevels)
+        root = root_symbol(symbol)
+        und = {"ES": "SPX", "NQ": "NDX"}.get(root)
+        if und is not None:
+            q = q or QuestDB()
+            basis = BasisSeries.load(q, und, root, DEFAULT_BASIS)
+            lv = GammaLevels(q, underlying=und).levels_prev(day, basis=basis.for_day(day))
+    except Exception as ex:                          # noqa: BLE001
+        log.warning("level book: no gamma walls for %s %s (%s)", symbol, day, ex)
+    for s in want:
+        s.levels.set_gamma(lv)
+    log.info("level book: gamma walls %s for %d sleeve(s) on %s",
+             "attached" if lv else "UNAVAILABLE", len(want), symbol)
+    return len(want)
 
 
 def attach_curves(sleeves, symbol: str, day: str, curve=None) -> None:
@@ -893,6 +1020,12 @@ async def main() -> None:
         # gamma curve it needs no re-attaching at the session rollover -- it
         # rolls itself from the tape.
         attach_day_range([s for _, s in lane_roster], sym)
+        # today's ET session date -- the walls are the PRIOR session's, which
+        # levels_prev resolves from this
+        from engine.core.timeutil import et_session_date
+        import time as _time
+        attach_level_books([s for _, s in lane_roster], sym,
+                           et_session_date(int(_time.time() * 1e9)))
         # emit_depth only when raw-capturing (the engine itself needs BookFlow,
         # not raw depth — RawCaptureTee records the depth and drops it onward).
         feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),
