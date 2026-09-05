@@ -78,7 +78,9 @@ class RecorderTee:
     def __init__(self, inner, qdb: AsyncQuestDB | None = None,
                  symbol: str = "ES", table: str = "claude_bars_live",
                  record_sec: bool = True, sec_table: str = "claude_sec_live",
-                 probe_timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
+                 probe_timeout_s: float = DEFAULT_TIMEOUT_S,
+                 recheck_s: float = 300.0, recheck_fail_n: int = 3,
+                 recheck_timeout_s: float = 60.0) -> None:
         self.inner = inner
         self.qdb = qdb or AsyncQuestDB()
         self.symbol = symbol
@@ -89,6 +91,13 @@ class RecorderTee:
         self.n_dropped = 0
         self._wq: asyncio.Queue | None = None
         self._writer: asyncio.Task | None = None
+        self._probe: asyncio.Task | None = None
+        self.recheck_s = recheck_s
+        # See raw_capture: one failed probe is a slow WAL commit, not a
+        # death. Only a streak counts, on a longer budget than startup.
+        self.recheck_fail_n = max(1, int(recheck_fail_n))
+        self.recheck_timeout_s = recheck_timeout_s
+        self._fail_streak = 0
         self._buf: list[str] = []
         self._sbuf: list[str] = []
         self._live = False
@@ -194,26 +203,69 @@ class RecorderTee:
         self._pxc = 0.0
         self._adelta = self._avol = self._ntr = 0
 
-    async def _verify_ingest(self) -> bool:
+    async def _verify_ingest(self, timeout_s: float | None = None) -> bool:
         """Round-trip a probe row into every table this tee writes, through the
         same INSERT path the real rows take. Both tables broke independently on
         2026-08-05, so proving one says nothing about the other."""
         ok = True
+        budget = self.probe_timeout_s if timeout_s is None else timeout_s
         if self._ready:
             ok &= await verify_ingest_async(
                 self.qdb, self.table,
                 lambda ts: self.qdb.query(
                     f"INSERT INTO {self.table} VALUES "
                     f"('{PROBE_SYMBOL}','{_ts(ts)}',0,0,0,0,0)"),
-                timeout_s=self.probe_timeout_s)
+                timeout_s=budget)
         if self._sready:
             ok &= await verify_ingest_async(
                 self.qdb, self.sec_table,
                 lambda ts: self.qdb.query(
                     f"INSERT INTO {self.sec_table} VALUES "
                     f"('{PROBE_SYMBOL}','{_ts(ts)}',0,0,0,0,0,0,0,0)"),
-                timeout_s=self.probe_timeout_s)
+                timeout_s=budget)
         return bool(ok)
+
+    async def recheck_ingest(self) -> None:
+        """Re-run the round trip and update `ingest_ok`, announcing transitions.
+
+        The startup probe proves the tables CAN store. It cannot prove they
+        still are. On 2026-09-01 QuestDB stopped committing around 14:30 and
+        this tee kept reporting healthy until 16:13 -- claude_bars_live lost 101
+        minutes, claude_sec_live 99, in silence."""
+        was = self.ingest_ok
+        ok = await self._verify_ingest(timeout_s=self.recheck_timeout_s)
+        if ok:
+            self._fail_streak = 0
+        else:
+            self._fail_streak += 1
+            if self._fail_streak < self.recheck_fail_n:
+                log.warning("recorder [%s]: ingest probe missed (%d/%d) -- "
+                            "a slow commit, not yet a death",
+                            self.symbol, self._fail_streak, self.recheck_fail_n)
+                return
+        self.ingest_ok = ok
+        if ok == was:
+            return
+        if ok:
+            log.warning("recorder [%s]: ingest RECOVERED. The rows written while "
+                        "it was down are gone; the gap does not backfill.",
+                        self.symbol)
+        else:
+            log.error("recorder [%s]: INGEST DIED MID-SESSION. %s/%s accept "
+                      "writes and store nothing; every row from here is lost. "
+                      "Recording continues so the feed is never blocked.",
+                      self.symbol, self.table, self.sec_table)
+
+    async def _run_probe_monitor(self) -> None:
+        while True:
+            await asyncio.sleep(self.recheck_s)
+            try:
+                await self.recheck_ingest()
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:                  # noqa: BLE001 - never die
+                log.warning("recorder [%s]: ingest re-probe failed: %s",
+                            self.symbol, ex)
 
     async def stream(self) -> AsyncIterator[MarketEvent]:
         self._rearm()
@@ -233,6 +285,8 @@ class RecorderTee:
                 log.warning("sec-recorder disabled (table init failed): %s", ex)
                 self._sready = False
         self.ingest_ok = await self._verify_ingest()
+        if self.recheck_s > 0:
+            self._probe = asyncio.create_task(self._run_probe_monitor())
         async for ev in self.inner.stream():
             if isinstance(ev, Trade):
                 self._live = True
@@ -275,6 +329,8 @@ class RecorderTee:
                             self._wq.qsize(), DRAIN_TIMEOUT_S)
         if self._writer is not None:
             self._writer.cancel()
+        if self._probe is not None:
+            self._probe.cancel()
 
 
 __all__ = ["RecorderTee"]

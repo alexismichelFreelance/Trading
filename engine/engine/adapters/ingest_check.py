@@ -11,11 +11,22 @@ So the counters cannot be trusted to answer "is this working". Only a round trip
 can: write one row through the same path the real data will take, then read it
 back.
 
-This runs ONCE per stream, at startup, and never again. It is a precondition
-check, not a background monitor — it answers a question at the only moment the
-answer is actionable, when the session has not started and the database can
-still be repaired. A failed probe never stops the feed: recording is not worth a
-missed trade. It logs loudly and sets a flag the heartbeat surfaces.
+This runs at startup AND on a timer for the rest of the session (see
+`recheck_ingest` on RawCaptureTee and RecorderTee). It used to run once and
+never again, on the reasoning that startup was "the only moment the answer is
+actionable, when the database can still be repaired". 2026-09-01 disproved
+that: QuestDB saturated around 14:30, stopped committing, and the engine ran to
+16:13 believing itself healthy — dropped=0, every counter climbing, the
+heartbeat's TABLE-NOT-INGESTING alarm structurally unable to fire because the
+flag had been decided at 09:30. The last ~90 minutes of RTH were lost on every
+table.
+
+Mid-session the answer is still actionable; it is simply a different answer.
+Not "repair before you start" but "everything you record from here is going
+nowhere" — worth knowing while the session runs rather than the next morning.
+
+A failed probe never stops the feed: recording is not worth a missed trade. It
+logs loudly and sets a flag the heartbeat surfaces.
 """
 from __future__ import annotations
 

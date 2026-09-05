@@ -26,12 +26,40 @@ instruments:
     # flip sign with the session set (ES trendjoin_narrow -6,738 on 13 matched
     # sessions, +8,325 on 29), which is a statement about the sample, not the
     # sleeve.
+    # onfade ADDED 2026-09-05 and picked up automatically by 'all'. Fades the
+    # 18:00->09:30 overnight move at the open, target 75% of that move, stop
+    # 0.75x the overnight range. The only sleeve here whose config was chosen on
+    # a train half and scored ONCE: 1,145 ES sessions replayed through the real
+    # engine give $164/trade, t=5.50, 75% wins, maxDD -10,878 (test half $178,
+    # t=3.42). It fires once per session, every session. ES ONLY -- NQ is
+    # untested and the last overnight-signal sleeve (failed-break fade) worked
+    # on ES and died on NQ, so it does not go in the NQ roster on faith.
     paper: "all,-flow,-ignition"
     live: ""
   NQ:
     market_port: 36011
     broker_port: 36012
     draw_port: 36014
+    # RAW DEPTH CAPTURE OFF 2026-09-02. NQ was writing 11.5M of the 15.5M daily
+    # rows into claude_depth_live (ES 3.9M); the table stood at 272M rows over 27
+    # days and had QuestDB pinned. On 2026-09-01 it stopped committing entirely
+    # and the last ~90 minutes of RTH were lost on EVERY table while the engine
+    # ran on believing itself healthy.
+    #
+    # Nothing consumes this table. The live sleeves (flow, ignition, open_drive)
+    # read per-second BookFlow, which is built inside the feed from the same DOM
+    # stream and is UNAFFECTED by this switch -- NinjaTraderFeed calls
+    # agg.accumulate(ev) unconditionally and only the raw DepthUpdate is gated.
+    # claude_sec_live still carries NQ book add/cancel.
+    #
+    # The research record on raw depth is three nulls and one effect the exact
+    # size of the spread ($7.30/contract against $16 round turn) -- see the
+    # intraday-cost-floor and orderflow-postshock notes. ES stays on because the
+    # one open question (order flow in the post-shock window) is an ES question
+    # and needs ~100 sessions; it had 18.
+    #
+    # NQ TICKS are still captured: claude_ticks_live is small and useful.
+    capture_depth: false
     # Everything whose levels/stops derive from NQ's OWN price action, so it
     # ports without retuning. EXCLUDED on purpose:
     #   ignition / ignition_fixed / ignition_gex -- would silently borrow ES's

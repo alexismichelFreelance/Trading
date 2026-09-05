@@ -86,6 +86,77 @@ class TrendJoinStrategy(BaseStrategy):
         self.pos = 0
         self._trade: dict | None = None
         self._bars_held = 0
+        # JOIN ON A PULLBACK instead of on the breakout bar. 0 = off.
+        #
+        # The sleeve enters the moment confirmation arrives -- price has already
+        # travelled conf_pts off the window extreme, so it buys the move at its
+        # most extended point so far, and its own record says that is expensive:
+        # a caught leg gives a median 7.5pt of heat, and on 2026-08-28
+        # ES:trendjoin_narrow took six stops in one session flipping direction
+        # on every one.
+        #
+        # With pullback_pts set, confirmation only ARMS. The entry waits for
+        # price to retrace that far from the extreme reached since arming, and
+        # a move that never retraces is DECLINED -- that runaway is precisely
+        # the one a breakout entry buys at its worst price. The arm expires
+        # after pullback_bars so a stale setup cannot fire on old news.
+        #
+        # NOT a clock gate. "Skip the first hour" was tested over 29 ES / 26 NQ
+        # replayed sessions and does not replicate -- it helps ES (+105,062 ->
+        # +119,275 skipping before 10:30) and destroys NQ (+513,295 -> +110,160),
+        # and the worst window differs per instrument (ES 10:00-10:30, NQ
+        # 11:30-14:00). Time of day is noise here; the entry PRICE is not.
+        self.pullback_pts = 0.0
+        # PULL BACK TO STRUCTURE, not to a distance. With a LevelBook attached
+        # the sleeve waits for price to retrace into whatever is actually there
+        # -- a pivot, prior-day high, virgin zone edge, VWAP, a gamma wall --
+        # and DECLINES when nothing is. `pullback_pts` above is the magic-number
+        # version and is kept only as the control to measure this against: 4pt
+        # on ES became 20pt on NQ purely to preserve a ratio, which is the tell
+        # that it describes no market fact at all.
+        self.levels = None
+        self.pullback_max = 0.0      # absolute cap, if one is set explicitly
+        # HOW FAR BACK IS STILL A PULLBACK, as a fraction of a TYPICAL session's
+        # range rather than a point count. A points cap is the same mistake as a
+        # points pullback: 30 on ES would have to become 150 on NQ for no reason
+        # the market recognises. DayRange.typical() is measured from the last ten
+        # sessions, so this rescales itself when the regime does. Fails closed --
+        # a cold ruler means no cap can be computed and no trade is taken.
+        self.pullback_frac = 0.0
+        # PULLBACK DEPTH as a fraction of a TYPICAL session's range. This is the
+        # scale-free form of the only thing that replicated: 8 ES points and 40
+        # NQ points both roughly doubled the baseline (+13,862 vs +7,212;
+        # +42,605 vs +17,550), and those two independently-chosen constants land
+        # at 0.138 and 0.107 of their instrument's median RTH range -- about an
+        # eighth of a normal day, on both. Expressed this way it needs no
+        # per-instrument value and rescales when the regime does.
+        #
+        # Chosen over the structure version, which FAILED -- but the reason
+        # first recorded here was WRONG and is corrected 2026-09-04.
+        #
+        # It said confluence happens on 1 of 108 ES entries, so "strongest
+        # cluster" degenerated to "nearest lone pivot". That rate was an
+        # artifact: LevelBook.levels() called z.virgin() on a bool @property,
+        # raising TypeError into a bare except, so NO ZONE EVER REACHED THE
+        # BOOK. Confluence cannot involve an absent source. (Three more bugs sat
+        # behind it: zones were detected on raw 1m bars rather than 30m, touches
+        # were never counted so nothing left the virgin state, and the per-bar
+        # loops walked every zone ever created.)
+        #
+        # All four fixed, confluence then available on 49% of moments instead of
+        # 8% -- and the sleeve STILL loses. 56 ES sessions, replayed:
+        #     trendjoin_narrow  $242/day   trendjoin_pb8  $225/day
+        #     trendjoin_pb4     $198/day   trendjoin_lvl   $77/day
+        # So the conclusion stands and the mechanism is now understood: waiting
+        # for structure is worse than not waiting, even when the structure is
+        # really there. It is not a plumbing failure.
+        self.pullback_typ = 0.0
+        self._arm_level: float | None = None
+        self._arm_src = ""
+        self.pullback_bars = 20
+        self._arm_dir = 0
+        self._arm_ext: float | None = None
+        self._arm_age = 0
         # Lots to take on a day FOLLOWING a wider-than-usual session. 0 = off.
         # Needs a DayRange; see DayRange.size_mult for the measurement and for
         # why sizing is the only lever a fixed-ledger measurement can justify.
@@ -104,6 +175,8 @@ class TrendJoinStrategy(BaseStrategy):
         # stop and the clock are what is left over when nothing else fired.
         if self.day_range is not None:
             self.day_range.note(b.ts, b.c)
+        if self.levels is not None:
+            self.levels.on_bar(b)
 
         if self.pos != 0 and self._trade is not None:
             self._bars_held += 1
@@ -127,6 +200,12 @@ class TrendJoinStrategy(BaseStrategy):
             if self._bars_held >= self.hold_min:
                 return self._flatten("timeout")
 
+        if self._arm_dir:
+            self._arm_age += 1
+            if self._arm_age > self.pullback_bars:    # stale: forget it
+                self._arm_dir, self._arm_ext, self._arm_age = 0, None, 0
+                self._arm_level, self._arm_src = None, ""
+
         in_rth = m >= RTH_OPEN
         ready = len(self._hi) >= self.lookback
         win_hi = max(self._hi) if self._hi else None
@@ -138,6 +217,40 @@ class TrendJoinStrategy(BaseStrategy):
             return []
         if m > RTH_LAST_ENTRY:
             return []
+        # ALREADY ARMED: the retracement is checked on EVERY bar, independently
+        # of whether confirmation still holds. It usually does not -- price has
+        # pulled back, which is the entire point -- so testing the arm after the
+        # confirmation branch would return early and the entry would never fire.
+        if self._arm_dir:
+            d = self._arm_dir
+            self._arm_ext = (max(self._arm_ext, b.c) if d > 0
+                             else min(self._arm_ext, b.c))
+            if self._arm_level is not None:
+                # STRUCTURE: has price actually traded into the level yet? The
+                # bar's extreme, not its close -- a touch is a touch.
+                reached = (b.l <= self._arm_level) if d > 0 else (b.h >= self._arm_level)
+                if not reached:
+                    return []
+            else:
+                need = self.pullback_pts
+                if self.pullback_typ > 0.0:
+                    typ = (self.day_range.typical()
+                           if self.day_range is not None else None)
+                    if typ is None:
+                        return []                     # cold ruler: no trade
+                    need = self.pullback_typ * typ
+                if (self._arm_ext - b.c) * d < need:
+                    return []                         # not deep enough yet
+            if not self.pocket_entry_ok(b.c):
+                return []
+            src = self._arm_src
+            self._arm_dir, self._arm_ext, self._arm_age = 0, None, 0
+            self._arm_level, self._arm_src = None, ""
+            out = self._open(d, b)
+            if out and src:
+                out[0] = Order(self.symbol, d, out[0].qty,
+                               tag=f"trendjoin-entry-{src}")
+            return out
         # confirmation measured against the window as it stood BEFORE this bar
         if b.c - win_lo >= self.conf_pts:
             d = 1
@@ -151,6 +264,33 @@ class TrendJoinStrategy(BaseStrategy):
         # genuinely flat rather than tracking a position it never opened.
         if not self.pocket_entry_ok(b.c):
             return []
+        # PULLBACK: confirmation only ARMS; the entry waits for a retracement.
+        cap = self.pullback_max
+        if self.pullback_frac > 0.0:
+            typ = self.day_range.typical() if self.day_range is not None else None
+            if typ is None:
+                return []                      # cold ruler: no opinion, no trade
+            cap = self.pullback_frac * typ
+        if self.levels is not None and cap > 0.0:
+            # STRONGEST structure within reach, not the nearest. Sources within
+            # `tol` are one level; tol scales with the day so it is not a point
+            # count. Nearest-first is what made the first version a shallow
+            # constant in disguise.
+            typ = self.day_range.typical() if self.day_range is not None else None
+            tol = 0.03 * typ if typ else 0.0
+            hit = self.levels.pullback_to(b.c, d, max_dist=cap, tol=tol)
+            if hit is None:
+                return []          # nothing to pull back TO -- decline the setup
+            self._arm_level, self._arm_src, _n = hit
+            self._arm_dir, self._arm_ext, self._arm_age = d, b.c, 0
+            return []
+        if self.pullback_pts > 0.0 or self.pullback_typ > 0.0:
+            self._arm_level, self._arm_src = None, ""
+            self._arm_dir, self._arm_ext, self._arm_age = d, b.c, 0
+            return []
+        return self._open(d, b)
+
+    def _open(self, d: int, b: Bar) -> list[Order]:
         self._trade = {"dir": d, "entry": b.c, "ts": b.ts}
         self._bars_held = 0
         self.scale_reset()

@@ -55,9 +55,13 @@ class RawCaptureTee:
                  ilp_port: int = 9009, queue_cap: int = 500_000,
                  batch: int = 5000, flush_ms: int = 250, log_every_s: float = 15.0,
                  qdb: QuestDB | None = None,
-                 probe_timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
+                 probe_timeout_s: float = DEFAULT_TIMEOUT_S,
+                 recheck_s: float = 300.0, recheck_fail_n: int = 3,
+                 recheck_timeout_s: float = 60.0,
+                 capture_depth: bool = True) -> None:
         self.inner = inner
         self.symbol = symbol
+        self.capture_depth = capture_depth
         self.host, self.ilp_port = host, ilp_port
         self.batch, self.flush_ms = batch, flush_ms
         self.log_every_s = log_every_s
@@ -65,6 +69,18 @@ class RawCaptureTee:
         self._q: queue.Queue = queue.Queue(maxsize=queue_cap)
         self._stop = threading.Event()
         self._writer: threading.Thread | None = None
+        self._monitor: threading.Thread | None = None
+        self.recheck_s = recheck_s
+        # A single failed probe is NOT a death. QuestDB commits WAL
+        # asynchronously and under write load a specific row often is not
+        # readable inside the budget -- the first version of this monitor
+        # flapped 62 times in one session on tables that were ingesting
+        # normally the whole time. Only a STREAK counts, and the re-probe
+        # gets a longer budget than the startup one, which runs before any
+        # load exists.
+        self.recheck_fail_n = max(1, int(recheck_fail_n))
+        self.recheck_timeout_s = recheck_timeout_s
+        self._fail_streak = 0
         # counters (read by the monitor; thread-safe enough for logging)
         self.n_written = 0
         self.n_dropped = 0
@@ -93,20 +109,74 @@ class RawCaptureTee:
         finally:
             s.close()
 
-    def _verify_ingest(self) -> bool:
+    def _verify_ingest(self, timeout_s: float | None = None) -> bool:
         """Round-trip one probe row into EACH table, over ILP — the same path
         the tape takes. Both tables broke independently on 2026-08-05, so
         proving one says nothing about the other."""
         ok = True
-        for table, line in (
-                (TICKS, f"{TICKS},symbol={PROBE_SYMBOL} price=0.0,size=0i,"
-                        f"aggressor=0i {{ts}}\n"),
-                (DEPTH, f"{DEPTH},symbol={PROBE_SYMBOL} side=0i,level=0i,"
-                        f"price=0.0,size=0i {{ts}}\n")):
+        budget = self.probe_timeout_s if timeout_s is None else timeout_s
+        probes = [(TICKS, f"{TICKS},symbol={PROBE_SYMBOL} price=0.0,size=0i,"
+                          f"aggressor=0i {{ts}}\n")]
+        if self.capture_depth:
+            # A lane with raw depth switched off (live.yaml capture_depth) never
+            # receives a DepthUpdate, so probing the depth table on its behalf
+            # tests a path it does not use and writes probe rows into a table it
+            # is no longer a customer of.
+            probes.append((DEPTH, f"{DEPTH},symbol={PROBE_SYMBOL} side=0i,level=0i,"
+                                  f"price=0.0,size=0i {{ts}}\n"))
+        for table, line in probes:
             ok &= verify_ingest(self._qdb, table,
                                 lambda ts, ln=line: self._send_ilp(ln.format(ts=ts)),
-                                timeout_s=self.probe_timeout_s)
+                                timeout_s=budget)
         return bool(ok)
+
+    def recheck_ingest(self) -> None:
+        """Re-run the round trip and update `ingest_ok`, announcing transitions.
+
+        The startup probe answers "can this table store anything". It cannot
+        answer "is it storing anything NOW", and on 2026-09-01 those diverged at
+        about 14:30: QuestDB stopped committing, every counter kept climbing,
+        and 90 minutes of RTH were lost in silence because ingest_ok had been
+        decided at 09:30 and never revisited.
+
+        Mid-session the answer is still actionable -- not "repair before you
+        start" but "everything from here is going nowhere", which is worth
+        knowing while the session is running rather than the next morning."""
+        was = self.ingest_ok
+        ok = self._verify_ingest(timeout_s=self.recheck_timeout_s)
+        if ok:
+            self._fail_streak = 0
+        else:
+            self._fail_streak += 1
+            if self._fail_streak < self.recheck_fail_n:
+                log.warning("raw capture [%s]: ingest probe missed (%d/%d) -- "
+                            "a slow commit, not yet a death",
+                            self.symbol, self._fail_streak, self.recheck_fail_n)
+                return
+        self.ingest_ok = ok
+        if ok == was:
+            return
+        if ok:
+            log.warning("raw capture [%s]: ingest RECOVERED -- %s are storing "
+                        "rows again. Everything written while it was down is "
+                        "gone; the gap does not backfill.",
+                        self.symbol, f'{TICKS}/{DEPTH}' if self.capture_depth else TICKS)
+        else:
+            log.error("raw capture [%s]: INGEST DIED MID-SESSION. %s accept "
+                      "writes and store nothing. Every row from here is lost, "
+                      "counters and dropped=0 notwithstanding. Recording "
+                      "continues so the feed is never blocked.",
+                      self.symbol, f'{TICKS}/{DEPTH}' if self.capture_depth else TICKS)
+
+    def _run_monitor(self) -> None:
+        """Re-probe on a timer. Its own thread because the probe blocks for up
+        to probe_timeout_s and must never stall the writer or the hot path."""
+        while not self._stop.wait(self.recheck_s):
+            try:
+                self.recheck_ingest()
+            except Exception as ex:                  # noqa: BLE001 - never die
+                log.warning("raw capture [%s]: ingest re-probe failed: %s",
+                            self.symbol, ex)
 
     # ── writer lifecycle ──────────────────────────────────────────────────
     @property
@@ -221,8 +291,13 @@ class RawCaptureTee:
             return
         self.ingest_ok = self._verify_ingest()
         self._start_writer()
+        if self.recheck_s > 0:
+            self._monitor = threading.Thread(target=self._run_monitor, daemon=True,
+                                             name=f"rawcap-probe-{self.symbol}")
+            self._monitor.start()
         last_log = time.monotonic()
         prev_written = 0
+        prev_dropped = 0
         log.info("raw capture ON [%s] -> %s/%s via ILP :%d (buffered, off hot path)",
                  self.symbol, TICKS, DEPTH, self.ilp_port)
         try:
@@ -237,14 +312,33 @@ class RawCaptureTee:
                     yield ev
                 now = time.monotonic()
                 if now - last_log >= self.log_every_s:
+                    # SILENT WHEN HEALTHY. This used to print a rows/s line every
+                    # 15s forever, which trains the eye to skip the one line that
+                    # matters. The counters still exist and are still checked --
+                    # they are only SAID when one of them is wrong:
+                    #   writer thread dead   -> nothing is being stored at all
+                    #   dropped rows rising  -> tape is being lost right now
+                    #   queue over half full -> the writer is losing the race
+                    # Anything healthy goes to DEBUG, so -v still shows the rate.
                     rate = (self.n_written - prev_written) / (now - last_log)
-                    lvl = logging.INFO if self.writer_alive else logging.ERROR
+                    qn, cap = self._q.qsize(), self._q.maxsize or 1
+                    backed_up = qn > cap // 2
+                    losing = self.n_dropped > prev_dropped
+                    if not self.writer_alive:
+                        lvl, why = logging.ERROR, "  WRITER THREAD DEAD"
+                    elif losing:
+                        lvl, why = logging.ERROR, (
+                            f"  DROPPING ROWS (+{self.n_dropped - prev_dropped})")
+                    elif backed_up:
+                        lvl, why = logging.WARNING, f"  QUEUE BACKED UP ({qn}/{cap})"
+                    else:
+                        lvl, why = logging.DEBUG, ""
                     log.log(lvl, "raw capture [%s]: %.0f rows/s  written=%d  "
                             "queue=%d  dropped=%d%s",
-                            self.symbol, rate, self.n_written, self._q.qsize(),
-                            self.n_dropped,
-                            "" if self.writer_alive else "  WRITER THREAD DEAD")
+                            self.symbol, rate, self.n_written, qn,
+                            self.n_dropped, why)
                     last_log, prev_written = now, self.n_written
+                    prev_dropped = self.n_dropped
         finally:
             self._stop.set()
             if self._writer is not None:

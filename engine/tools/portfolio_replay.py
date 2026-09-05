@@ -368,6 +368,14 @@ async def run_day(qdb, symbol, day, labels, peer_map, source="mbo",
     # persist across the replay (see build_strategies), so the curve has to be
     # refreshed per session or every day would be gated on the first day's book.
     _attach_curves(qdb, strats, symbol, day)
+    # The LevelBook's gamma walls are PER SESSION and causal (prior session's),
+    # so they are refreshed here rather than once at build time -- the same
+    # reason _attach_curves is called here.
+    try:
+        from tools.run_live import attach_level_books
+        attach_level_books(strats, symbol, day, q=qdb)
+    except Exception:                                # noqa: BLE001 - fail open
+        pass
     # DayRange is attached ONCE, outside the per-day loop, and deliberately so:
     # it carries PRIOR sessions' ranges, so re-creating it per day would leave
     # it permanently cold -- size_mult would always fail closed to one lot and

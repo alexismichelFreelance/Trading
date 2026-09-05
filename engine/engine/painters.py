@@ -53,6 +53,12 @@ TF_OPACITY = {"30m": 16, "1h": 24, "4h": 34, "1d": 46}
 TF_LABEL = {"4h": True, "1d": True}          # tag these on the chart
 
 GHOST_CAP_PER_TAG = 6        # persistent chart objects — keep low so NT8 stays responsive
+# HOW MANY ZONES TO DRAW per timeframe. The BOOK keeps every unbroken zone --
+# that is the point of seeding, and bracket()/strategies read all of it. The
+# CHART is a different question: seeding takes ES from ~8 unbroken zones to
+# ~200, and 200 rectangles re-asserted every 4 minutes is how NT8 becomes
+# unusable. Draw the ones nearest price, keep the rest in the model.
+ZONE_DRAW_PER_TF = 6
 
 
 class ZoneView:
@@ -79,6 +85,31 @@ class ZoneView:
         """Feed historical daily bars (built externally) to the 1d detector."""
         for b in daily_bars:
             self._feed("1d", b)
+
+    def seed_intraday(self, bars_1m: list) -> None:
+        """Warm the 30m/1h/4h detectors from HISTORICAL 1-minute bars.
+
+        WHY. ZoneDetector needs 20 bars of its own timeframe before it can score
+        a departure (range >= 1.4 x avg20). RTH-only, that is 13 bars a session
+        at 30m, 6.5 at 1h and 1.6 at 4h -- so fed from the live stream alone the
+        1h detector holds ~6 bars and the 4h holds one or two, and NEITHER CAN
+        EVER DETECT ANYTHING. A reversal level from last week could not become a
+        zone, not because zones expire (ZoneBook never prunes) but because no
+        detector had seen the bars. Only 1d had history, via seed_daily, which
+        is why 1d was the only timeframe showing older structure.
+
+        Deliberately routed through update(), the SAME path the live stream
+        takes, so a seeded zone and a live one are produced by identical code
+        and the RTH gate applies to both. Zones broken during the seeded history
+        come up already broken, and the book is a pure function of the bars --
+        so a restart REBUILDS it rather than losing it, and nothing has to be
+        persisted.
+
+        Lossy in one respect, stated because it matters: on_price counts touches
+        tick by tick live, but a replay only sees bar closes, so seeded zones
+        carry a coarser virgin/tested grade than live ones."""
+        for b in bars_1m:
+            self.update(b)
 
     def update(self, bar) -> None:
         if bar.tf == "1d":
@@ -143,6 +174,7 @@ class PaintController:
         self._paper_by_tag: dict[str, int] = {}
         self._arrows: dict[str, tuple] = {}   # fill arrows to re-assert above zones
         self._arrow_bucket = -1
+        self._last_px: float | None = None
         self._zone_state: dict[str, object] = {}
         self._last_px = 0.0
         self._warm_n = 0
@@ -229,6 +261,7 @@ class PaintController:
         self.zv.update(bar)                       # build zone history always
         self._last_px = bar.c
         if live:
+            self._last_px = bar.c
             await self._paint_zones(bar.ts)
             await self._paint_bracket(bar.c)
             await self._paint_gamma(bar.ts)
@@ -245,9 +278,21 @@ class PaintController:
         # (fast enough to recover within minutes of a chart refresh, still ~2.5x
         # fewer redraws than the original 2m to keep NT8 responsive)
         for tf in TF_ORDER:
+            # nearest-to-price subset, plus anything price is currently inside.
+            # Everything else stays in the book and simply is not drawn; a zone
+            # that scrolls out of the drawn set is removed from the chart by the
+            # same "gone" path a broken one uses.
+            live = [z for z in self.zv.book[tf].zones if not z.broken]
+            if self._last_px is not None and len(live) > ZONE_DRAW_PER_TF:
+                px = self._last_px
+                live.sort(key=lambda z: 0.0 if z.bot <= px <= z.top
+                          else min(abs(z.top - px), abs(z.bot - px)))
+                keep = {id(z) for z in live[:ZONE_DRAW_PER_TF]}
+            else:
+                keep = {id(z) for z in live}
             for z in self.zv.book[tf].zones:
                 tag = f"eng-zone-{tf}-{z.formed_ts}-{z.direction}"
-                if z.broken:
+                if z.broken or id(z) not in keep:
                     if self._zone_state.get(tag) != "gone":
                         self._zone_state[tag] = "gone"
                         await self.p.remove(tag)
@@ -320,6 +365,12 @@ class PaintController:
         lines.append(f"{r}   {s}")
         counts = "  ".join(f"{tf}:{len(self.zv.active(tf))}" for tf in TF_ORDER)
         lines.append(f"zones  {counts}   sig {self._n_live}L/{self._n_ghost}G")
+        # ONLY WHAT IS IN THE MARKET. Listing all 40 sleeves made the panel a
+        # wall of "+0" that had to be read to find the one line that mattered,
+        # and it grew with every sleeve added. Flat sleeves are counted, not
+        # named; an open position gets its entry and its open P&L, which is the
+        # thing you actually want off a glance at the chart.
+        held, flat = [], 0
         for s in self.strategies:
             name = type(s).__name__.replace("Strategy", "").replace("Following", "")
             if name == "Observe":
@@ -327,17 +378,23 @@ class PaintController:
             pos = getattr(s, "pos", None)
             if pos is None:
                 continue
+            if not pos:
+                flat += 1
+                continue
             bits = f"{name:<10} {pos:+d}"
+            ep = getattr(s, "entry_px", None)
+            if ep:
+                bits += f" @{ep:.2f} {(close - ep) * (1 if pos > 0 else -1):+.2f}"
             if hasattr(s, "_F"):
                 tgt = max(-s.maxp, min(s.maxp, s._F / s.scale)) if s.scale else 0
                 bits += f"  F={s._F:+.0f} tgt={tgt:+.1f}"
             if getattr(s, "_er", None) is not None:
                 bits += f"  ER={s._er:.2f}"
-            if hasattr(s, "peak_fe") and pos:
+            if hasattr(s, "peak_fe"):
                 bits += f"  peak={s.peak_fe:+.1f}"
-            if pos:
-                bits += "  <== IN"
-            lines.append(bits)
+            held.append(bits)
+        lines += held or ["flat"]
+        lines.append(f"({flat} armed)" if held else f"({flat} sleeves armed)")
         await self.p.status("\\n".join(lines), pos=self.panel_pos)
 
 

@@ -139,6 +139,48 @@ def session_daily_bars(sym: str) -> list:
     return out
 
 
+_MINUTE_CACHE: dict = {}
+
+
+def minute_bars_for(sym: str, sessions: int = 60) -> list:
+    """Recent 1-minute bars for `sym` from OUR OWN table, to seed the zone view.
+
+    claude_bars_live, not the NT8 .ncd archive: the schema is ours, the recorder
+    fills it from whatever feed is attached, and it deepens by itself. A broker
+    change costs future rows, not the history. (.ncd was imported into this
+    table ONCE, by tools/import_ncd_bars.py, and is never read at runtime.)
+
+    All bars in the window are fetched and ZoneView.update applies the RTH gate
+    itself -- doing it in SQL would need a UTC offset that DST moves twice a
+    year, and the gate already exists in one place.
+
+    Fail-open: any error returns [] and the detectors simply start cold, which
+    is the behaviour this replaces."""
+    key = (sym, sessions)
+    if key in _MINUTE_CACHE:
+        return _MINUTE_CACHE[key]
+    bars: list = []
+    try:
+        import pandas as pd
+
+        from engine.adapters.questdb import QuestDB
+        from engine.core.events import Bar as _Bar
+        df = QuestDB(timeout=120).df(
+            f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
+            f"WHERE symbol = '{sym}' AND ts > dateadd('d', -{int(sessions * 1.5)}, now()) "
+            f"ORDER BY ts")
+        for r in df.itertuples():
+            bars.append(_Bar(int(pd.Timestamp(r.ts).value), "1m",
+                             float(r.o), float(r.h), float(r.l), float(r.c),
+                             int(r.vol), sym))
+    except Exception as ex:                       # noqa: BLE001 - never block startup
+        log.warning("zone seed: no 1m history for %s (%s); "
+                    "intraday detectors will start cold", sym, ex)
+        return []
+    _MINUTE_CACHE[key] = bars
+    return bars
+
+
 def daily_bars_for(sym: str) -> list:
     """~320 daily bars for `sym` (Yahoo continuous), fetched once and cached —
     used to seed both the 1d zone view and the pivot sleeve's D/W/M grid."""
@@ -414,6 +456,13 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return WallFadeStrategy(symbol, point_usd=pu)
     if label == "onbreak":           # study-motivated: overnight-range break
         return OvernightBreakStrategy(symbol)
+    if label == "onfade":
+        # onbreak's opposite number: the overnight move OVERSHOT, so fade it at
+        # the open with a target that is a fraction of that move. The only
+        # sleeve in the roster whose config was chosen on a train half and
+        # scored once (1,143 ES sessions) -- see the strategy docstring.
+        from engine.strategies.overnight_fade import OvernightFadeStrategy
+        return OvernightFadeStrategy(symbol)
     # onbreak_2p and onbreak_2p24 REMOVED: the same entry with a decay/range
     # two-phase exit differing only in arming distance. On 2026-08-14 all five
     # onbreak rows entered at 10:22 and the family booked +3,650 of a +4,665
@@ -590,7 +639,8 @@ FLOW_GATE = (13, 20)          # 09:00 -> 16:00 ET
 ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
               "flow", "flow_fixed",
               "zones", "zones_gap", "ibs", 
-              "pivot", "vwapbreak", "onbreak",               "trendjoin_pk", "opendrive_pk", "wallfade",
+              "pivot", "vwapbreak", "onbreak", "onfade",
+              "trendjoin_pk", "opendrive_pk", "wallfade",
               "ignition_lg", "flow_lg", "onbreak_lg",
               "opendrive_vac",          # break-quality twin of `opendrive`
               "trendjoin_scale80", "trendjoin_scale100",   # scale-out twins
@@ -751,6 +801,20 @@ def attach_day_range(sleeves, symbol: str, shared=None):
     return dr
 
 
+def heartbeat_should_speak(faults, went_live: bool, now: float,
+                           last_alarm: float, repeat_s: float) -> bool:
+    """Print policy for the live heartbeat.
+
+    Quiet is the whole point, so the failure this guards against is the opposite
+    one: going quiet while something is broken. A fault ALWAYS speaks -- the
+    repeat window only limits how often it repeats, never whether the first one
+    is said. `went_live` speaks once so a session that never starts is visible
+    by its silence rather than indistinguishable from a healthy one."""
+    if faults:
+        return now - last_alarm >= repeat_s or last_alarm == 0.0
+    return bool(went_live)
+
+
 def attach_level_books(sleeves, symbol: str, day: str, q=None) -> int:
     """Put the PRIOR-SESSION gamma walls into every sleeve's LevelBook.
 
@@ -764,11 +828,18 @@ def attach_level_books(sleeves, symbol: str, day: str, q=None) -> int:
 
     Fail-open: no levels, no gamma in the book, and the sleeve simply has fewer
     sources to find agreement between."""
-    want = [s for s in sleeves if getattr(s, "levels", None) is not None]
+    # Select on CAPABILITY, not on the attribute name. `.levels` is not one
+    # type: ignition owns a SessionLevels, trendjoin owns None until the _lvl
+    # variant swaps in a LevelBook. Filtering on "has a .levels" fed a
+    # SessionLevels to set_gamma and took the whole engine down on startup
+    # (2026-08-31). Anything that cannot hold walls is simply not a customer.
+    want = [s for s in sleeves
+            if hasattr(getattr(s, "levels", None), "set_gamma")]
     if not want:
         return 0
     lv = None
     try:
+        from engine.adapters.questdb import QuestDB
         from engine.core.config import root_symbol
         from engine.features.gamma_basis import BasisSeries
         from engine.features.gamma_levels import (DEFAULT_BASIS,
@@ -910,6 +981,9 @@ async def main() -> None:
                     help="also PAINT paper-sleeve fills (cyan). Default OFF: 10 paper "
                          "sleeves add many chart objects; they're always recorded to "
                          "claude_paper_fills regardless (review via tools/scorecard.py)")
+    ap.add_argument("--zone-seed-sessions", type=int, default=60,
+                    help="sessions of 1m history used to warm the intraday zone "
+                         "detectors at startup (0 = off, cold start)")
     ap.add_argument("--panel", default="bottomleft",
                     choices=["bottomleft", "topright", "bottomright", "topleft"],
                     help="corner for the engine info panel (default bottomleft)")
@@ -1028,12 +1102,22 @@ async def main() -> None:
                            et_session_date(int(_time.time() * 1e9)))
         # emit_depth only when raw-capturing (the engine itself needs BookFlow,
         # not raw depth — RawCaptureTee records the depth and drops it onward).
+        # Per-lane `capture_depth` (live.yaml) turns the RAW depth tap off for a
+        # lane while leaving everything else intact: BookFlow is accumulated
+        # inside the feed regardless of emit_depth, so the sleeves that read it
+        # (flow, ignition, open_drive) are untouched, and the tee still records
+        # that lane's TRADES. Off for NQ since 2026-09-02 -- it was 11.5M of the
+        # 15.5M daily rows into a 272M-row table that nothing reads and that
+        # took QuestDB down mid-session.
+        cap_depth = a.raw_capture and bool(lc.get("capture_depth", True))
         feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),
-                               symbol=sym, emit_depth=a.raw_capture)
+                               symbol=sym, emit_depth=cap_depth)
         if a.raw_capture:                            # innermost: sees raw depth first
             from engine.adapters.feeds.raw_capture import RawCaptureTee
-            feed = RawCaptureTee(feed, symbol=sym)
+            feed = RawCaptureTee(feed, symbol=sym, capture_depth=cap_depth)
             rawcaps.append(feed)
+            log.info("raw capture [%s]: trades ON, depth %s", sym,
+                     "ON" if cap_depth else "OFF (live.yaml capture_depth)")
         if a.record:
             rec = RecorderTee(feed, AsyncQuestDB(), symbol=sym)
             recorders.append(rec)
@@ -1175,6 +1259,15 @@ async def main() -> None:
             if daily:
                 lane_pc.zv.seed_daily(daily)
                 print(f"seeded {len(daily)} daily bars for {sym} 1d zones")
+            # INTRADAY zones need history too. Without this the 1h detector holds
+            # ~6 bars and the 4h one or two -- under the 20 a departure test
+            # needs -- so no zone older than the process could ever exist.
+            mins = minute_bars_for(sym, sessions=a.zone_seed_sessions)
+            if mins:
+                lane_pc.zv.seed_intraday(mins)
+                n = {tf: len(lane_pc.zv.book[tf].zones) for tf in ("30m", "1h", "4h")}
+                print(f"seeded {len(mins):,} 1m bars for {sym} intraday zones -> "
+                      + "  ".join(f"{k} {v}" for k, v in n.items()))
             print(f"chart painting ON [{sym}] (zones, S/R, gamma, signals, panel)")
             # gamma S/R levels per lane: ES <- SPX chain, NQ <- NDX chain
             # (instruments.yaml gex: {underlying, basis}); --gex-basis still
@@ -1378,9 +1471,25 @@ async def main() -> None:
         Paper fills, dispatched events, sink drops and strategy failures are the
         numbers that go to zero when the book stops. Those are what print now.
         """
+        import time
+
         from engine.core import dispatch as _dsp
+        # SAY SOMETHING ONLY WHEN IT MATTERS. The old line printed every 5s for
+        # the whole session, so the one line carrying a fault looked exactly like
+        # the 4,000 that did not. The counters are all still computed and still
+        # checked every 5s -- they are only PRINTED when one of them is wrong,
+        # plus once when the engine goes live so a session that never starts is
+        # still obvious by its silence.
+        #
+        # The stall check is what the old line was reaching for and never had:
+        # obs.trades climbing proves the loop is turning, but nothing noticed it
+        # STOPPING. Now a live engine that has seen no trade for STALL_S says so.
+        STALL_S, REPEAT_S = 300, 60
         last_seen = -1
         last_fills = 0
+        last_state = None
+        last_change = time.monotonic()
+        last_alarm = 0.0          # so the FIRST fault speaks at once
         while True:
             await asyncio.sleep(5)
             state = "LIVE" if eng._live else f"WARMUP({eng._backfill_bars} bars)"
@@ -1390,18 +1499,24 @@ async def main() -> None:
             dead = [k for k, v in fails.items() if v["disabled"]]
             open_pos = sum(1 for s in strategies
                            if abs(getattr(s, "pos", 0) or 0) > 0)
-            if obs.trades != last_seen or not eng._live:
+            now = time.monotonic()
+            if obs.trades != last_seen:
+                last_change = now
+            faults = []
+            if eng._live and now - last_change > STALL_S:
+                faults.append(f"!!NO TRADES FOR {int(now - last_change)}s")
+            if True:
                 line = (f"  [{state}] ev={eng._processed} trades={obs.trades} "
                         f"bars={obs.bars} last={obs.last_px} "
                         f"paper_fills={pf}(+{pf - last_fills}) open={open_pos} "
                         f"ghosts={ghosts} live={blot.n_fills}")
                 if eng._sink_dropped or eng._sink_errors:
-                    line += (f" SINK drop={eng._sink_dropped} "
-                             f"err={eng._sink_errors}")
+                    faults.append(f"SINK drop={eng._sink_dropped} "
+                                  f"err={eng._sink_errors}")
                 if fails:
-                    line += f" STRAT_FAIL={len(fails)}"
+                    faults.append(f"STRAT_FAIL={len(fails)}")
                 if dead:
-                    line += f" DISABLED={','.join(k.split('@')[0] for k in dead)}"
+                    faults.append(f"DISABLED={','.join(k.split('@')[0] for k in dead)}")
                 # A recorder whose table accepts writes and stores nothing, or
                 # whose ILP writer thread has died, looks perfectly healthy from
                 # every counter above. Both happened on 2026-08-05 and cost a
@@ -1412,11 +1527,17 @@ async def main() -> None:
                 broken = [getattr(t, "symbol", "paper") for t in probed
                           if getattr(t, "ingest_ok", None) is False]
                 if broken:
-                    line += f" !!TABLE-NOT-INGESTING[{','.join(sorted(set(broken)))}]"
+                    faults.append(f"!!TABLE-NOT-INGESTING[{','.join(sorted(set(broken)))}]")
                 stalled = [rc.symbol for rc in rawcaps if not rc.writer_alive]
                 if stalled:
-                    line += f" !!RAWCAP-WRITER-DEAD[{','.join(sorted(set(stalled)))}]"
-                print(line)
+                    faults.append(f"!!RAWCAP-WRITER-DEAD[{','.join(sorted(set(stalled)))}]")
+                went_live = state != last_state and eng._live
+                if heartbeat_should_speak(faults, went_live, now,
+                                          last_alarm, REPEAT_S):
+                    print(line + (" " + " ".join(faults) if faults else ""))
+                    if faults:
+                        last_alarm = now
+                last_state = state
                 last_seen, last_fills = obs.trades, pf
 
     tasks = [asyncio.create_task(eng.run()), asyncio.create_task(heartbeat()),

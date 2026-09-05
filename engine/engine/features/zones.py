@@ -140,13 +140,26 @@ class ZoneBook:
 
     def __init__(self) -> None:
         self.zones: list[Zone] = []
+        # UNBROKEN zones only. `zones` keeps everything -- consumers need the
+        # broken ones (the painter reads them once to erase the rectangle, and
+        # they are the record of what invalidated) -- but the per-bar hot loops
+        # must not walk history. on_price runs on EVERY 1m bar, and a book that
+        # never prunes made that cost grow without bound: once LevelBook started
+        # actually receiving zones, a 120-session replay stopped finishing.
+        self._live: list[Zone] = []
 
     def add(self, zone: Zone) -> None:
         self.zones.append(zone)
+        if not zone.broken:
+            self._live.append(zone)
+
+    def _drop_broken(self) -> None:
+        if any(z.broken for z in self._live):
+            self._live = [z for z in self._live if not z.broken]
 
     def on_price(self, price: float, ts: int) -> None:
         """Count a touch each time price enters a (non-broken) zone band."""
-        for z in self.zones:
+        for z in self._live:
             if z.broken:
                 continue
             inside = z.bot <= price <= z.top
@@ -159,7 +172,7 @@ class ZoneBook:
         """A 30m close fully through a zone BREAKS it and FLIPS polarity.
         Returns any newly-created flip zones."""
         new_flips = []
-        for z in list(self.zones):
+        for z in list(self._live):
             if z.broken:
                 continue
             broke = (z.direction > 0 and bar.c < z.bot) or (z.direction < 0 and bar.c > z.top)
@@ -169,7 +182,10 @@ class ZoneBook:
                 flip = Zone(bar.ts, z.top, z.bot, -z.direction,
                             z.departure_score, z.base_score, flipped_from=z.direction)
                 self.zones.append(flip)
+                self._live.append(flip)
                 new_flips.append(flip)
+        if new_flips:
+            self._drop_broken()
         return new_flips
 
     def nearest_opposing(self, price: float, trade_dir: int, min_dist: float = 2.0,
