@@ -53,6 +53,13 @@ HMM_PATH = str(ROOT / "config" / "hmm_es_1h.json")
 SYMBOL = "ES"
 INSTRUMENTS = load_instruments(ROOT / "config" / "instruments.yaml")
 
+# Rolling window for the RTH daily aggregation in session_daily_bars. The
+# claude_bars_live table holds 1.58M ES rows since the .ncd backfill; an
+# unbounded scan froze the engine's event loop on 2026-09-07 (see
+# tests/test_bars_live_queries_bounded.py). 120 days of 1-minute bars is
+# comfortably more than the daily/weekly/monthly pivot grid needs to warm up.
+DAILY_WINDOW_D = 120
+
 
 def fetch_daily_bars(symbol: str = "ES=F", days: int = 320) -> list:
     """Daily bars for the 1d zone view (Yahoo continuous front ~ current ES,
@@ -118,7 +125,8 @@ def session_daily_bars(sym: str) -> list:
         # survives a spot check.
         df = QuestDB(timeout=90).df(
             f"SELECT ts, h, l, c, vol FROM claude_bars_live "
-            f"WHERE symbol = '{sym}' ORDER BY ts")
+            f"WHERE symbol = '{sym}' AND ts > dateadd('d', -{DAILY_WINDOW_D}, now()) "
+            f"ORDER BY ts")
         if not len(df):
             return []
         et = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("America/New_York")
@@ -280,6 +288,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     from engine.strategies.overnight_break import OvernightBreakStrategy
     from engine.strategies.pivot import PivotStrategy
     from engine.strategies.sweep_follow import SweepFollowStrategy
+    from engine.strategies.vwap_break import VwapBreakStrategy
     from engine.strategies.zones_strategy import ZoneLifecycleStrategy
     # REMOVED 2026-09-16: ignition, ignition_fixed — confirmed losers across all
     # measurement windows (replay -1,012 / matched -750 / live -900).
@@ -304,6 +313,17 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     if label == "opendrive_2p32":
         return OpenDriveStrategy(symbol, mode="orb", two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=32.0))
+    # opendrive base rebuilt as ORB. The blind 10:00 drive entry is a validated
+    # PARITY default that stays on the class (see test_strategy_defaults_are_untouched),
+    # but the DEPLOYED roster is orb: the blind entry loses in every shape of the
+    # open (tests/test_roster_decisions.py) and `orb` is the only positive variant.
+    if label == "opendrive":
+        return OpenDriveStrategy(symbol, mode="orb")
+    # vwapbreak rebuilt as RETEST. Entering AT the (midnight-anchored, corrected)
+    # VWAP line instead of chasing the break: vwapbreak_retest +3,425/+201 per day
+    # vs vwapbreak -3,750/-221 on the same exits (tests/test_roster_decisions.py).
+    if label == "vwapbreak":
+        return VwapBreakStrategy(symbol, entry_mode="retest")
     # REMOVED 2026-09-16: flow, flow_fixed — confirmed losers (replay -2,725 /
     # matched -875 / live -5,650). Exit logic is broken; the family stays removed.
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
@@ -585,9 +605,8 @@ FLOW_GATE = (13, 20)          # 09:00 -> 16:00 ET
 # every strategy + variant — the full paper roster (--paper all)
 ALL_LABELS = (
               "zones", "zones_gap", "ibs",
-              "pivot", "onbreak", "onfade",
+              "pivot", "onfade",
               "trendjoin_pk", "wallfade",
-              "onbreak_lg",
               "trendjoin_scale80", "trendjoin_scale100",   # scale-out twins
               "trendjoin_fast",         # scales on ARRIVAL SPEED instead
               "trendjoin_scale80w",     # scale80 + one-way suppressor
@@ -597,8 +616,6 @@ ALL_LABELS = (
               "trendjoin_d10", "trendjoin_d14",   # scale-free pullback DEPTH
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
-              "onbreak_2p_retrace",
-              "onbreak_2p32",
               "opendrive_2p24",
               "zones_15m", "zones_1h",
               "dip3")
