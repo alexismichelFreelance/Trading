@@ -34,8 +34,31 @@ instruments:
     # t=3.42). It fires once per session, every session. ES ONLY -- NQ is
     # untested and the last overnight-signal sleeve (failed-break fade) worked
     # on ES and died on NQ, so it does not go in the NQ roster on faith.
-    paper: "all,-flow,-ignition"
-    live: ""
+    # ROUTED LIVE 2026-09-06 (demo account). The 40-forward-paper-session gate
+    # (G7) is SUSPENDED by explicit decision, and the reason is sound: the paper
+    # record has never survived 40 sessions without a critical bug being found in
+    # the engine underneath it -- fill pricing, ingest, accounting, the roster
+    # itself -- so the clock has never actually started. Waiting for 40 clean
+    # sessions of a record that keeps being invalidated is not caution, it is a
+    # loop. Every other gate still applies, and the risk supervisor is on with
+    # its production limits (10/sleeve, 15 gross, halt at -$5,000, entry lockout
+    # 15:45 ET, flatten 15:58 ET).
+    #   zones      5/5 computable gates, 83% sign, mean $762   (n=6, risk-sized)
+    #   zones_15m  4/5, mean $1,390, median $768, total +$13,901 (n=10)
+    #   zones_gap  3/5 but the largest total on both lanes, +$23,087 (n=30)
+    #   pivot      5/5, 70% sign, mean $560, median $841       (n=10)
+    #   onfade     see below
+    # The zones family is the ONLY thing in the book that replicates across
+    # instruments: same sign and similar magnitude on ES and NQ, which is what
+    # G3 asks for. Its samples are small BECAUSE these sleeves fire rarely.
+    paper: "all"
+    live: "zones,zones_15m,zones_gap,pivot,onfade"
+    # onfade goes live on the strength of its OWN replay -- 1,145 ES sessions,
+    # $164/trade, t=5.50, 75% wins -- and not on the 38-session window above,
+    # where it made -$14/trade. Both numbers are real and they do not conflict:
+    # 38 sessions inside a 1,145-session sample, well within a drawdown the
+    # backtest already measured at -$10,878. Stated here because the short
+    # window is the one that will be visible day to day.
   NQ:
     market_port: 36011
     broker_port: 36012
@@ -75,6 +98,10 @@ instruments:
     # tools/sleeve_audit.py, where all 6 pairs matched exactly. Duplicates burn
     # compute and, worse, look like independent agreement in a twin comparison.
     # Re-add them only once an NDX-based GammaRegime exists.
+    # TRENDJOIN_GEX ADDED 2026-09-09: NDX GammaRegime now exists via
+    # claude_gex_levels (CBOE true-OI, ≤7 DTE). Validation on 2026-08-22->09-01
+    # (10 sessions): raw -367.9 pts (93 trades) -> gated +48.1 pts (23 trades),
+    # delta +416 pts. The gate eliminates all long-gamma chop entries.
     # trendjoin ADDED 2026-08-16. It is the best sleeve on NQ by a wide margin
     # and had never been deployed there, while instruments.yaml has carried
     # NQ-calibrated parameters for it all along (conf_pts 186, stop_pts 53,
@@ -113,5 +140,18 @@ instruments:
     # the control ends that comparison, and opendrive_vac had only ~10 mature
     # sessions (it fails open for its first 5 while its threshold warms). Its
     # forward record now has nothing to be compared against.
-    paper: "zones,zones_gap,dipbuy,ibs,pivot,opendrive_vac,flow,vwapbreak,onbreak,trendjoin,trendjoin_narrow"
-    live: ""
+    # ROUTED LIVE 2026-09-06 (demo account), same suspension of G7 as ES.
+    #   zones          5/5 computable gates, 100% sign, mean $1,739  (n=4)
+    #   zones_15m      5/5, 100% sign, mean $1,440, median $1,550    (n=6)
+    #   zones_gap      4/5, mean $1,738, total +$24,331              (n=14)
+    #   opendrive_2p24 4/5, 85% sign on 94% of sessions, mean $113   (n=33)
+    # opendrive_2p24 is the ONE survivor of the opendrive family: the base sleeve
+    # is -$490/session here and its `_vac` twin fails G9 against it, but the
+    # 24-point-armed two-phase exit takes the same entries and posts 85% sign
+    # consistency. The entry was never the problem; the base exit was.
+    # NOT live on NQ: pivot (27% sign, negative median here -- it is ES-only) and
+    # onfade (measured and FAILS on NQ: $94/trade at t=0.43 over 194 sessions,
+    # against ES $207 at t=3.09 on the same window).
+    # dipbuy dropped: it is not in ALL_LABELS and produced no fills in the replay.
+    paper: "zones,zones_15m,zones_gap,pivot,opendrive_2p24,trendjoin,trendjoin_gex,trendjoin_narrow,trendjoin_pb8,trendjoin_scale100,ibs,rsi2,dip3"
+    live: "zones,zones_15m,zones_gap,opendrive_2p24,trendjoin_gex"

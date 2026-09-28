@@ -15,6 +15,7 @@ predicted (rank -0.09 vs efficiency) — this is a SIZE/regime signal only.
 from __future__ import annotations
 
 import logging
+import numpy as np
 from datetime import date
 
 from ..adapters.questdb import QuestDB
@@ -130,4 +131,85 @@ class GammaRegime:
         return None if v is None else v <= max_pctl
 
 
-__all__ = ["GammaRegime", "TREND_MAX_PCTL", "MAX_AGE_DAYS"]
+__all__ = ["GammaRegime", "NDXGammaRegime", "TREND_MAX_PCTL", "MAX_AGE_DAYS"]
+
+
+class NDXGammaRegime:
+    """NDX dealer-gamma regime from claude_gex_levels (CBOE true-OI, ≤7 DTE).
+
+    Trading day D uses the PRIOR session's trailing-252-session percentile of
+    total_gex. Low percentile = dealers short gamma (trend amplified);
+    high percentile = dealers long gamma (mean-reversion / pinning).
+
+    Data source: `tools/fetch_cboe_gex.py` writes daily per-strike chains
+    aggregated to `claude_gex_levels`. This class reads the `total_gex` column
+    and computes the same causal trailing percentile as `GammaRegime` does for
+    SqueezeMetrics SPX GEX.
+    """
+
+    def __init__(self, q: QuestDB | None = None, table: str = "claude_gex_levels",
+                 window: int = 252, max_age_days: int = 4) -> None:
+        self._q = q or QuestDB()
+        self._table = table
+        self._window = window
+        self._max_age_days = max_age_days
+        self._stale_warned: str | None = None
+        self._snap: tuple[list, list] = ([], [])   # (dates, gexp_vals), swapped atomically
+        self._load()
+
+    def _load(self) -> None:
+        df = self._q.df(f"SELECT ts, total_gex FROM {self._table} "
+                        f"WHERE underlying='NDX' AND total_gex IS NOT NULL ORDER BY ts")
+        dates = df["ts"].dt.strftime("%Y-%m-%d").tolist()
+        gex = df["total_gex"].astype(float).tolist()
+        # trailing percentile (causal: only sessions strictly BEFORE current index)
+        gexp = []
+        for i, v in enumerate(gex):
+            if i < 10:
+                gexp.append(None)
+            else:
+                w = gex[max(0, i - self._window):i]
+                gexp.append((np.array(w) < v).mean() if len(w) else None)
+        self._snap = (dates, gexp)
+
+    def reload(self) -> bool:
+        """Re-read the table IN PLACE. Returns True if the snapshot GAINED data."""
+        before = tuple(self._snap[0])
+        self._load()
+        return tuple(self._snap[0]) != before
+
+    def newest_session(self) -> str | None:
+        dates = self._snap[0]
+        return dates[-1] if dates else None
+
+    def needs_reload(self, day: str, max_age_days: int | None = None) -> bool:
+        return self.gexp_prev(day, max_age_days or self._max_age_days) is None
+
+    def gexp_prev(self, day: str, max_age_days: int = 4) -> float | None:
+        """CAUSAL prior-session NDX GEX percentile for trading day 'YYYY-MM-DD'.
+
+        Returns None if that session is more than `max_age_days` old.
+        """
+        import bisect
+        from datetime import date
+        dates, gexp = self._snap
+        i = bisect.bisect_left(dates, day)
+        if i == 0:
+            return None
+        prev = dates[i - 1]
+        age = (date.fromisoformat(day) - date.fromisoformat(prev)).days
+        if age > max_age_days:
+            if self._stale_warned != day:
+                self._stale_warned = day
+                log.error("NDX GAMMA DATA STALE: newest session before %s is %s "
+                          "(%d days old, limit %d). %s is not being updated -- "
+                          "check the Trading_GEX_Daily task and gamma/fetch_log.txt. "
+                          "Gating DISABLED until it is fresh.",
+                          day, prev, age, max_age_days, self._table)
+            return None
+        return gexp[i - 1]
+
+    def is_short_gamma(self, day: str, max_pctl: float = 1.0 / 3.0) -> bool | None:
+        """True = short-gamma regime (trend sleeves on). None = no data OR stale."""
+        v = self.gexp_prev(day)
+        return None if v is None else v <= max_pctl

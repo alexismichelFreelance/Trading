@@ -176,17 +176,26 @@ def nq_lane_builds(labels) -> bool:
 # `-label` subtracts instead, so the lane stays on 'all' and the exclusion is
 # explicit and auditable in config/live.yaml.
 def test_all_minus_a_label_drops_only_that_label():
+    """The subtraction MECHANISM, not any particular sleeve.
+
+    This used to subtract flow and ignition, because the ES lane really did run
+    'all,-flow,-ignition'. Both were cut from ALL_LABELS outright on 2026-09-06,
+    so the test was asserting the presence of sleeves that no longer exist -- and
+    it failed LOUDLY rather than silently passing, which is the good outcome.
+    Rewritten to take its two labels FROM ALL_LABELS instead of naming more
+    constants that can go stale the same way."""
     from run_live import ALL_LABELS, build_roster
+    a, b = ALL_LABELS[0], ALL_LABELS[1]
     full = build_roster("all", symbol="ES")
-    cut = build_roster("all,-flow,-ignition", symbol="ES")
+    cut = build_roster(f"all,-{a},-{b}", symbol="ES")
     names_full = {lb for lb, _ in full}
     names_cut = {lb for lb, _ in cut}
-    assert "flow" in names_full and "ignition" in names_full
-    assert "flow" not in names_cut and "ignition" not in names_cut
-    assert names_full - names_cut == {"flow", "ignition"}, \
+    assert a in names_full and b in names_full
+    assert a not in names_cut and b not in names_cut
+    assert names_full - names_cut == {a, b}, \
         "subtracting must remove EXACTLY the named labels"
-    # the variants survive: only the base sleeve was cut
-    assert "flow_lg" in names_cut and "ignition_fixed" in names_cut
+    # everything else survives: subtraction is not a wildcard
+    assert len(names_cut) == len(names_full) - 2
 
 
 def test_subtraction_works_on_an_explicit_list_too():

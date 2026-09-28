@@ -38,6 +38,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from ..core.events import Bar
+from ..core.market_calendar import flat_min_for
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
 from .base import BaseStrategy
@@ -166,7 +167,7 @@ class MacroDipStrategy(BaseStrategy):
             self._day = day
             self._decided = False
         self._c = b.c
-        if self._decided or et_minute_of_day(b.ts) < DECISION_MIN:
+        if self._decided or et_minute_of_day(b.ts) < flat_min_for(b.ts):
             return []
         self._decided = True
         # today's close participates in the decision but is appended at the roll

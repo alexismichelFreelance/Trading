@@ -59,13 +59,14 @@ NOT yet tested: slippage beyond the flat round turn.
 from __future__ import annotations
 
 from ..core.events import Bar
+from ..core.market_calendar import past_flat
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
 from .base import BaseStrategy, level_fill
 
 RTH_START = 9 * 60 + 30       # 09:30 ET — the overnight window closes, entry here
 GLOBEX_OPEN = 18 * 60         # 18:00 ET — the overnight window opens
-EOD_FLAT = 15 * 60 + 59       # 15:59 ET — flat
+EOD_FLAT = 15 * 60 + 59       # ORDINARY sessions only; past_flat() is the gate
 TGT_FRAC = 0.75               # target = this much of |overnight move|
 STOP_FRAC = 0.75              # stop   = this much of the overnight RANGE
 MIN_ON_BARS = 200             # a partial night is not an overnight move
@@ -141,7 +142,7 @@ class OvernightFadeStrategy(BaseStrategy):
             self.n_on += 1
             return []
         # ── the session ──
-        if m >= EOD_FLAT:
+        if past_flat(bar.ts):   # calendar-aware: 12:59 on a holiday
             return self._flatten(bar, "moc", at=None)
         if self.pos != 0 and self.trade is not None:
             return self._manage(bar)

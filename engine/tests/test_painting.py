@@ -226,23 +226,33 @@ def test_zoneview_multitf_detects_and_brackets():
 
 def test_fill_arrows_reasserted_on_top_after_zones():
     """A fill arrow is remembered and, on the next 4-min redraw cycle, removed
-    and re-added (so NT renders it above the zone fills)."""
+    and re-added (so NT renders it above the zone fills).
+
+    LIVE fills live in their OWN store since 2026-09-06 (`_live_arrows`), so that
+    paper traffic cannot evict the marks that were actually routed to the broker,
+    and so they can be re-asserted LAST — NT8 has no z-index, only append order,
+    which is the entire mechanism for "on top"."""
     from engine.core.events import Fill
     p = _painter()
     pc = PaintController(p, [])
 
     async def go():
-        f = Fill(10 * NS, "O1", "ES", 5000.0, 1, 0.0, 0.0, "dipA-entry")
-        await pc.live_fill(f)
+        await pc.paper_fill(Fill(9 * NS, "O0", "ES", 4999.0, 1, 0.0, 0.0, "tj-entry"))
+        await pc.live_fill(Fill(10 * NS, "O1", "ES", 5000.0, 1, 0.0, 0.0, "dipA-entry"),
+                           sleeve="ES:dipA")
         p._w.lines.clear()
-        # first bar establishes the arrow bucket; a later bar (>4 min) re-asserts
+        # first call establishes the bucket; a later one (>4 min) re-asserts
         await pc._reassert_arrows(10 * NS)
-        first = [m for m in p._w.lines if m.get("kind") in ("arrow", "remove")]
+        p._w.lines.clear()
         await pc._reassert_arrows(10 * NS + 5 * 60 * NS)      # next 4-min bucket
-        kinds = [m["kind"] for m in p._w.lines if m.get("kind") in ("arrow", "remove")]
+        return [m for m in p._w.lines if m.get("kind") == "arrow"]
 
-    asyncio.run(go())
-    assert "eng-fill-1" in pc._arrows                          # remembered
+    arrows = asyncio.run(go())
+    assert "eng-fill-1" in pc._live_arrows                     # remembered
+    assert "eng-paper-1" in pc._arrows
+    tags = [m["tag"] for m in arrows]
+    assert tags.index("eng-fill-1") > tags.index("eng-paper-1"), \
+        "the LIVE mark must be re-added after the paper one, i.e. on top of it"
 
 
 def test_manual_fill_is_redrawn():

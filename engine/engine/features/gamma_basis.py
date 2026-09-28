@@ -55,10 +55,22 @@ class BasisSeries:
         """Join the stored index closes to our own RTH futures closes."""
         import pandas as pd
         try:
+            # BOUNDED BY `days`, which this signature has always taken and this
+            # query never used. It selected EVERY bar of the contract to compute
+            # a 30-day basis. That was survivable while claude_bars_live held the
+            # recorder's own ~57 sessions; after the .ncd backfill it holds 1.58M
+            # ES rows, the query times out, and because BasisSeries.load is
+            # called synchronously on the engine's event loop -- at startup and
+            # again on every session rollover -- each timeout FREEZES THE WHOLE
+            # LOOP for the QuestDB timeout. On 2026-09-07 a restart during RTH
+            # left the chart with no panel, no zones and no position tracking:
+            # not a painter fault, the loop simply never got back to painting.
+            # A wider window than `days` is fetched (x3) so the join still has
+            # futures closes to pair with the oldest stored index closes.
             gx = q.df(f"SELECT ts, spot FROM claude_gex_levels "
                       f"WHERE underlying = '{underlying}' ORDER BY ts")
             b = q.df(f"SELECT ts, c FROM claude_bars_live WHERE symbol = '{fut}' "
-                     f"ORDER BY ts")
+                     f"AND ts > dateadd('d', -{int(days) * 3}, now()) ORDER BY ts")
         except Exception as ex:                       # noqa: BLE001
             log.warning("basis unmeasurable for %s (%s); falling back to the "
                         "configured constant %.1f", fut, ex, fallback)

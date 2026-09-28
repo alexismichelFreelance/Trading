@@ -211,9 +211,21 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
                 else if (kind == "line")
                 {
+                    // WIDTH AND STYLE ARE NOW THE SENDER'S CHOICE. This was hard-coded
+                    // to a 1-pixel DASHED line, which is fine for a construction line
+                    // and useless for the thing it now mostly draws: the connector
+                    // between a live trade's entry and its exit. A trade you took has
+                    // to be readable at a glance, not inferred from a hairline.
+                    // Absent fields keep the old dash/1 so nothing else shifts.
+                    double w = m.Num("width");
+                    if (w <= 0) w = 1;
+                    string st = m.Get("style");
+                    DashStyleHelper ds = st == "solid" ? DashStyleHelper.Solid
+                                       : st == "dot" ? DashStyleHelper.Dot
+                                       : DashStyleHelper.Dash;
                     Draw.Line(this, tag, false, FromNs(m.Num("t1")), m.Num("p1"),
                               FromNs(m.Num("t2")), m.Num("p2"),
-                              BrushOf(m.Get("color"), Brushes.Orange), DashStyleHelper.Dash, 1);
+                              BrushOf(m.Get("color"), Brushes.Orange), ds, (int)w);
                 }
                 else if (kind == "text")
                 {

@@ -29,12 +29,13 @@ tools/sweep_backtest.py). Paper only until its own forward record says otherwise
 from __future__ import annotations
 
 from ..core.events import Signal, Trade
+from ..core.market_calendar import past_flat
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
 from .base import BaseStrategy
 
 RTH_START = 9 * 60 + 30
-EOD_FLAT = 15 * 60 + 59
+EOD_FLAT = 15 * 60 + 59       # ORDINARY sessions only; past_flat() is the gate
 NS_MS = 1_000_000
 TICK = 0.25
 
@@ -100,7 +101,7 @@ class SweepFollowStrategy(BaseStrategy):
                 return [Order(self.symbol, -side, abs(self.pos), tag="safety-flat",
                               reduce_only=True)]
         m = et_minute_of_day(t.ts)
-        if m >= EOD_FLAT:
+        if past_flat(t.ts):     # calendar-aware: 12:59 on a holiday
             self._c_dir = 0
             return self._flatten("moc")
         if self.pos != 0 and self.trade is not None:

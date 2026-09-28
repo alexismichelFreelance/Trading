@@ -23,6 +23,7 @@ comparing its daily call to the user's actual trades (paper only). The execution
 from __future__ import annotations
 
 from ..core.events import Bar
+from ..core.market_calendar import past_flat
 from ..core.orders import Order, OrderType
 from ..core.timeutil import et_minute_of_day, et_session_date
 from ..features.pivots import MultiPivots
@@ -31,7 +32,7 @@ from .base import BaseStrategy, level_fill
 # ── session windows (ET minutes) ─────────────────────────────────────────────
 RTH_START = 9 * 60 + 30      # 09:30 — US open; bias is frozen here
 RTH_END = 16 * 60           # 16:00
-EOD_FLAT = 15 * 60 + 59     # 15:59 — flat everything
+EOD_FLAT = 15 * 60 + 59       # ORDINARY sessions only; past_flat() is the gate
 
 # ── bias thresholds (TUNABLE — the research/fuzzy knobs) ─────────────────────
 # Kaufman ER is NOT comparable across bar counts: for a random walk of N bars
@@ -183,7 +184,7 @@ class PivotStrategy(BaseStrategy):
             self._open = bar.o
         if not self.grid:
             return []
-        if m >= EOD_FLAT:                         # flat by the close
+        if past_flat(bar.ts):   # calendar-aware: 12:59 on a holiday                         # flat by the close
             return self._flatten("eod")
         if self.pos != 0 and self.trade is not None:
             return self._manage(bar)

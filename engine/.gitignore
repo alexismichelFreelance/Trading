@@ -6,3 +6,10 @@ __pycache__/
 *.egg-info/
 # replay npz + fills (~88MB), regenerable from QuestDB by tools/portfolio_replay.py
 .cache/
+
+# engine logs
+logs/
+*.log
+# kanban/orchestrator stray artifacts
+*.pkl
+*.stackdump

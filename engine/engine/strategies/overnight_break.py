@@ -25,13 +25,14 @@ from __future__ import annotations
 
 from ..core.events import Bar
 from ..core.exits import ExitCtx, TwoPhaseExit
+from ..core.market_calendar import past_flat
 from ..core.orders import Order
 from ..core.timeutil import et_minute_of_day, et_session_date
 from .base import BaseStrategy
 
 RTH_START = 9 * 60 + 30      # 09:30 — overnight range freezes here
 START_MIN = 10 * 60          # 10:00 — no entries before this (fakeout window)
-EOD_FLAT = 15 * 60 + 59      # 15:59 — flat everything
+EOD_FLAT = 15 * 60 + 59       # ORDINARY sessions only; past_flat() is the gate
 BUF_FRAC = 0.05              # break buffer = 5% of the overnight range
 MIN_RANGE = 5.0              # points; below this the night was too quiet to trade
 
@@ -87,7 +88,7 @@ class OvernightBreakStrategy(BaseStrategy):
             self.on_lo = bar.l if self.on_lo is None else min(self.on_lo, bar.l)
             return []
         self.frozen = True                    # 09:30: the range is now fixed
-        if m >= EOD_FLAT:
+        if past_flat(bar.ts):   # calendar-aware: 12:59 on a holiday
             return self._flatten("moc")
         if self.pos != 0 and self.trade is not None:
             return self._manage(bar.c)

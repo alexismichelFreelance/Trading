@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from ..core.events import Bar
 from ..core.exits import ExitCtx, TwoPhaseExit
+from ..core.market_calendar import flat_min_for, past_flat
 from ..core.orders import Order, OrderType
 from ..core.timeutil import et_minute_of_day, et_session_date
 from ..features.avwap import AnchoredVWAP
@@ -33,7 +34,7 @@ from .base import BaseStrategy
 RTH_START = 9 * 60 + 30      # 09:30 — RTH open
 GLOBEX_OPEN = 18 * 60        # 18:00 ET — the futures session open NT8 anchors to
 START_MIN = 10 * 60          # 10:00 — no entries before this (sigma must settle)
-EOD_FLAT = 15 * 60 + 59      # 15:59 — flat everything
+EOD_FLAT = 15 * 60 + 59       # ORDINARY sessions only; past_flat() is the gate
 MAX_ENTRIES = 2              # a failed break then a real one is common
 OR_END = 10 * 60             # 10:00 ET — the opening range is 09:30-10:00
 REGIME_CLOSES = 3            # 5m closes the far side of VWAP = the other side is in control
@@ -185,9 +186,9 @@ class VwapBreakStrategy(BaseStrategy):
         # "calculate on bar close": the CLOSE of each completed bar, weighted by
         # its volume -- not the (h+l+c)/3 typical price the sleeve used before.
         self.av.add(bar.c, float(bar.v) if bar.v else 0.0)
-        if m < RTH_START or m >= EOD_FLAT + 1:     # outside RTH: accumulate only
+        if m < RTH_START or m > flat_min_for(bar.ts):   # outside RTH
             return []
-        if m >= EOD_FLAT:
+        if past_flat(bar.ts):   # calendar-aware: 12:59 on a holiday
             return self._flatten("moc")
         vwap, sigma = self.av.value, self.av.sigma
         up = vwap + self.band_k * sigma

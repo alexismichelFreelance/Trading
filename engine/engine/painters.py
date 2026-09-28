@@ -45,7 +45,19 @@ GEX_CALL = "#FFFFA500"       # call wall (gamma resistance) — orange
 GEX_FLIP = "#FFBA90E0"       # zero-gamma flip (regime divider) — violet
 PAPER = "#FF66CCCC"          # paper-sleeve fills (not routed to broker) — muted cyan
 PAPER_CAP_PER_TAG = 12       # with 10 paper sleeves this bounds total chart objects
-ARROW_KEEP = 80              # most-recent fill arrows re-asserted on top of zones
+ARROW_KEEP = 80              # most-recent PAPER/MANUAL arrows re-asserted over zones
+
+# LIVE TRADES ARE THE POINT OF THE CHART, so they get their own everything.
+# Before this they shared one 80-deep arrow store with paper and manual fills:
+# ten paper sleeves firing all day evicted the handful of marks that were
+# actually routed to the broker, and a round trip was drawn as two unconnected
+# arrows with no statement of what it made. A trade is now ONE line from entry
+# to exit, coloured by outcome, labelled with the sleeve and the P&L.
+TRADE_WIN = "#FF00FF7F"      # closed in profit — spring green
+TRADE_LOSS = "#FFFF4500"     # closed at a loss — orange red
+TRADE_OPEN = "#FFFFD700"     # STILL ON — gold, redrawn to the current bar
+LIVE_KEEP = 400              # live arrows kept; ~a month of live trading
+TRADE_KEEP = 200             # closed-trade lines + labels kept
 
 # timeframes shown, low->high. Higher TF = more opaque (more significant).
 TF_ORDER = ("30m", "1h", "4h", "1d")
@@ -161,10 +173,21 @@ def gamma_label(price: float, flip: float | None, net_sign: int) -> str:
 
 class PaintController:
     def __init__(self, painter: NTChartPainter, strategies: list,
-                 panel_pos: str = "bottomleft") -> None:
+                 panel_pos: str = "bottomleft", point_usd: float = 50.0) -> None:
         self.p = painter
         self.strategies = strategies
         self.panel_pos = panel_pos
+        self.point_usd = point_usd
+        # live trade bookkeeping, per SLEEVE label
+        self._book: dict[str, tuple] = {}        # name -> (qty, avg_px, entry_ts)
+        self._open_line: dict[str, tuple] = {}   # name -> (entry_ts, entry_px)
+        self._live_arrows: dict[str, tuple] = {}  # never evicted by paper traffic
+        self._trades: dict[str, tuple] = {}      # closed-trade lines
+        self._trade_txt: dict[str, tuple] = {}   # their P&L labels
+        self._n_trade = 0
+        self._rail_state: dict[str, tuple] = {}  # rail -> (price, 4min bucket)
+        # roster labels that route to the broker; the panel stars them
+        self.live_labels: set = set()
         self.zv = ZoneView()
         self._n_live = 0
         self._n_ghost = 0
@@ -202,16 +225,127 @@ class PaintController:
                            color=LIVE_UP if side > 0 else LIVE_DN,
                            label=f"{tag} x{qty}")
 
-    async def live_fill(self, f) -> None:
-        """Paint at the ACTUAL fill ts+price (coincides with NT's native dot)."""
+    async def live_fill(self, f, sleeve: str = "") -> None:
+        """Paint a ROUTED fill at its actual ts+price, and book it into a trade.
+
+        Uncapped and kept in its own store: a live mark must never be evicted by
+        paper traffic. The arrow says WHAT happened; _close_trade draws the line
+        that says what the round trip was worth."""
         self._n_live += 1
         side = 1 if f.size > 0 else -1
+        name = (sleeve or "live").split(":")[-1]
         tag = f"eng-fill-{self._n_live}"
-        self._remember_arrow(tag, f.ts, f.price, side,
-                             LIVE_UP if side > 0 else LIVE_DN, f"{f.tag} @{f.price:.2f}")
-        await self.p.arrow(tag, f.ts, f.price, side,
-                           color=LIVE_UP if side > 0 else LIVE_DN,
-                           label=f"{f.tag} @{f.price:.2f}")
+        color = LIVE_UP if side > 0 else LIVE_DN
+        label = f"{name} {f.tag} @{f.price:.2f}"
+        self._live_arrows[tag] = (f.ts, f.price, side, color, label)
+        while len(self._live_arrows) > LIVE_KEEP:
+            self._live_arrows.pop(next(iter(self._live_arrows)))
+        await self.p.arrow(tag, f.ts, f.price, side, color=color, label=label)
+        await self._book_fill(name, f)
+
+    # ── live trades: entry -> exit, as one object ────────────────────────
+    async def _book_fill(self, name: str, f) -> None:
+        """Average-cost per sleeve. A fill that returns the book to flat closes
+        a trade and draws it."""
+        qty, avg, ets = self._book.get(name, (0, 0.0, 0))
+        q = int(f.size)
+        if qty == 0 or (qty > 0) == (q > 0):                 # opening or adding
+            navg = ((avg * abs(qty) + f.price * abs(q)) / (abs(qty) + abs(q))
+                    if (abs(qty) + abs(q)) else f.price)
+            self._book[name] = (qty + q, navg, ets or f.ts)
+            if qty == 0:
+                self._open_line[name] = (f.ts, f.price)
+            return
+        closed = min(abs(q), abs(qty))                       # reducing or closing
+        d = 1 if qty > 0 else -1
+        pts = (f.price - avg) * d
+        left = qty + q
+        if left == 0:
+            self._book.pop(name, None)
+            entry = self._open_line.pop(name, (ets, avg))
+            await self._clear_open_marks(name)
+            await self._close_trade(name, entry[0], avg, f.ts, f.price, pts, closed)
+        else:                                                 # partial scale-out
+            self._book[name] = (left, avg, ets)
+
+    async def _close_trade(self, name, t0, p0, t1, p1, pts, qty) -> None:
+        self._n_trade += 1
+        col = TRADE_WIN if pts > 0 else TRADE_LOSS
+        ln, tx = f"eng-trade-{self._n_trade}", f"eng-tradetxt-{self._n_trade}"
+        usd = pts * self.point_usd * qty
+        label = f"{name} {pts:+.2f}pt {usd:+,.0f}$"
+        self._trades[ln] = (t0, p0, t1, p1, col)
+        self._trade_txt[tx] = (t1, p1, label, col)
+        while len(self._trades) > TRADE_KEEP:
+            old = next(iter(self._trades))
+            self._trades.pop(old)
+            await self.p.remove(old)
+        while len(self._trade_txt) > TRADE_KEEP:
+            old = next(iter(self._trade_txt))
+            self._trade_txt.pop(old)
+            await self.p.remove(old)
+        await self.p.line(ln, t0, p0, t1, p1, color=col, width=3, style="solid")
+        await self.p.text(tx, t1, p1, label, color=col)
+
+    def _sleeve(self, name: str):
+        for s in self.strategies:
+            lb = (getattr(s, "label", "") or "").split(":")[-1]
+            if lb == name:
+                return s
+        return None
+
+    async def paint_open_trades(self, bar) -> None:
+        """Redraw everything about every OPEN live position: the in-progress leg
+        from entry to now, and the levels the sleeve is working — ENTRY, TARGET
+        and STOP as their own labelled rails.
+
+        Every bar, not on the 4-minute re-assert bucket: these are the objects on
+        the chart whose whole job is to be current. At most four per live sleeve,
+        so the cost is a handful of messages a minute.
+
+        Target and stop come from the sleeve's chart_marks(), which is a declared
+        protocol — see BaseStrategy. A sleeve that does not implement it simply
+        draws fewer rails; nothing is guessed."""
+        for name, (t0, p0) in list(self._open_line.items()):
+            tag = f"eng-open-{name}"
+            await self.p.remove(tag)
+            await self.p.line(tag, t0, p0, bar.ts, float(bar.c),
+                              color=TRADE_OPEN, width=2, style="solid")
+            s = self._sleeve(name)
+            marks = s.chart_marks() if hasattr(s, "chart_marks") else {}
+            # THE RAILS ARE NOT REDRAWN EVERY BAR. Entry, target and stop are
+            # static for the life of the trade; only their right edge creeps
+            # forward, which nobody can see arriving 4 minutes late. Five live
+            # sleeves x three rails x (remove line, remove text, line, text) is
+            # ~60 messages a minute for no visible gain, and redraw volume is
+            # exactly how this chart was made unusable before. The CONNECTOR
+            # above is the part that must be current, so it alone runs per bar.
+            bucket = bar.ts // (4 * 60 * NS)
+            for key, color in (("entry", TRADE_OPEN), ("target", TRADE_WIN),
+                               ("stop", TRADE_LOSS)):
+                px = marks.get(key)
+                lt, tt = f"eng-{key}-{name}", f"eng-{key}txt-{name}"
+                state = (round(float(px), 4) if px else None, bucket)
+                if self._rail_state.get(lt) == state:
+                    continue
+                self._rail_state[lt] = state
+                await self.p.remove(lt)
+                await self.p.remove(tt)
+                if not px:
+                    continue
+                await self.p.line(lt, t0, float(px), bar.ts, float(px),
+                                  color=color, width=2,
+                                  style="solid" if key == "entry" else "dash")
+                await self.p.text(tt, bar.ts, float(px),
+                                  f"{name} {key.upper()} {px:.2f}", color=color)
+
+    async def _clear_open_marks(self, name: str) -> None:
+        """Every rail belonging to a position that has just closed."""
+        for t in (f"eng-open-{name}", f"eng-entry-{name}", f"eng-entrytxt-{name}",
+                  f"eng-target-{name}", f"eng-targettxt-{name}",
+                  f"eng-stop-{name}", f"eng-stoptxt-{name}"):
+            await self.p.remove(t)
+            self._rail_state.pop(t, None)   # else the next trade skips its redraw
 
     async def manual_fill(self, f) -> None:
         """Re-draw a MANUAL (unattributed) fill. The relay strategy on the chart
@@ -246,14 +380,29 @@ class PaintController:
             self._arrows.pop(next(iter(self._arrows)))
 
     async def _reassert_arrows(self, now_ts: int) -> None:
-        """Re-add fill arrows AFTER the zones each redraw cycle so they render on
-        top (NT appends re-added objects) — otherwise the zone fills wash them out."""
+        """Re-add fill marks AFTER the zones each redraw cycle so they render on
+        top (NT appends re-added objects) — otherwise the zone fills wash them out.
+
+        LIVE marks go last, so they end up above everything else on the chart
+        including the paper ones. That ordering is the whole fix for "hidden
+        behind": NT8 has no z-index, only append order."""
         bucket = now_ts // (4 * 60 * NS)
-        if bucket == self._arrow_bucket or not self._arrows:
+        if bucket == self._arrow_bucket:
+            return
+        if not (self._arrows or self._live_arrows or self._trades):
             return
         self._arrow_bucket = bucket
         for tag, (ts, px, side, color, label) in list(self._arrows.items()):
             await self.p.remove(tag)                   # remove+re-add -> moves to front
+            await self.p.arrow(tag, ts, px, side, color=color, label=label)
+        for tag, (t0, p0, t1, p1, col) in list(self._trades.items()):
+            await self.p.remove(tag)
+            await self.p.line(tag, t0, p0, t1, p1, color=col, width=3, style="solid")
+        for tag, (ts, px, label, col) in list(self._trade_txt.items()):
+            await self.p.remove(tag)
+            await self.p.text(tag, ts, px, label, color=col)
+        for tag, (ts, px, side, color, label) in list(self._live_arrows.items()):
+            await self.p.remove(tag)
             await self.p.arrow(tag, ts, px, side, color=color, label=label)
 
     # ── per-bar ───────────────────────────────────────────────────────────
@@ -266,7 +415,8 @@ class PaintController:
             await self._paint_bracket(bar.c)
             await self._paint_gamma(bar.ts)
             await self._paint_risk()
-            await self._reassert_arrows(bar.ts)   # keep fill arrows above the zones
+            await self._reassert_arrows(bar.ts)   # keep fill marks above the zones
+            await self.paint_open_trades(bar)     # every bar: it must be current
             await self._paint_status(True, backfill_bars, bar.c)
         else:
             self._warm_n += 1
@@ -372,8 +522,13 @@ class PaintController:
         # thing you actually want off a glance at the chart.
         held, flat = [], 0
         for s in self.strategies:
-            name = type(s).__name__.replace("Strategy", "").replace("Following", "")
-            if name == "Observe":
+            # The ROSTER LABEL when there is one, not the class name. Five zones
+            # variants and eight trendjoin variants all share a class, so a panel
+            # keyed on the class showed "ZoneLifecycle +1" with no way to tell
+            # which of them was in the market. build_roster stamps .label.
+            name = getattr(s, "label", "") or type(s).__name__
+            name = name.split(":")[-1].replace("Strategy", "").replace("Following", "")
+            if name in ("Observe", "ObserveOnly"):
                 continue
             pos = getattr(s, "pos", None)
             if pos is None:
@@ -381,10 +536,16 @@ class PaintController:
             if not pos:
                 flat += 1
                 continue
-            bits = f"{name:<10} {pos:+d}"
+            # LIVE-routed sleeves are flagged, because "which of these is
+            # actually in the market with the broker" is the first question the
+            # panel has to answer now that some of them are.
+            mark = "*" if name in self.live_labels else " "
+            bits = f"{mark}{name:<16} {pos:+d}"
             ep = getattr(s, "entry_px", None)
             if ep:
-                bits += f" @{ep:.2f} {(close - ep) * (1 if pos > 0 else -1):+.2f}"
+                open_pts = (close - ep) * (1 if pos > 0 else -1)
+                bits += (f" @{ep:.2f} {open_pts:+.2f}pt "
+                         f"{open_pts * self.point_usd * abs(pos):+,.0f}$")
             if hasattr(s, "_F"):
                 tgt = max(-s.maxp, min(s.maxp, s._F / s.scale)) if s.scale else 0
                 bits += f"  F={s._F:+.0f} tgt={tgt:+.1f}"

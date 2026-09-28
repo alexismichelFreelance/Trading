@@ -59,13 +59,43 @@ class ReplayFeed:
     async def list_days(self) -> list[str]:
         if self._days is not None:
             return list(self._days)
-        df = await self.qdb.df(f"SELECT DISTINCT day FROM {self.table}{self._range_where()} ORDER BY day")
-        return [d.strftime("%Y-%m-%d") for d in df["day"]]
+        # Use a simpler approach: get min/max ts and generate days, or use the day column if it exists
+        df = await self.qdb.df(f"SELECT ts FROM {self.table} LIMIT 1")
+        has_day_col = "day" in df.columns if len(df) > 0 else False
+        
+        if has_day_col:
+            df = await self.qdb.df(f"SELECT DISTINCT day FROM {self.table}{self._range_where()} ORDER BY day")
+            return [d.strftime("%Y-%m-%d") for d in df["day"]]
+        else:
+            # Live table: get min/max ts and generate date range
+            minmax = await self.qdb.df(f"SELECT min(ts) as min_ts, max(ts) as max_ts FROM {self.table}{self._range_where()}")
+            if len(minmax) == 0:
+                return []
+            min_ts = minmax["min_ts"].iloc[0]
+            max_ts = minmax["max_ts"].iloc[0]
+            import pandas as pd
+            # Check for NaT
+            if pd.isna(min_ts) or pd.isna(max_ts):
+                return []
+            days = pd.date_range(min_ts.floor("D"), max_ts.floor("D"), freq="D")
+            return [d.strftime("%Y-%m-%d") for d in days]
 
     async def _sec_events(self, day: str) -> list[tuple[int, int, MarketEvent]]:
-        df = await self.qdb.df(
-            f"SELECT {_SEC_COLS} FROM {self.table} "
-            f"WHERE day = '{day}T00:00:00.000000Z' ORDER BY ts")
+        # Check if table has a 'day' column (historical) or need to filter by ts (live)
+        df = await self.qdb.df(f"SELECT ts FROM {self.table} LIMIT 1")
+        has_day_col = "day" in df.columns if len(df) > 0 else False
+        
+        if has_day_col:
+            df = await self.qdb.df(
+                f"SELECT {_SEC_COLS} FROM {self.table} "
+                f"WHERE day = '{day}T00:00:00.000000Z' ORDER BY ts")
+        else:
+            # Live table: filter by ts date range
+            day_start = f"'{day}T00:00:00.000000Z'"
+            day_end = f"'{day}T23:59:59.999999Z'"
+            df = await self.qdb.df(
+                f"SELECT {_SEC_COLS} FROM {self.table} "
+                f"WHERE ts >= {day_start} AND ts <= {day_end} ORDER BY ts")
         ts = df["ts"].astype("int64").to_numpy()
         pxc = df["pxc"].to_numpy()
         adelta = df["adelta"].astype("int64").to_numpy()

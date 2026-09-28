@@ -146,6 +146,7 @@ class LiveEngine:
         # only. reduce_only is enforced HERE against the owner's attributed
         # position (the NT path cannot enforce it).
         self._owner: dict[str, object] = {}         # order_id -> strategy
+        self._order_tag: dict[str, str] = {}        # order_id -> the order's tag
         self._spos: dict[int, int] = {}              # id(strategy) -> signed qty
         self._savg: dict[int, float] = {}            # id(strategy) -> avg px
         # paper positions carried across a restart (e.g. IBS held overnight),
@@ -496,9 +497,20 @@ class LiveEngine:
                       type(ex).__name__, ex, self.failed_orders)
             return False
         self._owner[o.order_id] = s
+        # THE ORDER'S OWN TAG, kept because the FILL does not carry it. NT8
+        # echoes the order id back as the fill's tag, so a live fill arrives as
+        # tag='O37' and every chart mark and record built from it said "O37"
+        # instead of "entry-onfade". Paper fills are constructed in-process and
+        # keep the real tag, which is why this only ever showed on the live path.
+        self._order_tag[o.order_id] = o.tag
         self.blotter.on_order(o)
         self.risk.on_submit(id(s), o)
         return True
+
+    def tag_of(self, f) -> str:
+        """The originating order's tag for a fill, falling back to the fill's
+        own when it is not one of ours (a manual/external fill)."""
+        return self._order_tag.get(f.order_id) or f.tag
 
     async def _emit_signal(self, emitter, o, ts: int, px: float) -> None:
         """Broadcast `emitter`'s intent to its peers and route any replies.

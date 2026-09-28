@@ -244,11 +244,6 @@ class TrendJoinStrategy(BaseStrategy):
                     need = self.pullback_typ * typ
                 if (self._arm_ext - b.c) * d < need:
                     return []                         # not deep enough yet
-            # GAMMA GATE: trend-join is a continuation sleeve; only enter on
-            # short-gamma days (dealers amplify). pocket_entry_ok covers the
-            # local-sign pocket; gamma_entry_ok covers the aggregate regime.
-            if not self.gamma_entry_ok(b.ts, "short", b.c):
-                return []
             if not self.pocket_entry_ok(b.c):
                 return []
             src = self._arm_src
@@ -265,10 +260,6 @@ class TrendJoinStrategy(BaseStrategy):
         elif win_hi - b.c >= self.conf_pts:
             d = -1
         else:
-            return []
-        # GAMMA GATE: trend-join is a continuation sleeve; only enter on
-        # short-gamma days (dealers amplify).
-        if not self.gamma_entry_ok(b.ts, "short", b.c):
             return []
         # Near a gamma pocket edge a continuation entry is taken into
         # reversion (VR30 0.86 there against 1.25 deep). Checked BEFORE any
@@ -353,3 +344,4 @@ class TrendJoinStrategy(BaseStrategy):
 
 
 __all__ = ["TrendJoinStrategy"]
+[H[2J[3J

@@ -97,7 +97,7 @@ class ZoneLifecycleStrategy(BaseStrategy):
                  gate_utc: tuple[int, int] | None = (13, 21),
                  gap_thr: float = 0.0, point_usd: float = 50.0,
                  tf: str = "30m", enable_break: bool = True,
-                 runner: bool = True) -> None:
+                 runner: bool = True, gamma=None) -> None:
         self.symbol = symbol
         self.point_usd = point_usd     # $/pt for sizing (from InstrumentSpec)
         # 30m was chosen on ES history and is the validated default -- do not
@@ -133,6 +133,9 @@ class ZoneLifecycleStrategy(BaseStrategy):
         self.trade: _Trade | None = None
         # NEW entries only inside the validated window; management always runs
         self.gate_utc = gate_utc
+        # Optional GammaRegime: mean-reversion sleeves (fade/flip) on long-gamma days
+        # (dealers pin), break on short-gamma. A strategy choice, not an engine gate.
+        self.gamma = gamma
 
     def on_bar(self, bar: Bar) -> list[Order]:
         # SESSION BOUNDARY. This sleeve had none: no session date, no daily
@@ -292,47 +295,56 @@ class ZoneLifecycleStrategy(BaseStrategy):
                       trigger_price=level_fill(bar, entry, rising=d < 0))]
 
     def _scan(self, b: Bar) -> list[Order]:
-        for z in self.zones:
-            d = z.dir
-            # FADE — 1st touch of a fresh zone (gap zones only once armed: they
-            # must have left and be RE-touched, not faded at the open)
-            if not z.fade_done and not z.broke and z.armed:
-                touch = (b.l <= z.top and b.l >= z.bot - 0.5) if d > 0 else (b.h >= z.bot and b.h <= z.top + 0.5)
-                if touch:
-                    z.fade_done = True
-                    tgt = self._opp_target(-d, z.prox, self._k, d)
+            for z in self.zones:
+                d = z.dir
+                # FADE — 1st touch of a fresh zone (gap zones only once armed: they
+                # must have left and be RE-touched, not faded at the open)
+                if not z.fade_done and not z.broke and z.armed:
+                    touch = (b.l <= z.top and b.l >= z.bot - 0.5) if d > 0 else (b.h >= z.bot and b.h <= z.top + 0.5)
+                    if touch:
+                        z.fade_done = True
+                        # GAMMA GATE: FADE is mean-reversion → only on LONG gamma (dealers pin)
+                        if not self.gamma_entry_ok(b.ts, "long", z.prox):
+                            return []
+                        tgt = self._opp_target(-d, z.prox, self._k, d)
+                        if tgt is None:
+                            stop0 = z.bot - 1 if d > 0 else z.top + 1
+                            tgt = z.prox + d * abs(z.prox - stop0) * 2
+                        return self._enter("FADE", d, z.prox, z.bot - 1 if d > 0 else z.top + 1,
+                                           tgt, z, b)
+                # detect break
+                if not z.broke and ((b.c < z.bot - 1) if d > 0 else (b.c > z.top + 1)):
+                    z.broke = True
+                    z.break_k = self._k
+                    bdir = -d
+                    b_entry = b.c
+                    b_stop = z.top + 1 if d > 0 else z.bot - 1
+                    tgt = self._opp_target(d, b_entry, self._k, bdir)
                     if tgt is None:
-                        stop0 = z.bot - 1 if d > 0 else z.top + 1
-                        tgt = z.prox + d * abs(z.prox - stop0) * 2
-                    return self._enter("FADE", d, z.prox, z.bot - 1 if d > 0 else z.top + 1,
-                                   tgt, z, b)
-            # detect break
-            if not z.broke and ((b.c < z.bot - 1) if d > 0 else (b.c > z.top + 1)):
-                z.broke = True
-                z.break_k = self._k
-                bdir = -d
-                b_entry = b.c
-                b_stop = z.top + 1 if d > 0 else z.bot - 1
-                tgt = self._opp_target(d, b_entry, self._k, bdir)
-                if tgt is None:
-                    tgt = b_entry + bdir * abs(b_entry - b_stop) * 2
-                if self.enable_break:
-                    return self._enter("BREAK", bdir, b_entry, b_stop, tgt, z, b)
-            # FLIP — retest from broken side
-            if z.broke and not z.flip_done and z.break_k is not None and self._k >= z.break_k + 2:
-                ft = (b.h >= z.bot and b.h <= z.top + 0.5) if d > 0 else (b.l <= z.top and b.l >= z.bot - 0.5)
-                if ft:
-                    z.flip_done = True
-                    fdir = -d
-                    f_entry = z.bot if d > 0 else z.top
-                    f_stop = z.top + 1 if d > 0 else z.bot - 1
-                    tgt = self._opp_target(d, f_entry, self._k, fdir)
-                    if tgt is None:
-                        tgt = f_entry + fdir * abs(f_entry - f_stop) * 2
-                    return self._enter("FLIP", fdir, f_entry, f_stop, tgt, z, b)
-                if (b.c > z.top + 5) if d > 0 else (b.c < z.bot - 5):
-                    z.flip_done = True   # ran away, no flip
-        return []
+                        tgt = b_entry + bdir * abs(b_entry - b_stop) * 2
+                    if self.enable_break:
+                        # GAMMA GATE: BREAK is trend-following → only on SHORT gamma (dealers amplify)
+                        if not self.gamma_entry_ok(b.ts, "short", b_entry):
+                            return []
+                        return self._enter("BREAK", bdir, b_entry, b_stop, tgt, z, b)
+                # FLIP — retest from broken side
+                if z.broke and not z.flip_done and z.break_k is not None and self._k >= z.break_k + 2:
+                    ft = (b.h >= z.bot and b.h <= z.top + 0.5) if d > 0 else (b.l <= z.top and b.l >= z.bot - 0.5)
+                    if ft:
+                        z.flip_done = True
+                        fdir = -d
+                        f_entry = z.bot if d > 0 else z.top
+                        f_stop = z.top + 1 if d > 0 else z.bot - 1
+                        tgt = self._opp_target(d, f_entry, self._k, fdir)
+                        if tgt is None:
+                            tgt = f_entry + fdir * abs(f_entry - f_stop) * 2
+                        # GAMMA GATE: FLIP is mean-reversion → only on LONG gamma (dealers pin)
+                        if not self.gamma_entry_ok(b.ts, "long", f_entry):
+                            return []
+                        return self._enter("FLIP", fdir, f_entry, f_stop, tgt, z, b)
+                    if (b.c > z.top + 5) if d > 0 else (b.c < z.bot - 5):
+                        z.flip_done = True   # ran away, no flip
+            return []
 
     def _manage(self, b: Bar) -> list[Order]:
         t = self.trade

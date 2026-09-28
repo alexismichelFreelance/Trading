@@ -158,13 +158,25 @@ def test_only_one_of_the_correlated_onbreak_twins_is_deployed():
                           outcome (t = 0.54). Genuinely a second opinion.
       onbreak_gex         REMOVED 2026-08-15 with the rest of the _gex family
                           -- see test_the_gex_family_is_gone.
+
+    SUPERSEDED 2026-09-06: the WHOLE onbreak family is cut, so the question of
+    which twin represents it is moot. The reasoning above is kept because it is
+    about how to choose between correlated twins, which recurs -- but the choice
+    it made no longer has anything to choose between.
+
+    The family was cut on a full-roster replay over the captured tape, 38 ES and
+    35 NQ sessions, every sleeve against the same days. Sign consistency 29% (ES)
+    and 23% (NQ) for the raw sleeve, 31%/27% for 2p32, 31%/20% for retrace -- the
+    promotion gate asks for 70%. Mean per session was positive on ES and negative
+    on NQ for all three, and no variant had a positive median anywhere. It breaks
+    the overnight range with the break; over these sessions the break did not
+    continue.
     """
-    for gone in ("onbreak_2p", "onbreak_2p24"):
+    for gone in ("onbreak", "onbreak_2p", "onbreak_2p24", "onbreak_2p32",
+                 "onbreak_2p_retrace", "onbreak_lg", "onbreak_gex"):
         assert gone not in ALL_LABELS, (
-            f"{gone} is redundant with onbreak_2p32 (paired t=7.67 against "
-            f"2p24, t=0.17 against 2p)")
-    for kept in ("onbreak", "onbreak_2p32", "onbreak_2p_retrace"):
-        assert kept in ALL_LABELS, f"{kept} should still be deployed"
+            f"{gone}: the onbreak family was cut 2026-09-06 (sign consistency "
+            f"20-31% on both instruments against a 70% gate)")
 
 
 def test_the_gex_family_is_gone():
@@ -184,15 +196,22 @@ def test_the_gex_family_is_gone():
     once evaluated against a counterfactual. (Fixed separately; see
     tests/test_replay_bookflow.py.)
 
-    The local-sign twins that replace them are NOT yet better -- onbreak_lg
-    scored -3,800 against raw -1,488, a difference of one filtered day worth
-    +2,312. They are kept because they gate on the right quantity and are
-    measured from our own data, not because they have earned anything.
+    The local-sign twins that replaced them were kept on the argument that they
+    gate on the right quantity, explicitly NOT because they had earned anything
+    -- the blocker being that 23 of 25 sessions were short-gamma, so neither
+    polarity of the filter could be distinguished from no filter at all.
 
-    The blocker is the sample: 23 of 25 sessions were short-gamma, so a
-    short-gamma filter is nearly a no-op and a long-gamma filter stands the
-    sleeve down almost always. Neither can be distinguished from no gate at all
-    until a stretch with real regime variety."""
-    assert not [lb for lb in ALL_LABELS if lb.endswith("_gex")],         [lb for lb in ALL_LABELS if lb.endswith("_gex")]
-    for lg in ("ignition_lg", "flow_lg", "onbreak_lg"):
-        assert lg in ALL_LABELS, f"{lg} replaces its _gex twin and is missing"
+    THE _lg FAMILY IS NOW GONE TOO (2026-09-06), and the sample never did
+    arrive. Over 38 ES / 35 NQ replayed sessions: ignition_lg -$52/-$90 per
+    session, flow_lg -$163/+$66, onbreak_lg +$754 (n=8) / -$856 (n=7, 0% sign
+    consistency). On NQ ignition_lg was rho = 1.000 with ignition -- the gate
+    never once changed a decision, which is the same byte-identical-twin
+    pathology the _gex family had. A filter that cannot be shown to filter is
+    not evidence about gamma; it is a sleeve carrying an untested claim.
+
+    Both halves of this experiment are now cut. The gamma-regime question is
+    NOT settled -- it is unmeasured, and reopening it needs a stretch with real
+    regime variety, not another twin in the roster."""
+    for lb in ALL_LABELS:
+        assert not lb.endswith("_gex"), f"{lb}: the _gex family was cut 2026-08-15"
+        assert not lb.endswith("_lg"), f"{lb}: the _lg family was cut 2026-09-06"

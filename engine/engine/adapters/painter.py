@@ -68,9 +68,12 @@ class NTChartPainter:
         await self._send(dict(kind="hline", tag=tag, price=price, color=color))
 
     async def line(self, tag: str, t1: int, p1: float, t2: int, p2: float,
-                   color: str = "") -> None:
+                   color: str = "", width: int = 0, style: str = "") -> None:
+        """width/style are optional; the overlay keeps its old dash/1 when they
+        are absent, so existing callers are unchanged. A live trade's entry->exit
+        connector asks for solid and thick — see engine/painters.py."""
         await self._send(dict(kind="line", tag=tag, t1=t1, p1=p1, t2=t2, p2=p2,
-                              color=color))
+                              color=color, width=width, style=style))
 
     async def text(self, tag: str, ts: int, price: float, label: str,
                    color: str = "") -> None:

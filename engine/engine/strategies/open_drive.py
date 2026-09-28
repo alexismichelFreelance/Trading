@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from ..core.events import Bar, BookFlow, Trade
 from ..core.exits import ExitCtx, TwoPhaseExit
+from ..core.market_calendar import flat_min_for
 from ..core.orders import Order
 from ..core.timeutil import et, et_session_date
 from .base import BaseStrategy
@@ -119,7 +120,7 @@ class OpenDriveStrategy(BaseStrategy):
             self.lo = min(self.lo, px)
             return []
         # end-of-day flat (15:59 ET)
-        if mod >= FLAT_MIN:
+        if mod >= flat_min_for(ts):       # 12:59 on a holiday, 15:59 otherwise
             if self.pos != 0:
                 side = 1 if self.pos > 0 else -1
                 self.side = 0

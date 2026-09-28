@@ -19,6 +19,7 @@ gexp_prev >= gex_full_pctl; base qty otherwise. Default OFF (qty=qty_base).
 from __future__ import annotations
 
 from ..core.events import Bar, Fill
+from ..core.market_calendar import flat_min_for
 from ..core.orders import Order
 from ..core.timeutil import et, et_session_date
 from .base import BaseStrategy
@@ -75,7 +76,7 @@ class IBSSwingStrategy(BaseStrategy):
             self._c = b.c
         t = et(b.ts)
         mod = t.hour * 60 + t.minute
-        if mod < DECISION_MIN or self._decided or self._h <= self._l:
+        if mod < flat_min_for(b.ts) or self._decided or self._h <= self._l:
             return []
         self._decided = True
         ibs = (self._c - self._l) / (self._h - self._l)

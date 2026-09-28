@@ -6,10 +6,14 @@ from ..core.events import (Bar, BookFlow, DepthUpdate, Fill, PositionUpdate,
                            Quote, Signal, Trade)
 from ..core.exits import ExitCtx, ExitPolicy
 from ..core.orders import Order
+from ..core.market_calendar import flat_min_for
 from ..core.timeutil import et_minute_of_day, et_session_date
 
 
-SESSION_FLAT_MIN = 15 * 60 + 59      # 15:59 ET — last minute an intraday sleeve holds
+# 15:59 ET on an ordinary session; 12:59 on a holiday. NOT A CONSTANT any more --
+# see engine/core/market_calendar.py and what a hardcoded 15:59 cost on Labor Day
+# 2026. Kept as a name for the ordinary case so the intent still reads.
+SESSION_FLAT_MIN = 15 * 60 + 59
 SESSION_OPEN_MIN = 18 * 60           # 18:00 ET — Globex opens; a NEW session begins
 
 
@@ -58,6 +62,35 @@ class BaseStrategy:
     # costs you a flat position, not an unplanned overnight one.
     holds_overnight: bool = False
 
+    def chart_marks(self) -> dict:
+        """The levels this sleeve is currently working, for the chart:
+        {'entry': px, 'target': px, 'stop': px} — any key may be absent.
+
+        A DECLARED protocol rather than the painter reaching into whatever
+        attribute a sleeve happens to use. Sleeves name their state differently
+        (`trade` dicts, `entry_px`, `stop` as points vs `stop` as a price), and a
+        painter that guesses draws a stop 6000 points away the first time a
+        sleeve stores a distance where the last one stored a level.
+
+        The default handles the three shapes already in the codebase: a `trade`
+        DICT carrying prices (pivot, overnight_fade), a `trade` DATACLASS with
+        the same field names (zones_strategy's _Trade), and a bare `entry_px`.
+        A sleeve whose stop is a DISTANCE must override -- there is no way to
+        tell 6.0-points-away from price-6.00 by looking, and drawing the wrong
+        one puts a rail 6,000 points off the chart."""
+        t = getattr(self, "trade", None)
+        out: dict[str, float] = {}
+        if t is not None:
+            for key in ("entry", "target", "stop"):
+                v = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v:
+                    out[key] = float(v)
+        if "entry" not in out:
+            ep = getattr(self, "entry_px", None)
+            if isinstance(ep, (int, float)) and ep:
+                out["entry"] = float(ep)
+        return out
+
     @staticmethod
     def session_over(ts: int) -> bool:
         """True inside the CLOSING WINDOW: 15:59 ET up to the 18:00 ET Globex
@@ -70,8 +103,12 @@ class BaseStrategy:
 
         Always ET, never a UTC hour: a fixed UTC hour is a different ET hour
         either side of a DST change (21 UTC is 17:00 ET in July, 16:00 ET in
-        December), so a UTC gate silently moves twice a year."""
-        return SESSION_FLAT_MIN <= et_minute_of_day(ts) < SESSION_OPEN_MIN
+        December), so a UTC gate silently moves twice a year.
+
+        The LOWER edge comes from the calendar, not from a constant: on an
+        exchange holiday the session ends at 13:00 ET and this window has to open
+        at 12:59, or nothing flattens and a position rides into a shut market."""
+        return flat_min_for(ts) <= et_minute_of_day(ts) < SESSION_OPEN_MIN
 
     def gamma_entry_ok(self, ts: int, want: str, price: float | None = None) -> bool:
         """Dealer-gamma ENTRY filter, opt-in per strategy.

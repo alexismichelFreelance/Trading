@@ -230,26 +230,25 @@ _GAMMA_CACHE: dict = {}
 
 
 def _gamma_or_none(symbol: str):
-    """SPX dealer-gamma regime for the *_gex variants. ES only — SPX gamma is
-    not an NQ/GC signal. Fail-open: no GEX table / busy DB -> None (variant
-    trades raw). One shared instance; short timeout so a busy QuestDB never
-    stalls session startup."""
-    # root_symbol, not a literal match: 'ESM5' and 'ESH5' ARE ES, and matching
-    # the bare string silently gave them NO gate. Every 2025 replay therefore ran
-    # its *_gex twins byte-identical to the raw ones -- which is why the gamma
-    # result could not be validated out-of-sample: the wire was never connected.
+    """Dealer-gamma regime for the *_gex variants. ES uses SPX gamma, NQ uses NDX gamma.
+    Fail-open: no GEX table / busy DB -> None (variant trades raw). One shared instance
+    per root symbol; short timeout so a busy QuestDB never stalls session startup."""
     from engine.core.config import root_symbol
-    if root_symbol(symbol) != "ES":
-        return None
-    if "ES" not in _GAMMA_CACHE:
+    root = root_symbol(symbol)
+    if root not in _GAMMA_CACHE:
         from engine.adapters.questdb import QuestDB
-        from engine.features.gamma import GammaRegime
+        from engine.features.gamma import GammaRegime, NDXGammaRegime
         try:
-            _GAMMA_CACHE["ES"] = GammaRegime(QuestDB(timeout=30))
+            if root == "ES":
+                _GAMMA_CACHE[root] = GammaRegime(QuestDB(timeout=30))
+            elif root == "NQ":
+                _GAMMA_CACHE[root] = NDXGammaRegime(QuestDB(timeout=30))
+            else:
+                _GAMMA_CACHE[root] = None
         except Exception as ex:      # noqa: BLE001
-            print(f"  (*_gex variants trade RAW: GammaRegime unavailable: {ex})")
-            _GAMMA_CACHE["ES"] = None
-    return _GAMMA_CACHE["ES"]
+            print(f"  (*_gex variants trade RAW: GammaRegime unavailable for {root}: {ex})")
+            _GAMMA_CACHE[root] = None
+    return _GAMMA_CACHE.get(root)
 
 
 def _spec(symbol: str):
@@ -275,30 +274,19 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     from engine.strategies.fade_turn import FadeTurnStrategy
     from engine.strategies.fade_ladder import FadeLadderStrategy
     from engine.strategies.macro_dip import MacroDipStrategy
-    from engine.strategies.flow import FlowFollowingStrategy
     from engine.strategies.ibs_swing import IBSSwingStrategy
-    from engine.strategies.ignition import IgnitionStrategy
     from engine.core.exits import TwoPhaseExit
     from engine.strategies.open_drive import OpenDriveStrategy
     from engine.strategies.overnight_break import OvernightBreakStrategy
     from engine.strategies.pivot import PivotStrategy
     from engine.strategies.sweep_follow import SweepFollowStrategy
-    from engine.strategies.vwap_break import VwapBreakStrategy
     from engine.strategies.zones_strategy import ZoneLifecycleStrategy
-    if label == "ignition":
-        return IgnitionStrategy(symbol, hmm_path, exit_mode="trailing", regime_states=None)
-    if label == "ignition_fixed":    # variant: fixed/regime exits instead of trailing
-        return IgnitionStrategy(symbol, hmm_path, exit_mode="fixed", regime_states=None)
-    if label == "opendrive":
-        # ORB, not the blind 10:00 entry: every window shape loses on the blind
-        # rule and the CLEAN drives lose worst (see tests/test_roster_decisions).
-        return OpenDriveStrategy(symbol, mode="orb")
-    if label == "opendrive_vac":
-        # the twin of `opendrive`, differing ONLY in the break-quality gate, so
-        # the forward record measures the gate and nothing else. See
-        # engine/features/break_quality.py for the evidence and the fail-open.
-        from engine.features.break_quality import BreakQuality
-        return OpenDriveStrategy(symbol, mode="orb", vac_gate=BreakQuality())
+    # REMOVED 2026-09-16: ignition, ignition_fixed — confirmed losers across all
+    # measurement windows (replay -1,012 / matched -750 / live -900).
+    # REMOVED 2026-09-16: opendrive base — 46% expiry, 237min hold, broken exits.
+    # REMOVED 2026-09-16: opendrive_vac — break-quality gate adds nothing.
+    # REMOVED 2026-09-16: flow, flow_fixed — broken exit logic.
+    # REMOVED 2026-09-16: vwapbreak — negative in 3 of 4 windows.
     if label == "opendrive_2p":
         return OpenDriveStrategy(symbol, mode="orb",
                                  two_phase=TwoPhaseExit(12.0, "decay", 0.1))
@@ -316,18 +304,8 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     if label == "opendrive_2p32":
         return OpenDriveStrategy(symbol, mode="orb", two_phase=TwoPhaseExit(
             rev_kind="range", rev_f=0.25, arm_pts=32.0))
-    if label == "flow":              # adaptive z-score threshold (scale-invariant)
-        return FlowFollowingStrategy(symbol, maxp=5, adaptive=True, adapt_k=FLOW_K,
-                                     gate_utc=FLOW_GATE)
-    if label == "flow_fixed":        # variant: fixed threshold (research default)
-        # KNOWN-RARE (audit: 2 orders / 34 sessions) and NOT a threshold bug:
-        # th=30 already sits at p95 of live |adelta| (p50=4, p95=29, p99=59), so
-        # it is correctly scaled to this feed. Together with the flat k=1..3
-        # plateau in tools/flow_calib.py this says the threshold is NOT the
-        # binding gate -- the other entry conditions (trend_lag / book / hold
-        # bands) are. Retuning th or adapt_k cannot fix that; diagnosing which
-        # condition starves the sleeve is its own piece of work.
-        return FlowFollowingStrategy(symbol, maxp=5, adaptive=False, th=flow_th)
+    # REMOVED 2026-09-16: flow, flow_fixed — confirmed losers (replay -2,725 /
+    # matched -875 / live -5,650). Exit logic is broken; the family stays removed.
     pu = INSTRUMENTS[symbol].point_usd if symbol in INSTRUMENTS else 50.0
     if label == "zones":
         # BREAK stays off; the RUNNER is back on. Both were cut in 3f42771 on
@@ -348,9 +326,7 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
     if label == "zones_1h":
         return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="1h",
                                      enable_break=False)
-    if label == "zones_4h":
-        return ZoneLifecycleStrategy(symbol, point_usd=pu, tf="4h",
-                                     enable_break=False)
+    # REMOVED 2026-09-16: zones_4h — dead (2 trades in 38 sessions).
     if label == "zones_gap":         # variant: leave-and-return gap zones on
         return ZoneLifecycleStrategy(symbol, gap_thr=5.0, point_usd=pu)
     if label == "dipbuy":
@@ -397,59 +373,26 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         return IBSSwingStrategy(symbol, gamma=_gamma_or_none(symbol))
     if label == "pivot":             # user-modeled: overnight bias + pivot fades
         return PivotStrategy(symbol, point_usd=pu, gamma=_gamma_or_none(symbol))
-    if label == "vwapbreak":         # enter AT the line; chasing the break loses
-        return VwapBreakStrategy(symbol, entry_mode="retest")
-    # NINE vwapbreak variants REMOVED 2026-08-16: qual, qual_tol, qual_2p,
-    # q_noext, q_noclean, q_band, q_bandnoext, retest_2p, 2p24.
-    #
-    # Measured across FOUR independent windows -- ES 2026 (46 sessions), NQ 2026
-    # (26), ESM5 2025 (51), ESH5 2025 (22). The family is negative in three of
-    # the four on every single variant:
-    #     vwapbreak_qual        0/4   -7,862
-    #     vwapbreak_qual_tol    1/4  -21,285
-    #     vwapbreak_q_noclean   1/4  -16,447
-    #     vwapbreak_qual_2p     1/4  -11,470
-    #     vwapbreak_q_bandnoext 1/4  -10,508
-    #     vwapbreak_retest_2p   1/4  -10,348
-    #     vwapbreak             1/4   -7,397
-    #     vwapbreak_q_band      1/4  +20,979  <- ALL of it from one ESM5 window
-    # Ten labels for one bet, and the bet loses. q_band's apparent profit is the
-    # same single-window artifact that made opendrive_2p24 look like the best
-    # sleeve on the board the day before.
-    #
-    # These included the ablation twins built to find which of the three
-    # qualified-break conditions carried the value. The answer, across four
-    # windows, is none of them: the conditions were being ranked against each
-    # other inside a family that does not work.
-    #
-    # `vwapbreak` (entry AT the line) survives as a PAPER CONTROL so the idea
-    # stays measurable if the rule is re-specified. What four windows disprove
-    # is THIS IMPLEMENTATION, not the trade -- the manual version reads
-    # confluence and context that none of these variants encode.
-    if label == "opendrive_pk":      # POCKET-GATED twin of `opendrive`
-        from engine.strategies.open_drive import OpenDriveStrategy as _OD
-        s = _OD(symbol, mode="orb")
-        s.pocket_min_edge = POCKET_EDGE_PTS
-        return s
-    # LOCAL-SIGN twins of the _gex trio. Same sleeves, same want="short" gate,
+    # REMOVED 2026-09-16: vwapbreak — negative in 3 of 4 windows, all variants removed.
+    # REMOVED 2026-09-16: opendrive_pk — pocket gate adds nothing to broken base.
+    # LOCAL-SIGN twin of the _gex trio. Same sleeve, same want="short" gate,
     # but the regime comes from the sign of cumulative gamma AT PRICE instead of
     # gexp -- a 252-day percentile of the AGGREGATE book. Over 25 sessions with
     # both available the two agreed 7 times (28%): gexp said LONG on 18 while
     # price sat in a short-gamma pocket on 23. The curve is also OUR data,
     # measured daily, rather than a second unmonitored external feed.
-    if label in ("ignition_lg", "flow_lg", "onbreak_lg"):
-        base = label[:-3]
-        s = _make(base, flow_th, symbol, hmm_path)
+    # REMOVED 2026-09-16: ignition_lg, flow_lg — base sleeves are broken losers.
+    if label == "onbreak_lg":
+        s = _make("onbreak", flow_th, symbol, hmm_path)
         s.gamma = None                 # the curve replaces the percentile
         s._wants_curve = True          # attach_curves() gives it the curve
-        if label == "onbreak_lg":
-            # FLIPPED to want="long". Under want="short" this scored -3,800 on
-            # 22 of 29 days (p=0.974 against a random cull) while the 7 days it
-            # REJECTED made +5,488 (p=0.033). onbreak breaks the OVERNIGHT
-            # range; classifying it as a continuation sleeve may simply have
-            # pointed the gate the wrong way. Running forward to find out --
-            # see tests/test_regime_want.py for why this is not yet a result.
-            s.regime_want = "long"
+        # FLIPPED to want="long". Under want="short" this scored -3,800 on
+        # 22 of 29 days (p=0.974 against a random cull) while the 7 days it
+        # REJECTED made +5,488 (p=0.033). onbreak breaks the OVERNIGHT
+        # range; classifying it as a continuation sleeve may simply have
+        # pointed the gate the wrong way. Running forward to find out --
+        # see tests/test_regime_want.py for why this is not yet a result.
+        s.regime_want = "long"
         return s
     if label == "wallfade":          # fade gamma walls, LONG-gamma pockets only
         from engine.strategies.wall_fade import WallFadeStrategy
@@ -506,11 +449,15 @@ def _make(label: str, flow_th: int = 30, symbol: str = SYMBOL,
         stop = float(tj.get("stop_pts", 6.0))
         if label == "trendjoin":                 # clock exit -- the control
             return TrendJoinStrategy(symbol, conf_pts=conf, stop_pts=stop)
+        if label == "trendjoin_narrow":          # half the confirmation distance
+            return TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
+        if label == "trendjoin_gex":             # GAMMA-GATED variant (short gamma only)
+            return TrendJoinStrategy(symbol, conf_pts=conf, stop_pts=stop,
+                         gamma=_gamma_or_none(symbol))
         if label == "trendjoin_pk":              # POCKET-GATED twin of the above
             s = TrendJoinStrategy(symbol, conf_pts=conf, stop_pts=stop)
             s.pocket_min_edge = POCKET_EDGE_PTS
             return s
-        if label == "trendjoin_narrow":          # half the confirmation
             return TrendJoinStrategy(symbol, conf_pts=conf / 2, stop_pts=stop)
         if label in ("trendjoin_d10", "trendjoin_d14"):
             # The scale-free form of the pullback that actually replicated.
@@ -636,13 +583,11 @@ FLOW_K = 2.0
 FLOW_GATE = (13, 20)          # 09:00 -> 16:00 ET
 
 # every strategy + variant — the full paper roster (--paper all)
-ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
-              "flow", "flow_fixed",
-              "zones", "zones_gap", "ibs", 
-              "pivot", "vwapbreak", "onbreak", "onfade",
-              "trendjoin_pk", "opendrive_pk", "wallfade",
-              "ignition_lg", "flow_lg", "onbreak_lg",
-              "opendrive_vac",          # break-quality twin of `opendrive`
+ALL_LABELS = (
+              "zones", "zones_gap", "ibs",
+              "pivot", "onbreak", "onfade",
+              "trendjoin_pk", "wallfade",
+              "onbreak_lg",
               "trendjoin_scale80", "trendjoin_scale100",   # scale-out twins
               "trendjoin_fast",         # scales on ARRIVAL SPEED instead
               "trendjoin_scale80w",     # scale80 + one-way suppressor
@@ -652,14 +597,10 @@ ALL_LABELS = ("ignition", "ignition_fixed", "opendrive",
               "trendjoin_d10", "trendjoin_d14",   # scale-free pullback DEPTH
               "rsi2", "trendjoin", "trendjoin_narrow",
               "trendjoin_2p24", "trendjoin_2p32",
-                            "onbreak_2p_retrace",
-                            # fixed-distance arming twins — the variant that measured better
-              # than the volatility ruler; 16/24/32pt all run, none privileged
-              "opendrive_2p24",
+              "onbreak_2p_retrace",
               "onbreak_2p32",
-              # NINE vwapbreak variants REMOVED 2026-08-16 -- see _make().
-              # `vwapbreak` alone stays, as a paper control.
-              "zones_15m", "zones_1h", "zones_4h",
+              "opendrive_2p24",
+              "zones_15m", "zones_1h",
               "dip3")
 # fadeturn* are deliberately NOT in ALL_LABELS. They are built and replayable by
 # name, but they do not auto-enroll: measured 2026-08-29 over 205 ES + 160 NQ

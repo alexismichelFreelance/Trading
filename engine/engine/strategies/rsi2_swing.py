@@ -37,6 +37,7 @@ from collections import deque
 from pathlib import Path
 
 from ..core.events import Bar, Fill
+from ..core.market_calendar import flat_min_for
 from ..core.orders import Order
 from ..core.timeutil import et, et_session_date
 from .base import BaseStrategy
@@ -149,7 +150,7 @@ class RSI2SwingStrategy(BaseStrategy):
             self._decided = False
         self._c = b.c
         t = et(b.ts)
-        if t.hour * 60 + t.minute < DECISION_MIN or self._decided:
+        if t.hour * 60 + t.minute < flat_min_for(b.ts) or self._decided:
             return []
         self._decided = True
 

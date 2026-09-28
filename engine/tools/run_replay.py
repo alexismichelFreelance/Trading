@@ -67,7 +67,7 @@ def load_states():
 
 
 NEEDS_BARS = {"ignition": True, "zones": True, "flow": False, "opendrive": False,
-              "ibs": True}
+              "ibs": True, "trendjoin": False}
 
 
 def make_strategy(name: str, symbol: str, hmm_path: str = HMM_PATH, **kw):
@@ -91,7 +91,14 @@ def make_strategy(name: str, symbol: str, hmm_path: str = HMM_PATH, **kw):
     if name == "ibs":
         from engine.strategies.ibs_swing import IBSSwingStrategy
         return IBSSwingStrategy(symbol, **kw)
-    raise SystemExit(f"unknown strategy '{name}' (ignition/flow/zones/opendrive/ibs)")
+    if name == "trendjoin":
+        from engine.strategies.trend_join import TrendJoinStrategy
+        spec = spec_of(symbol)
+        # Use instrument-specific trend_join params from instruments.yaml
+        kw.setdefault("conf_pts", spec.extra.get("trend_join", {}).get("conf_pts", 15.0))
+        kw.setdefault("stop_pts", spec.extra.get("trend_join", {}).get("stop_pts", 8.0))
+        return TrendJoinStrategy(symbol, **kw)
+    raise SystemExit(f"unknown strategy '{name}' (ignition/flow/zones/opendrive/ibs/trendjoin)")
 
 
 def _make_feed(name: str, symbol: str, days, start, end) -> ReplayFeed:

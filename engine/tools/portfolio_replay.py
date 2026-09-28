@@ -449,9 +449,23 @@ def report(rows, symbol, point_usd, labels):
 
 
 def _live_days(qdb: QuestDB, symbol: str) -> list[str]:
-    """ET session dates that actually have live capture for this instrument."""
+    """ET session dates that actually have live capture for this instrument.
+
+    CLIPPED TO THE TAPE'S OWN RANGE, and that is the whole point. This used to
+    select every ts in claude_bars_live and take the distinct ET dates. That was
+    fine when the table held the recorder's own 57 sessions; after the .ncd
+    backfill it holds 1.58M ES rows going back to 2019, the unbounded query
+    fails with a QuestDB 400 after three minutes, and the tool cannot start at
+    all. A `--source live` replay can only run where there is captured
+    per-second tape, so the bars query is bounded by claude_sec_live's range --
+    exact same answer, ~3% of the rows."""
+    w = qdb.df(f"SELECT min(ts) a, max(ts) b FROM claude_sec_live WHERE symbol='{symbol}'")
+    if w.empty or pd.isna(w.a.iloc[0]):
+        return []
+    lo = pd.Timestamp(w.a.iloc[0]).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    hi = pd.Timestamp(w.b.iloc[0]).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     b = qdb.df("SELECT ts FROM claude_bars_live "
-               f"WHERE symbol='{symbol}' ORDER BY ts")
+               f"WHERE symbol='{symbol}' AND ts >= '{lo}' AND ts <= '{hi}' ORDER BY ts")
     if b.empty:
         return []
     t = pd.to_datetime(b.ts, utc=True).dt.tz_convert("America/New_York")

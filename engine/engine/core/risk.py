@@ -30,6 +30,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from .orders import Order
+from . import market_calendar as mcal
 from .timeutil import et_minute_of_day, et_session_date
 
 log = logging.getLogger("engine.risk")
@@ -89,6 +90,22 @@ class RiskSupervisor:
         self._eod_done = False
         self._last_emit = -1e18
         self.denials = 0
+
+
+    # ── the exchange calendar ────────────────────────────────────────────
+    # The configured times describe an ORDINARY session. On an exchange holiday
+    # the close is 13:00 ET, and a supervisor still waiting for 15:58 never
+    # flattens at all -- which on 2026-09-07 (Labor Day) left a live position
+    # open across a shut market and into the next session. Whichever comes
+    # FIRST wins: the backstop may fire early, never late.
+    @staticmethod
+    def _flatten_min(ts: int, configured: tuple[int, int]) -> int:
+        return min(configured[0] * 60 + configured[1], mcal.flat_min_for(ts))
+
+    @staticmethod
+    def _lockout_min(ts: int, configured: tuple[int, int]) -> int:
+        return min(configured[0] * 60 + configured[1],
+                   mcal.lockout_min(et_session_date(ts)))
 
     # ── session / bookkeeping ────────────────────────────────────────────
     def _roll_day(self, ts: int) -> None:
@@ -192,7 +209,7 @@ class RiskSupervisor:
             projected = base + o.side * o.qty
             increases = abs(projected) > abs(base)
             if increases and c.entry_lockout_et is not None and not swing:
-                lock = c.entry_lockout_et[0] * 60 + c.entry_lockout_et[1]
+                lock = self._lockout_min(ts, c.entry_lockout_et)
                 if lock <= m < EVENING_ET_MIN:
                     self._deny(name, o, "entry lockout (late session)")
                     return None
@@ -334,7 +351,7 @@ class RiskSupervisor:
                       self.marked_pnl(last_px), c.daily_loss_halt)
         if c.eod_flatten_et is not None and not self._eod_done:
             m = et_minute_of_day(ts)
-            if c.eod_flatten_et[0] * 60 + c.eod_flatten_et[1] <= m < EVENING_ET_MIN:
+            if self._flatten_min(ts, c.eod_flatten_et) <= m < EVENING_ET_MIN:
                 self._eod_done = True
                 tag = tag or "risk_eod"
                 log.info("risk: EOD flatten at %s", et_session_date(ts))
