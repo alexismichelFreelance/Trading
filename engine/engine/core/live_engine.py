@@ -19,11 +19,12 @@ import logging
 import time
 
 from .blotter import Blotter
+from .clock import WallClock
 from .dispatch import _wants, dispatch_broker, dispatch_market
 from .events import Bar, Fill, PositionUpdate, Signal, Trade
 from .orders import Order, OrderType
-from .risk import RiskSupervisor
-from .timeutil import et_session_date
+from .risk import EVENING_ET_MIN, RiskSupervisor
+from .timeutil import et_minute_of_day, et_session_date
 from ..strategies.base import BaseStrategy
 
 log = logging.getLogger("engine.live")
@@ -211,6 +212,18 @@ class LiveEngine:
         self._lag_logged = 0.0
         self._q: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
+        # WALL-CLOCK EOD FLATTEN TIMER (live only). The supervisor's flatten is
+        # event-timestamp-gated: it only fires if a market event carries a ts
+        # inside the flatten window. On 2026-10-02 the 10-minute-delayed feed
+        # stalled around the close, no event landed in 15:58-18:00 ET, and
+        # positions carried overnight. This timer makes the WALL CLOCK
+        # authoritative: when it is past the configured flatten time (or the
+        # earlier holiday close, whichever comes first) and the supervisor has
+        # not flattened, we drive on_market() ourselves with a wall-clock ts
+        # and the books we already hold. Inflight ttl/reemit logic is
+        # unchanged — the supervisor still owns retry cadence.
+        self._wallclock_eod = isinstance(self.clock, WallClock)
+        self.eod_poll_s = 5.0                     # timer wake-up cadence
 
     async def wait_processed(self, n: int, timeout: float = 10.0,
                              poll: float = 0.005) -> int:
@@ -790,6 +803,56 @@ class LiveEngine:
                     log.warning("LANE %s recovered after silence", lane)
                     warned.discard(lane)
 
+    async def _eod_timer(self) -> None:
+        """WALL-CLOCK EOD FLATTEN backstop (live only).
+
+        The supervisor's flatten in on_market() is gated on the EVENT
+        timestamp: it only fires while a market event carries a ts inside the
+        15:58-18:00 ET window. On 2026-10-02 the 10-minute-delayed CME feed
+        stalled around the close, no event landed in the window, and positions
+        carried overnight. On a DELAYED feed the flatten minute is reached in
+        EVENT time long before the WALL clock -- and if the feed then dies, the
+        event-gated path never fires at all.
+
+        This loop checkpoints the WALL clock every `eod_poll_s` and, once it is
+        past the flatten minute (the configured time or the earlier holiday
+        close, whichever comes first) and the supervisor has not yet flattened,
+        drives on_market() with a wall-clock timestamp and the books we already
+        hold. The supervisor's inflight/reemit/retry logic is unchanged.
+
+        LIVE-ONLY: armed only when the engine clock is a WallClock (i.e. not
+        replay, where the EventClock deliberately follows event-time), and it
+        does no work until at least one lane is live (`self._live`), so a
+        warmup backlog can never prematurely flatten on wall-clock time.
+        """
+        if not self._wallclock_eod:
+            return                                # replay / EventClock: NOP
+        while not self._stop.is_set():
+            await asyncio.sleep(self.eod_poll_s)
+            if not self._live:
+                continue                          # nothing live yet: keep waiting
+            now_ns = self.clock.now()             # WallClock: epoch ns, UTC
+            cfg = self.risk.cfg
+            if (cfg.eod_flatten_et is None or self.risk._eod_done
+                    or not RiskSupervisor._flatten_min(now_ns, cfg.eod_flatten_et)
+                       <= et_minute_of_day(now_ns) < EVENING_ET_MIN):
+                continue                          # not past the flatten minute yet
+            # Past the flatten minute and the supervisor has not flattened.
+            # Fire it with a wall-clock timestamp and today's books.
+            log.info("live: wall-clock EOD flatten due (clock %s, event tape "  # noqa: E501
+                     "may be stalled/delayed)", et_session_date(now_ns))
+            await self._supervisor_chk(now_ns)
+
+    async def _supervisor_chk(self, ts: int) -> None:
+        """Run the supervisor against `ts` and the current live books; submit
+        whatever flatten/halt orders it returns. Shared by the event path and
+        the wall-clock EOD timer."""
+        books = [(id(s), type(s).__name__, s.symbol, self._spos.get(id(s), 0))
+                 for s in self.strategies if self._is_live(s)]
+        for sid, o in self.risk.on_market(ts, self._last_px, books):
+            owner = next(s for s in self.strategies if id(s) == sid)
+            await self._submit_owned(owner, o)
+
     async def _pump_broker(self, broker) -> None:
         """Same contract as _pump_feed: a clean end is a DISCONNECT, not the end
         of the world. A broker socket dying quietly would otherwise stop order
@@ -826,6 +889,8 @@ class LiveEngine:
         # distinct broker objects only (a symbol->broker dict may share one)
         uniq_brokers = list({id(b): b for b in self.brokers.values()}.values())
         brokerers = [asyncio.create_task(self._pump_broker(b)) for b in uniq_brokers]
+        # wall-clock EOD flatten backstop (NOP for replay / EventClock)
+        eod_timer = asyncio.create_task(self._eod_timer())
         feeds_done = 0
         try:
             while not self._stop.is_set():
@@ -947,12 +1012,7 @@ class LiveEngine:
                                                     o.side, o.qty, o.tag,
                                                     self.px_for(o.symbol))
                     if self._live:                       # supervisor-owned actions (LIVE only)
-                        books = [(id(s), type(s).__name__, s.symbol,
-                                  self._spos.get(id(s), 0)) for s in self.strategies
-                                 if self._is_live(s)]
-                        for sid, o in self.risk.on_market(ev.ts, self._last_px, books):
-                            owner = next(s for s in self.strategies if id(s) == sid)
-                            await self._submit_owned(owner, o)
+                        await self._supervisor_chk(ev.ts)
                     if isinstance(ev, Bar) and self.on_bar_hook is not None:
                         self._emit_sink(self.on_bar_hook, ev, lane_live,
                                         self._bf_bars.get(sym, 0))
@@ -979,6 +1039,7 @@ class LiveEngine:
             await asyncio.gather(*feeders, *brokerers, return_exceptions=True)
             if dog is not None:
                 dog.cancel()
+            eod_timer.cancel()
             # bounded chance for observers to land (so shutdown does not lose the
             # last blotter rows), then stop regardless -- shutdown must not hang
             # on a stuck sink either.

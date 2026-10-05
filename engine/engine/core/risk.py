@@ -110,14 +110,28 @@ class RiskSupervisor:
     # ── session / bookkeeping ────────────────────────────────────────────
     def _roll_day(self, ts: int) -> None:
         day = et_session_date(ts)
-        if day != self._day:
-            if self._day is not None:
-                log.info("risk: new session %s (was %s); counters reset", day, self._day)
+        # If this is the very first event, set the day.
+        if self._day is None:
+            self._day = day
+            log.info("risk: initial session %s", day)
+            return
+
+        # If the incoming event is for a day *after* our current tracked day,
+        # then roll the day forward and reset counters.
+        if day > self._day:
+            log.info("risk: new session %s (was %s); counters reset", day, self._day)
             self._day = day
             self._realized = 0.0
             self.halted = False
             self._eod_done = False
             self._stamps.clear()
+        # If the incoming event is for a day *before* our current tracked day,
+        # ignore it (it's a historical backfill that shouldn't reset live state).
+        elif day < self._day:
+            log.debug("risk: ignoring backward day %s (current %s, catch-up)",
+                      day, self._day)
+            # No change to self._day or counters.
+            # (If day == self._day, no action needed for rolling the day.)
 
     def _expire_pending(self) -> None:
         now = self._now()
@@ -340,16 +354,22 @@ class RiskSupervisor:
                 self.note_price(sym, px)
         for sid, _n, symbol, _p in books:                  # learn sid -> symbol
             self._sym[sid] = symbol
+        # Every supervisor decision (daily-loss halt, EOD flatten) belongs to
+        # the CURRENT tracked session day. A prior-day backfill event from a
+        # warmer lane during multi-lane warmup must be inert — see _roll_day.
+        current_event_day = et_session_date(ts)
         c = self.cfg
         have_px = bool(last_px) if isinstance(last_px, dict) else last_px > 0
         tag = None
         if c.daily_loss_halt is not None and not self.halted and have_px \
+                and current_event_day == self._day \
                 and self.marked_pnl(last_px) <= c.daily_loss_halt:
             self.halted = True
             tag = "risk_halt"
             log.error("risk KILL SWITCH: marked P&L %.0f <= %.0f — flattening all books",
                       self.marked_pnl(last_px), c.daily_loss_halt)
-        if c.eod_flatten_et is not None and not self._eod_done:
+        if c.eod_flatten_et is not None and not self._eod_done \
+                and current_event_day == self._day:
             m = et_minute_of_day(ts)
             if self._flatten_min(ts, c.eod_flatten_et) <= m < EVENING_ET_MIN:
                 self._eod_done = True
