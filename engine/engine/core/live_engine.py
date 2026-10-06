@@ -812,7 +812,11 @@ class LiveEngine:
         c = self.risk.cfg
         if c.eod_flatten_et is None:
             return 0
-        books = [(id(s), type(s).__name__, s.symbol, self._spos.get(id(s), 0))
+        # Each book carries the sleeve's holds_overnight so the supervisor spares
+        # the SAME set the engine's own _flatten_for_session spares. Book shape:
+        # (sid, name, symbol, pos, holds_overnight).
+        books = [(id(s), type(s).__name__, s.symbol, self._spos.get(id(s), 0),
+                  bool(getattr(s, "holds_overnight", False)))
                  for s in self.strategies]
         fired = 0
         for sid, o in self.risk.trigger_eod_flatten(now, books):
