@@ -19,6 +19,7 @@ import logging
 import time
 
 from .blotter import Blotter
+from .clock import WallClock
 from .dispatch import _wants, dispatch_broker, dispatch_market
 from .events import Bar, Fill, PositionUpdate, Signal, Trade
 from .orders import Order, OrderType
@@ -158,6 +159,14 @@ class LiveEngine:
         # every production limit OFF, but in-flight-aware reduce_only vetting
         # is always on — that closed the 2026-07-09 duplicate-flatten bug.
         self.risk = risk if risk is not None else RiskSupervisor()
+        # EOD FLATTEN BACKSTOP (live only, see _eod_backstop).
+        # Independent of the market-data feed so a stalled/quiet feed cannot
+        # leave an intraday sleeve holding overnight: a wall-clock task fires
+        # the flatten even when no market event arrives in the flatten window.
+        self._eod_backstop_s = 30.0        # wall-clock poll cadence
+        self._eod_backstop_wired = False   # True once the task started (tests)
+        self._eod_backstop_fired = 0       # flatten orders emitted by the backstop
+        self._eod_backstop_task = None     # asyncio.Task | None
         # PAPER vs LIVE routing. live_owners = set of id(strategy) that route to
         # the real broker (NT8); every other strategy ALWAYS paper-trades — its
         # orders fill inline at last_px, attributed to its own book, recorded
@@ -790,6 +799,59 @@ class LiveEngine:
                     log.warning("LANE %s recovered after silence", lane)
                     warned.discard(lane)
 
+    async def _eod_backstop_check(self, now: int) -> int:
+        """One wall-clock pass of the EOD backstop. Returns the number of
+        flatten orders submitted this pass. No-op when the risk config does not
+        enable an EOD flatten time, so default engines are untouched.
+
+        Covers BOTH live and paper intraday sleeves (the RiskSupervisor's
+        event-driven on_market path only sees live books; paper positions must
+        not ride overnight either, and production may have either). Submission
+        routes by liveness exactly like _flatten_for_session: live books go to
+        the broker, paper books fill inline."""
+        c = self.risk.cfg
+        if c.eod_flatten_et is None:
+            return 0
+        books = [(id(s), type(s).__name__, s.symbol, self._spos.get(id(s), 0))
+                 for s in self.strategies]
+        fired = 0
+        for sid, o in self.risk.trigger_eod_flatten(now, books):
+            owner = next(s for s in self.strategies if id(s) == sid)
+            if self._is_live(owner):
+                await self._submit_owned(owner, o)
+            else:
+                await self._paper_submit(owner, o)
+            self._eod_backstop_fired += 1
+            fired += 1
+            log.warning("risk backstop: EOD flatten submitted %s %s %+d x%d (%s)",
+                        self.label_of(owner), o.symbol, o.side, o.qty, o.tag)
+        return fired
+
+    async def _eod_backstop(self) -> None:
+        """Wall-clock EOD flatten backstop (LIVE engines only).
+
+        The feed-driven EOD flatten in RiskSupervisor.on_market can only fire
+        when a market event lands in the flatten window (15:58-18:00 ET). If
+        the data feed stalls, lags or goes quiet near the close -- the
+        2026-10-02 incident -- no event lands and an intraday sleeve carries
+        overnight. This task polls the WALL CLOCK instead, so a quiet feed
+        cannot make the flatten miss.
+
+        It reuses the supervisor's shared _eod_done flag, so whichever path
+        fires first wins and the other is a no-op -- no double flatten, no fight
+        with a sleeve already exiting. Wired only for WallClock engines;
+        EventClock (replay) engines never start it and are unchanged."""
+        while not self._stop.is_set():
+            await asyncio.sleep(self._eod_backstop_s)
+            now = self.clock.now()
+            try:
+                await self._eod_backstop_check(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:          # noqa: BLE001 - resilient live loop
+                log.warning("risk backstop error: %s: %s",
+                            type(ex).__name__, ex)
+
     async def _pump_broker(self, broker) -> None:
         """Same contract as _pump_feed: a clean end is a DISCONNECT, not the end
         of the world. A broker socket dying quietly would otherwise stop order
@@ -823,6 +885,14 @@ class LiveEngine:
         # liveness watchdog: only meaningful for an unbounded (live) feed set
         dog = (asyncio.create_task(self._watchdog())
                if any(not getattr(f, "finite", False) for f in self.feeds) else None)
+        # EOD flatten backstop: real wall clock only. EventClock (replay)
+        # engines never wire it -- they stay byte-for-byte unchanged. The
+        # backstop is a no-op unless the risk config enables an EOD flatten.
+        backstop = (asyncio.create_task(self._eod_backstop())
+                    if isinstance(self.clock, WallClock) else None)
+        if backstop is not None:
+            self._eod_backstop_wired = True
+            self._eod_backstop_task = backstop
         # distinct broker objects only (a symbol->broker dict may share one)
         uniq_brokers = list({id(b): b for b in self.brokers.values()}.values())
         brokerers = [asyncio.create_task(self._pump_broker(b)) for b in uniq_brokers]
@@ -979,6 +1049,9 @@ class LiveEngine:
             await asyncio.gather(*feeders, *brokerers, return_exceptions=True)
             if dog is not None:
                 dog.cancel()
+            if backstop is not None:
+                backstop.cancel()
+                await asyncio.gather(backstop, return_exceptions=True)
             # bounded chance for observers to land (so shutdown does not lose the
             # last blotter rows), then stop regardless -- shutdown must not hang
             # on a stuck sink either.

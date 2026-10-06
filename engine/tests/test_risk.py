@@ -120,6 +120,38 @@ def test_eod_flatten_once_then_block_then_retry():
     assert len(out) == 1 and out[0][1].qty == 7
 
 
+def test_trigger_eod_flatten_backstop_fires_with_no_market_event():
+    """The 2026-10-02 incident: the feed stalls and on_market is never called
+    again in the flatten window. trigger_eod_flatten is the wall-clock backstop
+    the engine calls instead -- it must flatten on a bare wall-clock ts."""
+    cfg = RiskConfig(eod_flatten_et=(15, 58), swing_sleeves=("IBSSwingStrategy",))
+    r = RiskSupervisor(cfg)
+    books = [(1, "zones", "ES", 7), (2, "IBSSwingStrategy", "ES", 2)]
+    # before the flatten time: nothing
+    assert r.trigger_eod_flatten(ts_et("15:57"), books) == []
+    # at/after: intraday book flattened, swing spared, once only
+    out = r.trigger_eod_flatten(ts_et("15:58"), books)
+    assert len(out) == 1 and out[0][0] == 1
+    assert out[0][1].reduce_only and out[0][1].tag == "risk_eod" and out[0][1].qty == 7
+    # after it fired it is done -- a second call is a no-op
+    assert r.trigger_eod_flatten(ts_et("16:30"), books) == []
+    # and it sets the same _eod_done the event path does, so a stale feed event
+    # afterwards cannot double-flatten or re-open
+    assert r.vet(1, "zones", Order("ES", BUY, 1), ts_et("16:00"), 7) is None
+
+
+def test_trigger_eod_flatten_backstop_requires_config():
+    r = RiskSupervisor(RiskConfig())           # eod_flatten_et=None
+    assert r.trigger_eod_flatten(ts_et("15:58"), [(1, "zones", "ES", 7)]) == []
+
+
+def test_trigger_eod_flatten_backstop_no_emit_too_late():
+    # After 18:00 ET the backstop does not spring — matches on_market's window
+    r = RiskSupervisor(RiskConfig(eod_flatten_et=(15, 58)))
+    # 18:00 is the boundary; past 18:00 is a new evening session, no flatten
+    assert r.trigger_eod_flatten(ts_et("18:01"), [(1, "z", "ES", 5)]) == []
+
+
 def test_swing_sleeve_enters_late_and_survives_eod_flatten():
     """IBS enters at 15:59 and holds overnight: exempt from the entry lockout and
     the EOD flatten; intraday sleeves are still flattened; kill switch still
