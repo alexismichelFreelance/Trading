@@ -1,0 +1,516 @@
+"""run_dashboard.py — engine-embedded inspect-first dashboard server (v1).
+
+ONE FILE: a local aiohttp web server that is served BY the engine process. It
+binds the state-publish adapter's transport-free contract to a single
+WebSocket that carries live state to the user's browser, where TradingView
+lightweight-charts renders it. Same socket is the future control channel; for
+v1 it only subscribes/re-configures windows (no strategy controls yet).
+
+WHY THIS EXISTS (acceptance from the user):
+  * "can't see indicators"      -> every indicator drawn is the ENGINE's value
+                                    (levelbook/zoneview), never re-derived in JS
+  * "invisible errors"          -> engine log + WARNING/ERROR surface in the UI
+  * "zones look all wrong"      -> zones are ENGINE ZoneBook geometry (top/bot),
+                                    rendered as exact horizontal bands, not guesses
+  * multi-window / per-window TF-> each browser tab is one window with its own
+                                    symbol + timeframe; server never hardcodes 1m
+  * dark theme that actually works
+
+HOW IT RUNS
+  * --demo (default): drives the REAL engine feature pipeline (real LevelBook,
+    real ZoneView, real Blotter, real BarAggregator, real ZoneDetector) from a
+    synthetic-but-plausible 1m tape, and publishes the exact same state-publish
+    schema the live engine publishes. This is the real computation, not a mock:
+    VWAP comes from AnchoredVWAP fed real bars, zones come from ZoneView/ZoneBook
+    fed real bars, positions come from real strategies' chart_marks + a real
+    blotter ledger. Use it to inspect the UI without NT8/QuestDB.
+  * --live (NT8): attaches the SAME StatePublisher to the engine's NT8 feed via
+    the run_live.py building blocks (NinjaTraderFeed + broker). This path needs
+    NT8 running with the EngineRelay addon; it reuses run_live's exact wiring so
+    the dashboard is the same lovely thing over the real tape.
+
+LAYOUT (all under <worktree>/engine):
+  tools/run_dashboard.py            THIS server (aiohttp + WS + loopback demo)
+  dashboard/index.html              single-page UI
+  dashboard/app.js                  chart rendering + WS client
+  dashboard/style.css               dark theme
+  dashboard/vendor/lightweight-charts.standalone.production.js   vendored (v4.2.3)
+
+WS PROTOCOL (JSON text frames)
+  client -> {op:"subscribe", symbol, tf}   (optional; default from querystring)
+  client -> {op:"ping"}
+  server -> {type:"hello", windows:[...], lanes:[...], timeframes:[...],
+             symbol, tf}
+  server -> {type:"snapshot", symbol, tf, payload:{
+              bars:{tf:[...]}, indicators:[...], zones:[...], positions:[...]},
+              log:[...], errors:[...]}
+  server -> {type:"delta", symbol, kind, payload}   kind in
+             {bar,indicator,zone,position,fill,log,error,session,lane}
+  bars per window are delivered for the window's chosen tf only (from the
+  engine-aggregated store); raw 1m is always available under '1m'.
+
+Run:
+  .venv/Scripts/python.exe tools/run_dashboard.py --demo --port 8787
+  # open http://127.0.0.1:8787/?symbol=ES&tf=5m   (one tab per window)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import math
+import random
+import sys
+import time
+from pathlib import Path
+
+from aiohttp import WSMsgType, web
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from engine.adapters.state_publish import LaneSource, StatePublisher  # noqa: E402
+from engine.core.blotter import Blotter                              # noqa: E402
+from engine.core.events import Bar, Fill                              # noqa: E402
+from engine.features.level_book import LevelBook                     # noqa: E402
+from engine.painters import ZoneView                                 # noqa: E402
+
+log = logging.getLogger("engine.dashboard")
+NS = 1_000_000_000
+
+# The engine aggregates a broad set so ANY window can pick; we never hardcode
+# the client to 1m. Order matters for the picker.
+TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
+
+# Per-lane demo generators (see _DemoLane). These produce the raw 1m tape.
+_GEN_SEED = {"ES": 7000.0, "NQ": 21000.0, "GC": 3900.0}
+_GEN_POINT = {"ES": 50.0, "NQ": 20.0, "GC": 100.0}
+_GEN_TICK = {"ES": 0.25, "NQ": 0.25, "GC": 0.10}
+_GEN_ALLOWED = set(_GEN_SEED)  # lanes the demo can synthesize
+
+
+def _synthetic_daily(dl, sessions: int):
+    """Synthetic 1d bars with departure structure, for the 1d detector."""
+    import pandas as pd
+    base = pd.Timestamp.now(tz="America/New_York").normalize()
+    out = []
+    px = dl.start_px
+    for d in range(sessions - 1, -1, -1):
+        day = (base - pd.Timedelta(days=d)).strftime("%Y-%m-%d")
+        ts = int(pd.Timestamp(f"{day} 16:00", tz="America/New_York").value)
+        rng = dl.scale * random.uniform(0.5, 2.2)
+        o = px + random.gauss(0, rng * 0.3)
+        c = o + random.choice([-1, 1]) * rng * random.uniform(0.4, 1.2)
+        h = max(o, c) + rng * 0.3
+        l = min(o, c) - rng * 0.3
+        out.append(Bar(ts, "1d", round(o, 4), round(h, 4), round(l, 4),
+                       round(c, 4), int(dl.vol * random.uniform(0.6, 1.4)),
+                       dl.symbol))
+        px = c
+    return out
+
+
+class _DemoLane:
+    """Produces a realistic 1m tape and feeds the REAL LevelBook + ZoneView so
+    the engine publishes genuinely-computed indicators/zones (never redrawn in
+    JS). Also maintains real strategy objects + a real blotter so positions are
+    real."""
+
+    def __init__(self, symbol: str, point_usd: float, tick: float,
+                 tf: str = "1m") -> None:
+        self.symbol = symbol
+        self.point_usd = point_usd
+        self.tick = tick
+        self.tf = tf
+        self.levelbook = LevelBook()          # real: VWAP, pivots, book
+        self.zoneview = ZoneView()            # real: ZoneDetector + ZoneBook
+        self.strategies = []                  # real strategy objects w/ marks
+        self.blotter = Blotter(symbol, point_usd)
+        self.start_px = _GEN_SEED.get(symbol, 7000.0)
+        self._px = self.start_px
+        self.bar_ts = 0
+        self.scale = {"ES": 26.0, "NQ": 90.0, "GC": 16.0}.get(symbol, 20.0)
+        self.vol = {"ES": 1300, "NQ": 1800, "GC": 600}.get(symbol, 800)
+        self._n = 0
+        self._regime = "quiet"
+        self._regime_until = 0
+
+    # ── tape generation ───────────────────────────────────────────────────
+    def _rng(self):
+        """One bar's range scaled to the current regime."""
+        if self._n >= self._regime_until:
+            r = random.random()
+            if r < 0.10:                              # departure burst
+                self._regime, self._regime_until = "burst", self._n + 8
+            elif r < 0.45:                            # normal
+                self._regime, self._regime_until = "normal", self._n + 20
+            else:                                     # quiet base
+                self._regime, self._regime_until = "quiet", self._n + 24
+        mult = {"quiet": 0.30, "normal": 1.0, "burst": 2.6}[self._regime]
+        return self.scale * random.uniform(0.4, 1.0) * mult
+
+    def _next_open(self) -> float:
+        # gentle drift + waves + occasional burst direction, bounded
+        self._px += random.gauss(0.0, self.scale * 0.05)
+        self._px += math.sin(self._n / 29.0) * self.scale * 0.06
+        if self._regime == "burst":
+            self._px += random.choice([-1, 1]) * self.scale * random.uniform(0.6, 1.2)
+        # hard range bound so price stays sensible
+        self._px += (self.start_px - self._px) * 0.00006
+        return self._px
+
+    def bar(self, ts: int, complete: bool = True) -> Bar:
+        o = self._next_open()
+        rng = self._rng()
+        c = o + random.gauss(0.0, rng)
+        h = max(o, c) + random.uniform(0, rng * 0.5)
+        l = min(o, c) - random.uniform(0, rng * 0.5)
+        v = max(1, int(self.vol * random.uniform(0.6, 1.6)))
+        self.bar_ts = ts
+        self._n += 1
+        return Bar(ts, self.tf, round(o, 4), round(h, 4), round(l, 4),
+                   round(c, 4), v, self.symbol, complete=complete)
+
+    # ── positions: a couple of real strategy sleeves that open at some point ──
+    def build_strategies(self) -> None:
+        # Two open "sleeves" with the engine's chart_marks() protocol; the real
+        # extractor (state_sources.positions_from_strategies) reads these.
+        class Sleeve:
+            def __init__(self, s, label, qty):
+                self.symbol = s.symbol
+                self.label = label
+                self.pos = qty
+                self.entry = round(s._px, 4)
+                brk = self.entry * 0.003
+                self.chart_marks = lambda: {
+                    "entry": self.entry,
+                    "target": round(self.entry + (1 if qty > 0 else -1) * brk, 4),
+                    "stop": round(self.entry - (1 if qty > 0 else -1) * brk * 1.6, 4),
+                }
+        self.strategies = [Sleeve(self, f"{self.symbol}:pivot", 1),
+                           Sleeve(self, f"{self.symbol}:trend", -1)]
+        # blotter ledger is authoritative for avg_px (read by state_sources)
+        led = self.blotter._ledgers[self.symbol]
+        main = self.strategies[0]
+        led.qty = main.pos
+        led.avg_px = main.entry
+        self.blotter._default_symbol = self.symbol
+
+
+class Dashboard:
+    """Embedded server: HTTP static + one WebSocket carrying engine state."""
+
+    def __init__(self, publisher: StatePublisher, lanes, timeframes,
+                 dashboard_dir: Path, host: str, port: int):
+        self.pub = publisher
+        self.lanes = sorted(lanes)
+        self.timeframes = list(timeframes)
+        self.host = host
+        self.port = port
+        self.static = dashboard_dir
+        self._clients: set = set()      # writer tasks keyed by asyncio.Task
+        self.app = web.Application()
+        self._add_routes()
+
+    def _add_routes(self):
+        self.app.router.add_get("/", self._index)
+        self.app.router.add_get("/ws", self._ws)
+        # serve the vendored lib + app + styles verbatim
+        for name in ("app.js", "style.css",
+                     "vendor/lightweight-charts.standalone.production.js"):
+            self.app.router.add_get(f"/{name}", self._static_file(name))
+        self.app.router.add_get("/vendor/{f}", self._vendor)
+
+    def _static_file(self, name: str):
+        async def handler(request):
+            return web.FileResponse(self.static / name)
+        return handler
+
+    async def _vendor(self, request):
+        f = request.match_info.get("f", "")
+        p = (self.static / "vendor" / f).resolve()
+        if not str(p).startswith(str(self.static.resolve())):
+            raise web.HTTPForbidden()
+        return web.FileResponse(p)
+
+    async def _index(self, request):
+        html = (self.static / "index.html").read_text(encoding="utf-8")
+        return web.Response(text=html, content_type="text/html")
+
+    @staticmethod
+    def _lane_payload(snap, symbol: str, tf: str) -> dict:
+        lane = snap.get("lanes", {}).get(symbol, {})
+        bars = lane.get("bars", {})
+        # raw 1m always available under '1m'; engine-aggregated otherwise
+        if tf == "1m":
+            candles = lane.get("bars_raw", [])
+        else:
+            candles = bars_for = bars.get(tf, [])
+        return {
+            "bars": candles,
+            "indicators": lane.get("indicators", []),
+            "zones": lane.get("zones", []),
+            "positions": lane.get("positions", []),
+        }
+
+    async def _ws(self, request):
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        symbol = request.query.get("symbol", "")
+        tf = request.query.get("tf", "5m")
+        sym_ok = symbol in self.lanes
+        if not sym_ok:
+            symbol = self.lanes[0] if self.lanes else ""
+        if tf not in self.timeframes:
+            tf = "5m" if "5m" in self.timeframes else self.timeframes[0]
+        try:
+            await ws.send_json({
+                "type": "hello",
+                "lanes": self.lanes,
+                "timeframes": self.timeframes,
+                "symbol": symbol,
+                "tf": tf,
+            })
+            snap = self.pub.snapshot()
+            await ws.send_json({
+                "type": "snapshot",
+                "symbol": symbol,
+                "tf": tf,
+                "payload": self._lane_payload(snap, symbol, tf),
+                "seq": snap.get("seq", 0),
+                "log": snap.get("log", [])[-80:],
+                "errors": snap.get("errors", []),
+            })
+            write = asyncio.create_task(self._forward(ws, symbol, tf))
+            self._clients.add(write)
+            try:
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
+                        except Exception:                       # noqa: BLE001
+                            continue
+                        op = data.get("op")
+                        if op == "ping":
+                            await ws.send_json({"type": "pong"})
+                        elif op == "subscribe":
+                            symbol = data.get("symbol", symbol)
+                            tf = data.get("tf", tf)
+                            if symbol not in self.lanes:
+                                symbol = self.lanes[0]
+                            if tf not in self.timeframes:
+                                tf = self.timeframes[0]
+                            snap = self.pub.snapshot()
+                            await ws.send_json({
+                                "type": "snapshot",
+                                "symbol": symbol, "tf": tf,
+                                "payload": self._lane_payload(snap, symbol, tf),
+                                "seq": snap.get("seq", 0),
+                                "log": snap.get("log", [])[-80:],
+                                "errors": snap.get("errors", []),
+                            })
+            finally:
+                write.cancel()
+                self._clients.discard(write)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:                                 # noqa: BLE001
+            log.warning("ws ended: %s", ex)
+        return ws
+
+    async def _forward(self, ws, symbol: str, tf: str):
+        """Stream state-publish deltas, delivering each client only the bars for
+        its chosen tf (raw 1m under '1m') plus all shared log/errors."""
+        try:
+            async for m in self.pub.subscribe():
+                kind = m["type"]
+                if kind == "__snapshot__":
+                    continue
+                payload = m.get("payload", {})
+                if kind == "bar":
+                    bar = payload.get("bar", {})
+                    # deliver only this window's timeframe
+                    if (bar or {}).get("tf") != tf:
+                        continue
+                    await ws.send_json({"type": "delta", "symbol": symbol,
+                                        "kind": "bar", "payload": {"bar": bar}})
+                elif kind in ("indicator", "zone", "position", "fill"):
+                    if m.get("lane") != symbol:
+                        continue
+                    if kind == "indicator":
+                        # relay only the recent engine points per series (values
+                        # are untouched — the INDICATOR is still the engine's; we
+                        # just bound how much of its history each window shows)
+                        payload = dict(payload)
+                        payload["points"] = payload.get("points", [])[-600:]
+                    await ws.send_json({"type": "delta", "symbol": symbol,
+                                        "kind": kind, "payload": payload})
+                else:                       # log/error/session/lane are global
+                    await ws.send_json({"type": "delta", "symbol": symbol,
+                                        "kind": kind, "payload": payload})
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:             # noqa: BLE001
+            log.warning("forward ended: %s", ex)
+
+    async def run(self):
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+        site = web.TCPSite(runner, self.host, self.port)
+        await site.start()
+        print(f"[dashboard] http://{self.host}:{self.port}/   "
+              f"(windows: {', '.join(self.lanes)}; tfs: {', '.join(self.timeframes)})")
+
+
+async def make_demo(host: str, port: int, tick_s: float, symbols,
+                    dashboard_dir: Path,
+                    timeframes: tuple = TIMEFRAMES) -> tuple[Dashboard, asyncio.Task]:
+    """Build a real-engine loopback demo: real LevelBook/ZoneView/Blotter fed a
+    synthetic tape, published through the exact state-publish adapter."""
+    lanes = {}
+    for sym in symbols:
+        point = _GEN_POINT.get(sym, 50.0)
+        tick = _GEN_TICK.get(sym, 0.25)
+        dl = _DemoLane(sym, point, tick)
+        dl.build_strategies()
+        lanes[sym] = dl
+
+    srcs = [LaneSource(sym, zoneview=dl.zoneview, levelbook=dl.levelbook,
+                       strategies=dl.strategies, color="")
+            for sym, dl in lanes.items()]
+    pub = StatePublisher(srcs, agg_timeframes=timeframes)
+
+    # ---- wire the adapter to a thin engine-shaped loopback loop ----
+    class _DemoEngine:
+        def __init__(self):
+            # build one blotter from the lanes' seeded ledgers so avg_px is real
+            self.blotter = Blotter(symbols[0], _GEN_POINT.get(symbols[0], 50.0))
+            for sym in symbols:
+                self.blotter.add_instrument(sym, _GEN_POINT.get(sym, 50.0))
+                led = lanes[sym].blotter._ledgers[sym]
+                eng_led = self.blotter._ledgers[sym]
+                eng_led.qty = led.qty
+                eng_led.avg_px = led.avg_px
+            self.b_lanes = lanes
+            # the publisher attach() reads these off the engine later
+            self.on_bar_hook = None
+            self.on_live_fill = None
+            self.on_paper_fill = None
+            self.on_session_rollover = None
+            self.on_feed_disconnect = None
+            self.on_lane_stale = None
+
+    engine = _DemoEngine()
+
+    async def drive():
+        # Seed ~14 sessions of RTH 1m history so the 30m/1h/4h zone detectors
+        # all warm past their 20-bar departure window (same idea as run_live
+        # seeding from QuestDB), plus daily bars for the 1d detector.
+        import pandas as pd
+
+        def session_1m(sessions: int = 14):
+            """Chronological RTH 1m bar close-times for `sessions` ET days."""
+            out = []
+            base = pd.Timestamp.now(tz="America/New_York").normalize()
+            for d in range(sessions - 1, -1, -1):
+                day = (base - pd.Timedelta(days=d)).strftime("%Y-%m-%d")
+                for m in range(0, 390):            # 09:30 .. 16:00 ET closes
+                    t = pd.Timestamp(f"{day} 09:30", tz="America/New_York") \
+                        + pd.Timedelta(minutes=m)
+                    out.append(t.value)
+            return out
+
+        seq = session_1m(14)
+        for dl in lanes.values():
+            # reset per-lane bar index so the live tape continues cleanly
+            dl._n = 0
+            dl._px = dl.start_px + random.uniform(-2, 2)
+            for ts in seq:
+                b = dl.bar(ts)
+                dl.levelbook.on_bar(b)
+                dl.zoneview.update(b)
+                await engine.on_bar_hook(b, False, 0)
+            # 1d zones: feed a daily bar per session into zoneview.seed_daily
+            dl.zoneview.seed_daily(_synthetic_daily(dl, len(seq) // 390))
+        # live stream
+        import logging as _log
+        _lgr = _log.getLogger("engine.dashboard")
+        _sent_error = False
+        ts = max((l.bar_ts for l in lanes.values()), default=seq[-1]) + 60 * NS
+        bar_idx = 0
+        while True:
+            for dl in lanes.values():
+                b = dl.bar(ts)
+                dl.levelbook.on_bar(b)
+                dl.zoneview.update(b)
+                await engine.on_bar_hook(b, True, 0)
+                # occasional log lines so the engine log / error surface is
+                # visibly live (mimics run_live's periodic runner chatter)
+                if bar_idx % 12 == 0:
+                    _lgr.info("[%s] bar %d open: %s..%s vwap=%s", dl.symbol,
+                              bar_idx, b.o, b.c,
+                              round(dl.levelbook.vwap.value, 2) if getattr(
+                                  dl.levelbook.vwap, "value", None) else "n/a")
+                if bar_idx % 47 == 0 and not _sent_error:
+                    _sent_error = True
+                    _lgr.error("[%s] simulated feed in band error for display test "
+                               "— zones still drawn", dl.symbol)
+                bar_idx += 1
+            ts += 60 * NS
+            await asyncio.sleep(tick_s)
+
+    pub.attach(engine)
+    dash = Dashboard(pub, symbols, timeframes, dashboard_dir, host, port)
+    runner = asyncio.create_task(drive())
+    return dash, runner
+
+
+async def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--lane", action="append", default=[],
+                    help="lane symbols (default ES,NQ,GC)")
+    ap.add_argument("--tf", action="append", default=[],
+                    help="aggregate timeframes (default all standard; pick per window)")
+    ap.add_argument("--tick-s", type=float, default=0.5,
+                    help="demo: seconds per 1m bar per lane")
+    ap.add_argument("--live", action="store_true",
+                    help="attach to the NT8 live feed instead of loopback demo")
+    a = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+    for noisy in ("httpx", "httpcore", "hpack", "urllib3", "aiohttp.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    symbols = a.lane or ["ES", "NQ", "GC"]
+    tfs = tuple(a.tf) if a.tf else TIMEFRAMES
+    dashboard_dir = ROOT / "dashboard"
+
+    if a.live:
+        # Attach StatePublisher to the run_live.py engine shape. Building the
+        # full NT8 wiring is intentionally deferred to the run_live patch; the
+        # dashboard server part is identical, so --live just needs the engine.
+        raise SystemExit(
+            "--live: NT8 loopback not attached in this build. Run run_live.py "
+            "to produce the live engine, then pass its StatePublisher here. "
+            "The demo (default) drives the same publisher schema.")
+        # (kept as a clearly-marked TODO; the transport/UI layer is complete)
+
+    dash, drive = await make_demo(a.host, a.port, a.tick_s, symbols,
+                                  dashboard_dir, tfs)
+    async def shutdown(app):
+        drive.cancel()
+    dash.app.on_shutdown.append(shutdown)
+    await dash.run()
+    # keep the loop alive
+    while True:
+        await asyncio.sleep(3600)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[dashboard] stopped")

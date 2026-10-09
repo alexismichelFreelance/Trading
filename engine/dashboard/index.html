@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>es-engine dashboard</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <strong>es-engine</strong>
+    <span class="sub">inspect-first dashboard</span>
+  </div>
+  <div class="controls">
+    <label>symbol
+      <select id="laneSel"></select>
+    </label>
+    <label>timeframe
+      <select id="tfSel"></select>
+    </label>
+    <button id="linkBtn" title="copy this window's URL">↗ window link</button>
+  </div>
+  <div class="status" id="status">connecting…</div>
+</header>
+
+<main>
+  <section id="chartWrap">
+    <div id="chart"></div>
+    <div id="chartLegend"></div>
+    <canvas id="zoneCanvas"></canvas>
+  </section>
+
+  <aside id="side">
+    <div class="panel" id="positionsPanel">
+      <h3>positions</h3>
+      <div id="positions"></div>
+    </div>
+    <div class="panel" id="indicatorsPanel">
+      <h3>indicators <span class="hint">from engine</span></h3>
+      <div id="indicators"></div>
+    </div>
+  </aside>
+</main>
+
+<section id="logPanel">
+  <h3>engine log <span id="errorBadge" class="badge hidden"></span></h3>
+  <div id="log"></div>
+</section>
+
+<script src="/vendor/lightweight-charts.standalone.production.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
