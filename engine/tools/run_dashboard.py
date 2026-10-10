@@ -455,8 +455,10 @@ class Dashboard:
                 payload = m.get("payload", {})
                 if kind == "bar":
                     bar = payload.get("bar", {})
-                    # deliver only this window's timeframe
-                    if (bar or {}).get("tf") != tf:
+                    # deliver only this window's lane AND timeframe (bar deltas
+                    # are broadcast for every lane at the same ts, so without an
+                    # explicit lane check a window would mix GC/NQ bars in)
+                    if m.get("lane") != symbol or (bar or {}).get("tf") != tf:
                         continue
                     await ws.send_json({"type": "delta", "symbol": symbol,
                                         "kind": "bar", "payload": {"bar": bar}})
