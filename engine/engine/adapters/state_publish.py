@@ -49,7 +49,8 @@ from dataclasses import dataclass, field
 from ..core.events import Bar, Fill
 from ..features.bars import BarAggregator
 from ..features.state_store import StateStore
-from .state_sources import (indicators_from_levelbook, positions_from_strategies,
+from .state_sources import (gamma_map_from, indicators_from_levelbook,
+                            positions_from_strategies, strategies_roster_from,
                             zones_from_view)
 
 log = logging.getLogger("engine.state_publish")
@@ -64,6 +65,7 @@ class LaneSource:
     symbol: str
     zoneview: object = None          # painters.ZoneView  (zones)
     levelbook: object = None         # features.level_book.LevelBook (indicators)
+    gamma_curve: object = None       # features.gamma_curve.GammaCurve (multi-wall)
     strategies: list = field(default_factory=list)   # chart_marks() -> rails
     color: str = ""
 
@@ -189,6 +191,16 @@ class StatePublisher:
             return
         for ind in indicators_from_levelbook(src.levelbook, bar["ts"]):
             self.broadcast(self.store.apply_indicator(sym, ind))
+        # structured dealer-gamma map at the LIVE close (regime crosses flips)
+        price = bar["c"]
+        gm = gamma_map_from(src.gamma_curve, src.levelbook, price)
+        d = self.store.apply_gamma(sym, gm)
+        if d is not None:
+            self.broadcast(d)
+        # strategy roster with show/hide + per-strategy marks
+        d = self.store.apply_roster(sym, strategies_roster_from(src.strategies))
+        if d is not None:
+            self.broadcast(d)
         zones = zones_from_view(src.zoneview, bar["ts"])
         self.broadcast(self.store.apply_zones(sym, zones))
         await self._publish_positions(sym)

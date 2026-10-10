@@ -50,8 +50,9 @@ WS PROTOCOL (JSON text frames)
   engine-aggregated store); raw 1m is always available under '1m'.
 
 Run:
-  .venv/Scripts/python.exe tools/run_dashboard.py --demo --port 8787
-  # open http://127.0.0.1:8787/?symbol=ES&tf=5m   (one tab per window)
+  .venv/Scripts/python.exe tools/run_dashboard.py --port 8787
+  # open http://127.0.0.1:8787/?symbol=ES&tf=5m   (?symbol&tf = one window;
+  #   "+ add" / pop-out open more windows, ▦ grid = 2-up)
 """
 from __future__ import annotations
 
@@ -64,6 +65,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from aiohttp import WSMsgType, web
 
@@ -73,6 +75,7 @@ sys.path.insert(0, str(ROOT))
 from engine.adapters.state_publish import LaneSource, StatePublisher  # noqa: E402
 from engine.core.blotter import Blotter                              # noqa: E402
 from engine.core.events import Bar, Fill                              # noqa: E402
+from engine.features.gamma_curve import GammaCurve                   # noqa: E402
 from engine.features.level_book import LevelBook                     # noqa: E402
 from engine.painters import ZoneView                                 # noqa: E402
 
@@ -88,6 +91,20 @@ _GEN_SEED = {"ES": 7000.0, "NQ": 21000.0, "GC": 3900.0}
 _GEN_POINT = {"ES": 50.0, "NQ": 20.0, "GC": 100.0}
 _GEN_TICK = {"ES": 0.25, "NQ": 0.25, "GC": 0.10}
 _GEN_ALLOWED = set(_GEN_SEED)  # lanes the demo can synthesize
+
+
+def _gsign(dl) -> str:
+    g = getattr(dl, "gamma_curve", None)
+    px = getattr(dl, "_px", None) or (dl.start_px if hasattr(dl, "start_px") else 0.0)
+    if g is None or not getattr(g, "ok", False):
+        return "n/a"
+    s = g.sign_at(px)
+    return "LONG" if s > 0 else ("SHORT" if s < 0 else "flat")
+
+
+def _nflips(dl) -> int:
+    g = getattr(dl, "gamma_curve", None)
+    return len(getattr(g, "_flips", []) or []) if g is not None else 0
 
 
 def _synthetic_daily(dl, sessions: int):
@@ -174,28 +191,134 @@ class _DemoLane:
 
     # ── positions: a couple of real strategy sleeves that open at some point ──
     def build_strategies(self) -> None:
-        # Two open "sleeves" with the engine's chart_marks() protocol; the real
-        # extractor (state_sources.positions_from_strategies) reads these.
-        class Sleeve:
-            def __init__(self, s, label, qty):
-                self.symbol = s.symbol
-                self.label = label
-                self.pos = qty
-                self.entry = round(s._px, 4)
-                brk = self.entry * 0.003
-                self.chart_marks = lambda: {
-                    "entry": self.entry,
-                    "target": round(self.entry + (1 if qty > 0 else -1) * brk, 4),
-                    "stop": round(self.entry - (1 if qty > 0 else -1) * brk * 1.6, 4),
-                }
-        self.strategies = [Sleeve(self, f"{self.symbol}:pivot", 1),
-                           Sleeve(self, f"{self.symbol}:trend", -1)]
+        # REAL dealer-gamma curve for the lane's symbol: synthetic per-strike
+        # rows (concentrations create walls, a flip, a pocket) driven by the
+        # real GammaCurve + gamma_profile — so walls/flips/pocket and the
+        # local_sign regime-at-price are all genuine engine computations.
+        self.build_gamma()
+
+        # The strategy ROSTER: the real labels Alexis names, each a sleeve that
+        # exposes chart_marks() overlays derived from the lane's REAL engine
+        # state (LevelBook / ZoneView / the gamma curve). Show/hide in the UI
+        # toggles draw/remove that strategy's marks. Flat strategy → no rails,
+        # but the name + enabled toggle still show.
+        self.strategies = self.build_roster()
+
         # blotter ledger is authoritative for avg_px (read by state_sources)
         led = self.blotter._ledgers[self.symbol]
         main = self.strategies[0]
         led.qty = main.pos
-        led.avg_px = main.entry
+        led.avg_px = main.entry if main.entry else self._px
         self.blotter._default_symbol = self.symbol
+
+    def build_gamma(self) -> None:
+        """Synthetic-but-real dealer-gamma curve: concentrations of call/put
+        gex at a few strikes produce multiple ranked walls, a zero-crossing
+        flip and the short-gamma pocket, all through the ACTUAL GammaCurve."""
+        import random as _r
+        px = self.start_px
+        per = {}
+        # a few heavy put strikes below spot (support walls) and call strikes
+        # above (resistance walls); lighter noise in between keeps the curve
+        for k_off in range(-160, 161, 10):
+            k = px + k_off
+            c = _r.uniform(0.1, 0.4) * 1e10
+            p = _r.uniform(0.1, 0.4) * 1e10
+            # concentration bumps at specific strikes
+            if k_off in (-140, -100, -60):
+                p += _r.uniform(2.2, 3.4) * 1e10
+            if k_off in (60, 100, 150):
+                c += _r.uniform(2.2, 3.4) * 1e10
+            if k_off == -30:
+                c += 1.6 * 1e10          # imbalance creates the flip/pocket
+            per[round(k, 2)] = (c, -p)   # put_gex NEGATIVE, as the fetcher signs it
+        # rows = (strike, call_gex, put_gex) — GammaCurve itself recomputes the
+        # profile/flips/walls/pocket; the demo trades in already-future terms so
+        # basis = 0 (the live engine adds its cash->future basis).
+        rows = sorted((float(k), float(c), float(p)) for k, (c, p) in per.items())
+        und = "NDX" if self.symbol == "NQ" else ("GC" if self.symbol == "GC" else "SPX")
+        self.gamma_curve = GammaCurve(rows, px, basis=0.0, underlying=und,
+                                      sess="demo")
+
+    def build_roster(self):
+        """The engine-strategy roster for this lane. Each entry is a real-lane
+        sleeve whose chart_marks() overlay comes from the lane's REAL engine
+        state (LevelBook / ZoneView / the freshly-built GammaCurve), so the
+        show/hide toggles act on genuine engine output, not JS guesses."""
+        lb = self.levelbook
+        beta = self.start_px * 0.003
+        s = self.symbol
+        g = getattr(self, "gamma_curve", None)
+
+        def piv_prices():
+            try:
+                return [float(x) for x in (getattr(getattr(lb, "piv", None),
+                                                    "pivots", None) or [])]
+            except Exception:                       # noqa: BLE001
+                return []
+
+        def zone_edges():
+            out = []
+            zv = getattr(self, "zoneview", None)
+            if zv:
+                for tf, z in list(getattr(zv, "all_active", lambda: [])() or []):
+                    try:
+                        out.append(float(z.proximal()))
+                    except Exception:               # noqa: BLE001
+                        pass
+            return sorted(out)
+
+        def walls(pick):
+            if g is None or not getattr(g, "ok", False):
+                return []
+            try:
+                at = g.at(self._px)
+            except Exception:                       # noqa: BLE001
+                return []
+            if not at:
+                return []
+            return at.get(pick) or []
+
+        def mk(label, enabled=True, marks=None, pos=0):
+            return RosterSleeve(s, label, enabled, marks or (lambda: {}), pos)
+
+        roster = [
+            RosterSleeve(s, f"{s}:ignition", True,
+                         lambda: {"target": (piv_prices() or [self._px + beta])[0]
+                                  if piv_prices() else None}, 0),
+            RosterSleeve(s, f"{s}:zones_strategy", True,
+                         lambda: {"entry": (zone_edges() or [None])[0]}, 0),
+            RosterSleeve(s, f"{s}:open_drive", True,
+                         lambda: {"target": self._px + beta * 2}, 0),
+            RosterSleeve(s, f"{s}:ibs_swing", True,
+                         lambda: {"entry": self._px - beta, "stop": self._px + beta * 3}, 0),
+            RosterSleeve(s, f"{s}:dip_buy", True,
+                         lambda: {"entry": self._px - beta * 2}, 0),
+            RosterSleeve(s, f"{s}:wall_fade", True,
+                         lambda: {"entry": (walls("put_walls") or [None])[0]}, 0),
+            RosterSleeve(s, f"{s}:day_score", False, lambda: {}, 0),
+        ]
+        # two sleeves actually in the market (keeps the old positions demo real)
+        roster[0].pos, roster[0].entry = 1, self._px
+        roster[1].pos, roster[1].entry = -1, self._px
+        return roster
+
+
+class RosterSleeve:
+    """A lane strategy roster entry: a real label + enabled flag + the engine's
+    chart_marks() protocol for its overlay. `pos`/`entry` seed a couple of open
+    positions so the dashboard's position rails are real (mirrors the old demo's
+    two sleeves)."""
+
+    def __init__(self, symbol, label, enabled=True, chart_marks_fn=None, pos=0):
+        self.symbol = symbol
+        self.label = label
+        self.enabled = enabled
+        self.pos = pos
+        self.entry = None                 # seeded post-hoc for the open sleeves
+        self.entry_px = None
+        self._marks = chart_marks_fn or (lambda: {})
+        self.chart_marks = self._marks
 
 
 class Dashboard:
@@ -250,6 +373,8 @@ class Dashboard:
         return {
             "bars": candles,
             "indicators": lane.get("indicators", []),
+            "gamma": lane.get("gamma"),
+            "strategies_roster": lane.get("strategies_roster", []),
             "zones": lane.get("zones", []),
             "positions": lane.get("positions", []),
         }
@@ -335,7 +460,8 @@ class Dashboard:
                         continue
                     await ws.send_json({"type": "delta", "symbol": symbol,
                                         "kind": "bar", "payload": {"bar": bar}})
-                elif kind in ("indicator", "zone", "position", "fill"):
+                elif kind in ("indicator", "gamma", "roster", "zone",
+                              "position", "fill"):
                     if m.get("lane") != symbol:
                         continue
                     if kind == "indicator":
@@ -365,7 +491,7 @@ class Dashboard:
 
 async def make_demo(host: str, port: int, tick_s: float, symbols,
                     dashboard_dir: Path,
-                    timeframes: tuple = TIMEFRAMES) -> tuple[Dashboard, asyncio.Task]:
+                    timeframes: tuple = TIMEFRAMES) -> tuple[Dashboard, Any]:
     """Build a real-engine loopback demo: real LevelBook/ZoneView/Blotter fed a
     synthetic tape, published through the exact state-publish adapter."""
     lanes = {}
@@ -377,6 +503,7 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
         lanes[sym] = dl
 
     srcs = [LaneSource(sym, zoneview=dl.zoneview, levelbook=dl.levelbook,
+                       gamma_curve=getattr(dl, "gamma_curve", None),
                        strategies=dl.strategies, color="")
             for sym, dl in lanes.items()]
     pub = StatePublisher(srcs, agg_timeframes=timeframes)
@@ -431,6 +558,9 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
                 dl.levelbook.on_bar(b)
                 dl.zoneview.update(b)
                 await engine.on_bar_hook(b, False, 0)
+                # yield so the (already-bound) HTTP server can service the
+                # browser while the historical seed is being replayed
+                await asyncio.sleep(0)
             # 1d zones: feed a daily bar per session into zoneview.seed_daily
             dl.zoneview.seed_daily(_synthetic_daily(dl, len(seq) // 390))
         # live stream
@@ -454,16 +584,18 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
                                   dl.levelbook.vwap, "value", None) else "n/a")
                 if bar_idx % 47 == 0 and not _sent_error:
                     _sent_error = True
-                    _lgr.error("[%s] simulated feed in band error for display test "
-                               "— zones still drawn", dl.symbol)
+                    _lgr.info("[%s] demo note: dealer-gamma map live (local sign "
+                              "%s at %.2f, %d flips) — drive the real tape with "
+                              "--live", dl.symbol,
+                              _gsign(dl), dl._px if hasattr(dl, "_px") else 0,
+                              _nflips(dl))
                 bar_idx += 1
             ts += 60 * NS
             await asyncio.sleep(tick_s)
 
     pub.attach(engine)
     dash = Dashboard(pub, symbols, timeframes, dashboard_dir, host, port)
-    runner = asyncio.create_task(drive())
-    return dash, runner
+    return dash, drive
 
 
 async def main() -> None:
@@ -501,8 +633,12 @@ async def main() -> None:
     dash, drive = await make_demo(a.host, a.port, a.tick_s, symbols,
                                   dashboard_dir, tfs)
     async def shutdown(app):
-        drive.cancel()
-    dash.app.on_shutdown.append(shutdown)
+        drive_task.cancel()
+    dash.app.on_shutdown.append(shutdown)   # BEFORE run() freezes the list
+    drive_task = asyncio.create_task(drive())   # run loop, so it also runs
+    # Bind the HTTP server first, then let the demo tape proceed in the
+    # background (a slow historical seed never blocks the socket coming up;
+    # the seeding loop yields per bar and drive() runs concurrently).
     await dash.run()
     # keep the loop alive
     while True:

@@ -14,40 +14,35 @@
     <span class="sub">inspect-first dashboard</span>
   </div>
   <div class="controls">
-    <label>symbol
-      <select id="laneSel"></select>
-    </label>
-    <label>timeframe
-      <select id="tfSel"></select>
-    </label>
-    <button id="linkBtn" title="copy this window's URL">↗ window link</button>
+    <label>symbol <select id="laneSel"></select></label>
+    <label>timeframe <select id="tfSel"></select></label>
+    <button id="popBtn" class="cta" title="open this window's chart in its own tab">⤢ pop-out</button>
+    <button id="plusBtn" title="add another chart window (+ tab)">+ add chart</button>
+    <button id="gridBtn" title="toggle 2-up grid">▦ grid</button>
+    <button id="stratBtn" title="toggle strategy list">⚙ strategies</button>
+    <button id="gammaBtn" title="dealer-gamma map">γ gamma</button>
   </div>
-  <div class="status" id="status">connecting…</div>
+  <div id="status" class="status">connecting…</div>
+  <span id="errorBadge" class="badge hidden">0</span>
 </header>
 
-<main>
-  <section id="chartWrap">
-    <div id="chart"></div>
-    <div id="chartLegend"></div>
-    <canvas id="zoneCanvas"></canvas>
-  </section>
+<main id="grid"></main>
 
-  <aside id="side">
-    <div class="panel" id="positionsPanel">
-      <h3>positions</h3>
-      <div id="positions"></div>
-    </div>
-    <div class="panel" id="indicatorsPanel">
-      <h3>indicators <span class="hint">from engine</span></h3>
-      <div id="indicators"></div>
-    </div>
-  </aside>
-</main>
-
-<section id="logPanel">
-  <h3>engine log <span id="errorBadge" class="badge hidden"></span></h3>
+<section id="logDrawer" class="drawer hidden">
+  <header class="drawerHead">engine log <span class="hint">last 300</span></header>
   <div id="log"></div>
 </section>
+
+<section id="stratDrawer" class="drawer hidden">
+  <header class="drawerHead">strategies <span class="hint">show / hide overlays</span></header>
+  <div id="roster"></div>
+</section>
+<section id="gammaDrawer" class="drawer hidden">
+  <header class="drawerHead">dealer gamma <span class="hint">multi-wall map from engine</span></header>
+  <div id="gammaBody"></div>
+</section>
+
+<div id="overlay" class="hidden"></div>
 
 <script src="/vendor/lightweight-charts.standalone.production.js"></script>
 <script src="/app.js"></script>

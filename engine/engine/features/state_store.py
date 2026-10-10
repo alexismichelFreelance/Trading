@@ -79,6 +79,8 @@ class StateStore:
                 "bars": {},                       # tf -> deque
                 "indicators": {},                 # id -> {"id","producer","label",
                                                   #        "unit","points": deque}
+                "gamma": None,                    # GammaMap (structured, per lane)
+                "strategies_roster": [],          # [RosterEntry]
                 "zones": {},                      # id -> ZoneDict
                 "positions": {},                  # sleeve -> PositionDict
                 "extra": {},                      # anything a lane wants to keep
@@ -129,6 +131,28 @@ class StateStore:
                    "points": [{"ts": p["ts"], "v": p["v"]}
                               for p in pts["points"].values()]}
         return self._next("indicator", lane, payload)
+
+    def apply_gamma(self, lane: str, gamma_map: dict | None) -> dict | None:
+        """Replace the lane's structured dealer-gamma map. The map carries the
+        regime AT A PRICE, so it is refreshed per bar (the publisher recomputes
+        it at the latest close — prices cross flips through the day). Returns a
+        'gamma' delta only when the map actually changed; None leaves state
+        alone (no duplicate deltas when the map is unchanged)."""
+        l = self._lane(lane)
+        if l["gamma"] == gamma_map:
+            return None
+        l["gamma"] = gamma_map
+        return self._next("gamma", lane, {"gamma": gamma_map})
+
+    def apply_roster(self, lane: str, roster: list) -> dict | None:
+        """Replace the lane's strategy-roster list. Returns a 'roster' delta
+        when the list changed (binary comparison) so identical broadcasts are
+        deduped. Roster is additive + idempotent; see state_sources.strategies_roster_from."""
+        l = self._lane(lane)
+        if l["strategies_roster"] == roster:
+            return None
+        l["strategies_roster"] = list(roster)
+        return self._next("roster", lane, {"roster": list(roster)})
 
     def apply_zones(self, lane: str, zones: list) -> dict:
         """Replace the lane's zone set with `zones` (each a ZoneDict). Returns a
@@ -187,6 +211,8 @@ class StateStore:
                 "bars": {tf: list(q) for tf, q in l["bars"].items()},
                 "indicators": [self._series_dict(sid, v) for sid, v
                                in sorted(l["indicators"].items())],
+                "gamma": l["gamma"],
+                "strategies_roster": list(l["strategies_roster"]),
                 "zones": sorted(l["zones"].values(),
                                 key=lambda z: (z.get("tf", ""), z.get("formed_ts", 0))),
                 "positions": sorted(l["positions"].values(),

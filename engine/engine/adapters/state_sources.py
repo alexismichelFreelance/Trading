@@ -82,6 +82,38 @@ def _round(x) -> float | None:
     return round(float(x), 4)
 
 
+def _vwap_bands(vwap, bar_ts: int) -> list:
+    """The anchored-VWAP LINE plus its +-2s / +-3s band boundaries as point
+    series. Every value is computed by the engine's AnchoredVWAP
+    (.value / .sigma / .band(k)); JS only pairs hi/lo to draw filled bands.
+    One point per bar, ts-stamped — the line accumulates across the session."""
+    out = []
+    if vwap is None:
+        return out
+    v = vwap.value
+    if v is None or v != v:                    # no volume -> no line yet
+        return out
+    ts = int(bar_ts)
+    out.append({"id": "vwap", "producer": "levelbook:avwap",
+                "label": "anchored VWAP", "unit": "price",
+                "points": [{"ts": ts, "v": _round(v)}]})
+    lo2, hi2 = vwap.band(2.0)
+    out.append({"id": "vwap_2s_hi", "producer": "levelbook:avwap",
+                "label": "VWAP +2σ", "unit": "price",
+                "points": [{"ts": ts, "v": _round(hi2)}]})
+    out.append({"id": "vwap_2s_lo", "producer": "levelbook:avwap",
+                "label": "VWAP −2σ", "unit": "price",
+                "points": [{"ts": ts, "v": _round(lo2)}]})
+    lo3, hi3 = vwap.band(3.0)
+    out.append({"id": "vwap_3s_hi", "producer": "levelbook:avwap",
+                "label": "VWAP +3σ", "unit": "price",
+                "points": [{"ts": ts, "v": _round(hi3)}]})
+    out.append({"id": "vwap_3s_lo", "producer": "levelbook:avwap",
+                "label": "VWAP −3σ", "unit": "price",
+                "points": [{"ts": ts, "v": _round(lo3)}]})
+    return out
+
+
 def indicators_from_levelbook(levelbook, bar_ts: int) -> list:
     """Indicator point series from a LevelBook (the one object that holds the
     engine's merged pivots + VWAP + gamma + zones). Empty series are omitted."""
@@ -90,14 +122,8 @@ def indicators_from_levelbook(levelbook, bar_ts: int) -> list:
         return out
     sess = _session_ts(bar_ts)
 
-    # VWAP — a real time series: one point per bar close, accumulating the line.
-    v = getattr(levelbook, "vwap", None)
-    if v is not None:
-        val = _round(v.value)
-        if val is not None:
-            out.append({"id": "vwap", "producer": "levelbook:avwap",
-                        "label": "anchored VWAP", "unit": "price",
-                        "points": [{"ts": int(bar_ts), "v": val}]})
+    # VWAP — a real time series (one point per bar close): the line + bands.
+    out += _vwap_bands(getattr(levelbook, "vwap", None), bar_ts)
 
     # Floor pivots — static intraday grid, stamped at the session.
     piv = getattr(getattr(levelbook, "piv", None), "pivots", None)
@@ -185,5 +211,103 @@ def position_from_blotter(blotter, symbol: str, mark=None) -> list:
     return out
 
 
-__all__ = ["zones_from_view", "indicators_from_levelbook",
-           "positions_from_strategies", "position_from_blotter", "_session_ts"]
+def _curve_from(gamma_curve) -> list:
+    """The full dealer-gamma curve as [[strike, net_gex, cum_gex], ...] straight
+    from the engine's GammaCurve profile (not every use needs it, but it is
+    drawable and costs nothing to publish)."""
+    prof = getattr(gamma_curve, "_prof", {}) or {}
+    curve = prof.get("curve") or []
+    return [[_round(k), _round(n), _round(c)] for k, n, c in curve]
+
+
+def _n_strikes(gamma_curve) -> int:
+    prof = getattr(gamma_curve, "_prof", {}) or {}
+    return int(len(prof.get("curve") or []))
+
+
+def gamma_map_from(gamma_curve, levelbook, price: float) -> dict | None:
+    """The structured dealer-gamma map at `price` (the LIVE price — so the
+    regime is answered WHERE PRICE IS, and toggles as price crosses a flip
+    during the day). Reads the real GammaCurve (multi flips, ranked walls,
+    pocket, the full curve); falls back to the flat LevelBook dict.
+
+    Returns None only when there is no gamma source at all (fail-open)."""
+    if gamma_curve is not None and getattr(gamma_curve, "ok", False):
+        at = gamma_curve.at(price)
+        if at is None:
+            return None
+        return {
+            "kind": "curve",
+            "ok": True,
+            "sess": getattr(gamma_curve, "sess", ""),
+            "underlying": getattr(gamma_curve, "underlying", ""),
+            "basis": _round(getattr(gamma_curve, "basis", 0.0)),
+            "price": _round(price),
+            "flips": [_round(f) for f in at.get("flips", [])],
+            "flip": _round(at.get("flip")),
+            "call_walls": [[_round(k), None] for k in at.get("call_walls", [])][:5],
+            "put_walls": [[_round(k), None] for k in at.get("put_walls", [])][:5],
+            "walls": [[_round(k), _round(n)] for k, n in at.get("walls", [])][:8],
+            "pocket": [_round(p) for p in at.get("pocket", (None, None))],
+            "local_sign": int(at.get("local_sign", 0)),
+            "total_sign": int(at.get("total_sign", 0)),
+            "net_at_price": _round(at.get("cum")),
+            "dist_to_edge": _round(gamma_curve.dist_to_edge(price)),
+            "curve": _curve_from(gamma_curve),
+            "n_strikes": _n_strikes(gamma_curve),
+        }
+    # FLAT fallback: the daily row (one put wall, one call wall, one flip).
+    g = getattr(levelbook, "gamma", None) if levelbook else None
+    if isinstance(g, dict):
+        return {
+            "kind": "flat",
+            "ok": bool(g.get("put_wall") or g.get("call_wall") or g.get("flip")),
+            "sess": g.get("sess", ""),
+            "underlying": g.get("underlying", ""),
+            "basis": _round(g.get("basis")),
+            "price": _round(price),
+            "flips": [_round(g["flip"])] if g.get("flip") is not None else [],
+            "flip": _round(g.get("flip")),
+            "call_walls": [[_round(g["call_wall"]), None]] if g.get("call_wall") else [],
+            "put_walls": [[_round(g["put_wall"]), None]] if g.get("put_wall") else [],
+            "walls": [],
+            "pocket": [None, None],
+            "local_sign": int(g.get("net_sign", 0)),
+            "total_sign": int(g.get("net_sign", 0)),
+            "net_at_price": None,
+            "dist_to_edge": None,
+            "curve": [],
+            "n_strikes": 0,
+        }
+    return None
+
+
+def strategies_roster_from(strategies) -> list:
+    """The engine's STRATEGY ROSTER (labels + enabled flags + per-strategy
+    chart marks), as shown in the dashboard's strategy list with show/hide.
+
+    Reads the real strategy objects on the lane: each entry is one engine
+    strategy with its roster `label`, whether it is `enabled`, its open
+    `qty`/`entry_px`, and the declared chart_marks() overlay it draws on the
+    chart (entry / target / stop). A strategy that is flat carries no mark and
+    contributes its name only — its toggle still shows/hides its category."""
+    out = []
+    for s in strategies or []:
+        marks = getattr(s, "chart_marks", None)
+        marks = marks() if callable(marks) else {}
+        qty = getattr(s, "pos", None) or getattr(s, "position", None) or 0
+        out.append({
+            "label": getattr(s, "label", "") or type(s).__name__,
+            "enabled": bool(getattr(s, "enabled", True)),
+            "qty": int(qty),
+            "entry_px": _round(getattr(s, "entry_px", None)),
+            "entry": _round(marks.get("entry")),
+            "target": _round(marks.get("target")),
+            "stop": _round(marks.get("stop")),
+        })
+    return out
+
+
+__all__ = ["zones_from_view", "indicators_from_levelbook", "gamma_map_from",
+           "strategies_roster_from", "positions_from_strategies",
+           "position_from_blotter", "_session_ts"]
