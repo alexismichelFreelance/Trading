@@ -72,6 +72,13 @@ class SocketBroker:
             log.info("%s broker connected %s:%d (%s)%s", self.name, self.host,
                      self.port, self.account,
                      f" [reconnect #{self.reconnects}]" if self.reconnects else "")
+            # EngineAddOn subscribes instruments at runtime: tell it which symbol
+            # this lane wants. Nothing to do for legacy relays (they ignore it).
+            # Send inside a fresh connection so a dropped subscription is re-armed
+            # whenever the engine reconnects.
+            payload = encode({"t": "sub", "symbol": self.symbol})
+            self._writer.write(payload)
+            await asyncio.wait_for(self._writer.drain(), self.send_timeout)
 
     @property
     def reconnects(self) -> int:

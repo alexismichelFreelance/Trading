@@ -58,6 +58,31 @@ log = logging.getLogger("engine.state_publish")
 NS = 1_000_000_000
 
 
+def _combine(prev, own):
+    """Chain a previously-attached async sink (the NT8 painter's) with our own
+    so BOTH receive the engine event. The painter and this publisher are both
+    observers of the same engine hooks; the LAST one to be assigned (us, after
+    run_live.py wires the painter) must not silently steal them from the first.
+
+    Prior sink runs FIRST, then our own work. An exception from the prior sink
+    must never stop publication (fail-open, the same rule the engine's sink
+    path already applies), and synchronous sinks are awaited transparently so
+    a mix of coroutine and plain functions composes cleanly."""
+    if prev is None:
+        return own
+
+    async def _both(*args, **kwargs):
+        try:
+            r = prev(*args, **kwargs)
+            if asyncio.iscoroutine(r):
+                await r
+        except Exception:                             # noqa: BLE001
+            pass
+        await own(*args, **kwargs)
+
+    return _both
+
+
 @dataclass
 class LaneSource:
     """The live engine objects whose state a lane publishes. Anything left None
@@ -137,14 +162,19 @@ class StatePublisher:
     def attach(self, engine) -> None:
         """Hook the engine's existing observer callbacks (the same ones the
         painter uses) into this publisher. Non-mutating to engines trading path:
-        these are side-effect sinks, drained off the hot path."""
+        these are side-effect sinks, drained off the hot path. Any sink already
+        attached (e.g. run_live.py's painter) is CHAINED, not replaced — both
+        keep receiving events (see `_combine`)."""
         self._engine = engine
-        engine.on_bar_hook = self._on_bar
-        engine.on_live_fill = self._on_fill
-        engine.on_paper_fill = self._on_fill
-        engine.on_session_rollover = self._on_session
-        engine.on_feed_disconnect = self._on_disconnect
-        engine.on_lane_stale = self._on_lane_stale
+        engine.on_bar_hook = _combine(engine.on_bar_hook, self._on_bar)
+        engine.on_live_fill = _combine(engine.on_live_fill, self._on_fill)
+        engine.on_paper_fill = _combine(engine.on_paper_fill, self._on_fill)
+        engine.on_session_rollover = _combine(engine.on_session_rollover,
+                                              self._on_session)
+        engine.on_feed_disconnect = _combine(engine.on_feed_disconnect,
+                                             self._on_disconnect)
+        engine.on_lane_stale = _combine(engine.on_lane_stale,
+                                        self._on_lane_stale)
         self._log_h = _LogEmit(self.store, self.broadcast)
         self._started = True
 

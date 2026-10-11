@@ -921,6 +921,10 @@ async def main() -> None:
     ap.add_argument("--strategies", default="",
                     help="DEPRECATED alias for --live (kept for old commands)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds (0 = run until Ctrl-C)")
+    ap.add_argument("--markets", default="",
+                    help="single-socket demux: markets to stream (comma list). "
+                         "When set, one NinjaTraderFeed carries all lanes over "
+                         "--market-port (chartless EngineAddOn).")
     ap.add_argument("--instruments", default="",
                     help="subset of instrument lanes to run (e.g. ES or ES,NQ). "
                          "DEFAULT (empty) = every lane in --live-config (config/live.yaml).")
@@ -928,6 +932,14 @@ async def main() -> None:
                     help="per-instrument lane config (ports, paper/live rosters)")
     ap.add_argument("--market-port", type=int, default=36001)
     ap.add_argument("--broker-port", type=int, default=36002)
+    ap.add_argument("--dashboard", action=argparse.BooleanOptionalAction, default=True,
+                    help="attach StatePublisher to the engine and serve the embedded "
+                         "web dashboard (default ON; --no-dashboard to disable)")
+    ap.add_argument("--dashboard-host", default="127.0.0.1")
+    ap.add_argument("--dashboard-port", type=int, default=8787)
+    ap.add_argument("--dashboard-tf", action="append", default=[],
+                    help="aggregate candle timeframe(s) for the dashboard "
+                         "(default 5m; raw 1m is always served)")
     ap.add_argument("--draw-port", type=int, default=36004,
                     help="EngineOverlay INDICATOR's draw socket (drawing lives in an "
                          "indicator, on the chart, so it never hides your orders)")
@@ -1032,6 +1044,21 @@ async def main() -> None:
     rawcaps: list = []
     lane_meta: dict = {}         # sym -> {draw_port, roster, lc}
     blot: Blotter | None = None
+    # single-socket demux mode (--markets): ONE NinjaTraderFeed carries every
+    # lane over the shared --market-port, each wire message tagged with its
+    # symbol (chartless EngineAddOn). Recording/raw-capture wrap per-lane feeds,
+    # so in this mode the single socket is fed read-only (read path only).
+    demux = [s.strip() for s in a.markets.split(",") if s.strip()]
+    if demux:
+        _rec, _raw = a.record, a.raw_capture
+        if _raw or _rec:
+            log.warning("single-socket (--markets) mode ignores --record/--raw-capture: "
+                        "not supported on a demux feed; running read-only")
+            a.record, a.raw_capture = False, False
+        feeds.append(NinjaTraderFeed("127.0.0.1", a.market_port,
+                                     symbols=demux, emit_depth=False))
+        print(f"[addon] one demux socket {a.market_port} -> markets {demux} "
+              f"(broker {a.broker_port})")
     for sym, lc in lanes_cfg.items():
         spec = INSTRUMENTS.get(sym)
         if spec is None:
@@ -1068,21 +1095,27 @@ async def main() -> None:
         # 15.5M daily rows into a 272M-row table that nothing reads and that
         # took QuestDB down mid-session.
         cap_depth = a.raw_capture and bool(lc.get("capture_depth", True))
-        feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),
-                               symbol=sym, emit_depth=cap_depth)
-        if a.raw_capture:                            # innermost: sees raw depth first
-            from engine.adapters.feeds.raw_capture import RawCaptureTee
-            feed = RawCaptureTee(feed, symbol=sym, capture_depth=cap_depth)
-            rawcaps.append(feed)
-            log.info("raw capture [%s]: trades ON, depth %s", sym,
-                     "ON" if cap_depth else "OFF (live.yaml capture_depth)")
-        if a.record:
-            rec = RecorderTee(feed, AsyncQuestDB(), symbol=sym)
-            recorders.append(rec)
-            feed = rec
-        feeds.append(feed)
-        brokers[sym] = NinjaTraderBroker("127.0.0.1", int(lc.get("broker_port", 36002)),
-                                         symbol=sym)
+        if demux:
+            # single-socket mode: the demux feed above carries this lane;
+            # per-lane broker just arms the shared socket for this symbol.
+            brokers[sym] = NinjaTraderBroker("127.0.0.1", a.broker_port,
+                                             symbol=sym)
+        else:
+            feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),
+                                   symbol=sym, emit_depth=cap_depth)
+            if a.raw_capture:                            # innermost: sees raw depth first
+                from engine.adapters.feeds.raw_capture import RawCaptureTee
+                feed = RawCaptureTee(feed, symbol=sym, capture_depth=cap_depth)
+                rawcaps.append(feed)
+                log.info("raw capture [%s]: trades ON, depth %s", sym,
+                         "ON" if cap_depth else "OFF (live.yaml capture_depth)")
+            if a.record:
+                rec = RecorderTee(feed, AsyncQuestDB(), symbol=sym)
+                recorders.append(rec)
+                feed = rec
+            feeds.append(feed)
+            brokers[sym] = NinjaTraderBroker("127.0.0.1", int(lc.get("broker_port", 36002)),
+                                            symbol=sym)
         if blot is None:
             blot = Blotter(sym, spec.point_usd, verbose=True)
         else:
@@ -1336,6 +1369,52 @@ async def main() -> None:
         asyncio.create_task(asyncio.to_thread(_refresh_gamma_blocking, new_day))
     eng.on_session_rollover = _on_rollover
 
+    # StatePublisher + embedded dashboard server. Non-mutating to the trading
+    # path: StatePublisher hooks the engine's existing observer callbacks and
+    # CHAINS the painter sinks already attached above, so both keep receiving
+    # events. The Dashboard is run_dashboard.py's own server, embedded here so
+    # a single live process serves the chart (read path only; no account/order
+    # changes).
+    dashboard = None
+    dashboard_task = None
+    if a.dashboard:
+        try:
+            from engine.adapters.state_publish import StatePublisher, LaneSource
+            import importlib.util
+            _spec = importlib.util.spec_from_file_location(
+                "run_dashboard", str(ROOT / "tools" / "run_dashboard.py"))
+            _dashmod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_dashmod)
+            Dashboard = _dashmod.Dashboard
+            tfs = tuple(a.dashboard_tf) or ("5m",)
+            srcs = []
+            for _sym, meta in lane_meta.items():
+                lb = gc = None
+                for _label, _s in meta["roster"]:
+                    if lb is None and hasattr(getattr(_s, "levels", None),
+                                              "set_gamma"):
+                        lb = _s.levels
+                    if gc is None and hasattr(getattr(_s, "pocket", None), "at"):
+                        gc = _s.pocket
+                srcs.append(LaneSource(
+                    _sym,
+                    zoneview=(pcs.get(_sym).zv if pcs.get(_sym) else None),
+                    levelbook=lb, gamma_curve=gc,
+                    strategies=[_s for _label, _s in meta["roster"]],
+                    color=""))
+            pub = StatePublisher(srcs, agg_timeframes=tfs)
+            pub.attach(eng)                       # chains the painter's sinks
+            dash_tfs = list(("1m",) + tfs)        # raw 1m always served
+            dashboard = Dashboard(pub, list(lane_meta), dash_tfs,
+                                  ROOT / "dashboard", a.dashboard_host,
+                                  a.dashboard_port)
+            dashboard_task = asyncio.create_task(dashboard.run())
+            print(f"  dashboard -> http://{a.dashboard_host}:{a.dashboard_port} "
+                  f"(1m raw + {'/'.join(tfs)} agg; lanes {list(lane_meta)})")
+        except Exception as ex:                   # noqa: BLE001
+            print(f"  (dashboard OFF: state-publish setup failed: {ex})")
+            dashboard = None
+
     async def gamma_keeper():
         """Keep the gamma snapshot able to answer for TODAY, for as long as the
         engine runs.
@@ -1500,6 +1579,8 @@ async def main() -> None:
 
     tasks = [asyncio.create_task(eng.run()), asyncio.create_task(heartbeat()),
              asyncio.create_task(gamma_keeper())]
+    if dashboard_task is not None:
+        tasks.append(dashboard_task)
     if a.seconds:
         tasks.append(asyncio.create_task(stopper()))
     try:
