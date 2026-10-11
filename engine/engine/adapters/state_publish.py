@@ -216,11 +216,18 @@ class StatePublisher:
 
     # ── pull real state per lane ─────────────────────────────────────────
     async def _publish_lane(self, sym: str, bar: dict) -> None:
+        """Publish this lane's newly-computed state. Per series we broadcast
+        ONLY the points the store had not already seen (append-only deltas),
+        never a full historical array — the engine-side fix for the
+        self-DOSing \"resend the whole history every bar\" flow. A series with
+        nothing new returns None from the store and is skipped entirely."""
         src = self.lanes.get(sym)
         if src is None:
             return
         for ind in indicators_from_levelbook(src.levelbook, bar["ts"]):
-            self.broadcast(self.store.apply_indicator(sym, ind))
+            d = self.store.apply_indicator(sym, ind)
+            if d is not None:
+                self.broadcast(d)
         # structured dealer-gamma map at the LIVE close (regime crosses flips)
         price = bar["c"]
         gm = gamma_map_from(src.gamma_curve, src.levelbook, price)
@@ -253,7 +260,12 @@ class StatePublisher:
     def broadcast(self, delta: dict) -> None:
         """Put a delta to every subscriber queue, dropping on overflow so a
         slow consumer can never apply backpressure to the engine (same rule as
-        the engine's own sink queue)."""
+        the engine's own sink queue). None is ignored: several store apply_*
+        methods return None when nothing changed, and the caller must be free
+        to hand that straight to broadcast without risking a null element on
+        the queue (a null would crash the drain loop with .get('type'))."""
+        if delta is None:
+            return
         for q in list(self._subs.values()):
             if q.full():
                 q.get_nowait()          # drop oldest, keep the newest flowing

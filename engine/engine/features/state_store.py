@@ -109,11 +109,18 @@ class StateStore:
         q.append(b)
         return self._next("bar", b["symbol"], {"bar": b, "aggregated": True})
 
-    def apply_indicator(self, lane: str, series: dict) -> dict:
-        """Set/replace one indicator point series. `series` carries id/producer/
+    def apply_indicator(self, lane: str, series: dict) -> dict | None:
+        """Record one indicator point series. `series` carries id/producer/
         label/unit/points+current. Each point {"ts","v"} — plus an optional explicit
         "key" to dedupe (two static levels that share a ts must not overwrite each
-        other); default key = f"{ts}-{v}". Returns an 'indicator' delta."""
+        other); default key = f"{ts}-{v}".
+
+        APPEND-ONLY DELTA CONTRACT: the returned 'indicator' delta carries ONLY the
+        points that were not already present in the store (the new points since the
+        last publish for this series), never the full accumulated array. Returns
+        None when nothing is new so the publisher can skip an empty broadcast — this
+        is the engine-side fix for the self-DOSing "resend the whole history every
+        bar" flow."""
         l = self._lane(lane)
         sid = series["id"]
         pts = l["indicators"].setdefault(sid, {"id": sid, "producer": "",
@@ -123,13 +130,16 @@ class StateStore:
         pts["producer"] = series.get("producer", pts.get("producer", ""))
         pts["label"] = series.get("label", pts.get("label", ""))
         pts["unit"] = series.get("unit", pts.get("unit", ""))
+        new_points = []
         for p in series.get("points", []):
             key = str(p.get("key", "{}-{}".format(p["ts"], p["v"])))
+            if key not in pts["points"]:
+                new_points.append({"ts": int(p["ts"]), "v": p["v"]})
             pts["points"][key] = {"ts": int(p["ts"]), "v": p["v"], "key": key}
+        if not new_points:
+            return None
         payload = {"id": sid, "producer": pts["producer"], "label": pts["label"],
-                   "unit": pts["unit"],
-                   "points": [{"ts": p["ts"], "v": p["v"]}
-                              for p in pts["points"].values()]}
+                   "unit": pts["unit"], "points": new_points}
         return self._next("indicator", lane, payload)
 
     def apply_gamma(self, lane: str, gamma_map: dict | None) -> dict | None:
@@ -154,9 +164,12 @@ class StateStore:
         l["strategies_roster"] = list(roster)
         return self._next("roster", lane, {"roster": list(roster)})
 
-    def apply_zones(self, lane: str, zones: list) -> dict:
+    def apply_zones(self, lane: str, zones: list) -> dict | None:
         """Replace the lane's zone set with `zones` (each a ZoneDict). Returns a
-        'zone' delta carrying the changes since the last publish."""
+        'zone' delta carrying the changes since the last publish, or None when
+        nothing changed — the same no-op suppression the other apply_* methods
+        apply: a bar that leaves the zone book untouched emits nothing, not an
+        empty diff to every subscriber on every bar."""
         l = self._lane(lane)
         old = dict(l["zones"])
         new = {z["id"]: z for z in zones}
@@ -166,6 +179,8 @@ class StateStore:
                 payload["updated" if zid in old else "added"].append(z)
         payload["removed"] = sorted(set(old) - set(new))
         l["zones"] = new
+        if not (payload["added"] or payload["updated"] or payload["removed"]):
+            return None
         return self._next("zone", lane, payload)
 
     def apply_position(self, position: dict) -> dict | None:

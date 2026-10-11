@@ -11,7 +11,8 @@ import asyncio
 import logging
 from collections import deque
 
-from engine.adapters.state_publish import LaneSource, StatePublisher
+from engine.adapters.state_publish import (LaneSource, StatePublisher,
+                                           _bar_dict)
 from engine.adapters.state_sources import (indicators_from_levelbook,
                                            positions_from_strategies,
                                            zones_from_view)
@@ -61,6 +62,62 @@ def test_store_agg_bar_rings_by_tf():
     assert snap["bars"]["5m"][1]["tf"] == "5m"
 
 
+def test_store_indicator_delta_carries_only_new_points():
+    """APPEND-ONLY DELTA contract (the self-DOS fix): the returned delta's
+    `points` are ONLY the not-yet-seen points, not the full accumulated
+    history; and a series with nothing new returns None."""
+    store = StateStore()
+    d1 = store.apply_indicator("ES", {"id": "vwap",
+        "points": [{"ts": 1 * NS, "v": 7000.0}]})
+    assert d1 is not None and d1["payload"]["points"] == [{"ts": 1 * NS, "v": 7000.0}]
+    # second bar: only the NEW point is in the delta, never the history
+    d2 = store.apply_indicator("ES", {"id": "vwap",
+        "points": [{"ts": 1 * NS, "v": 7000.0}, {"ts": 2 * NS, "v": 7005.0}]})
+    assert d2 is not None
+    assert d2["payload"]["points"] == [{"ts": 2 * NS, "v": 7005.0}]   # new only
+    # a static grid re-emitted unchanged -> nothing new -> None (no flood)
+    store.apply_indicator("ES", {"id": "pivots",
+        "points": [{"ts": 9 * NS, "v": 7000.0}, {"ts": 9 * NS, "v": 7100.0}]})
+    assert store.apply_indicator("ES", {"id": "pivots",
+        "points": [{"ts": 9 * NS, "v": 7000.0}, {"ts": 9 * NS, "v": 7100.0}]}) \
+        is None
+    # snapshot still reflects the FULL accumulated series
+    inds = {i["id"]: i for i in store.snapshot()["lanes"]["ES"]["indicators"]}
+    assert len(inds["vwap"]["points"]) == 2
+    assert [p["ts"] for p in inds["vwap"]["points"]] == [1 * NS, 2 * NS]
+
+
+def test_publish_lane_skips_empty_indicator_deltas():
+    """REG-RESSION: after the append-only change, a static indicator (pivots)
+    with no new points returns None from the store and must NOT enqueue a None
+    onto the subscriber queue (a None would crash the drain loop). Every
+    broadcast is a real delta."""
+    async def go():
+        pub = StatePublisher([], agg_timeframes=("5m",))
+        q = asyncio.Queue()
+        pub._subs["t"] = q
+        pub.broadcast(None)                       # caller hands a None delta
+        assert q.empty()                          # ...broadcast drops it
+        # _publish_lane with a static-only levelbook -> repeated bars must not
+        # put None on the queue, and must not crash.
+        class LB:
+            vwap = None
+            piv = type("P", (), {"pivots": [7000.0, 7100.0]})()
+            gamma = None
+        src = LaneSource("ES", zoneview=None, levelbook=LB())
+        pub.lanes["ES"] = src
+        from engine.core.events import Bar
+        b = _bar_dict(Bar(1 * NS, "1m", 7000, 7002, 6999, 7000.5, 100, "ES"))
+        await pub._publish_lane("ES", b)
+        await pub._publish_lane("ES", b)          # second identical bar
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        assert items, "first bar must emit the static pivot grid"
+        assert all(i is not None and i.get("type") for i in items)
+    asyncio.run(go())
+
+
 def test_store_indicator_dedupes_static_levels_accumulates_series():
     store = StateStore()
     # vwap: time series -> accumulates one point per ts
@@ -88,9 +145,8 @@ def test_store_zones_add_update_remove_deltas():
          "formed_ts": 1 * NS, "proximal": 7090, "distal": 7100}
     d = store.apply_zones("ES", [z])
     assert d["type"] == "zone" and d["payload"]["added"] == [z]
-    # no change -> empty update
-    d2 = store.apply_zones("ES", [z])
-    assert d2["payload"] == {"added": [], "updated": [], "removed": []}
+    # no change -> no delta (None), same no-op suppression as indicators
+    assert store.apply_zones("ES", [z]) is None
     # status change -> updated; a missing zone -> removed
     z2 = dict(z, virgin=False, touches=1)
     d3 = store.apply_zones("ES", [z2])

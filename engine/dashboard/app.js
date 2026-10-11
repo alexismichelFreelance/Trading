@@ -168,9 +168,9 @@ class ChartWindow {
   reflow() {
     const r = (el) => el.getBoundingClientRect();
     this.chart.applyOptions({ width: Math.max(200, Math.floor(r(this.chartBox).width)),
-                              height: Math.max(120, Math.floor(r(this.chartBox).height)) });
+                             height: Math.max(120, Math.floor(r(this.chartBox).height)) });
     this.volChart.applyOptions({ width: Math.max(200, Math.floor(r(this.volBox).width)),
-                                 height: Math.max(60, Math.floor(r(this.volBox).height)) });
+                                height: Math.max(60, Math.floor(r(this.volBox).height)) });
     // keep canvas overlay in step
     const cr = r(this.chartBox);
     const dpr = window.devicePixelRatio || 1;
@@ -179,9 +179,21 @@ class ChartWindow {
     this.canvas.style.width = cr.width + "px";
     this.canvas.style.height = cr.height + "px";
     this.ctx = this.canvas.getContext("2d");
-    this.drawOverlay();
-    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.drawOverlay());
-    this.chart.timeScale().subscribeVisibleTimeRangeChange(() => this.drawOverlay());
+    this.scheduleOverlay();
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.scheduleOverlay());
+    this.chart.timeScale().subscribeVisibleTimeRangeChange(() => this.scheduleOverlay());
+  }
+
+  /* Every manual canvas redraw (band fills) is coalesced through
+   * requestAnimationFrame so a burst of bar/indicator deltas cannot block the
+   * UI thread with one synchronous repaint per message — we draw at most once
+   * per animation frame. */
+  scheduleOverlay() {
+    if (this._overlayRaf) return;
+    this._overlayRaf = requestAnimationFrame(() => {
+      this._overlayRaf = 0;
+      this.drawOverlay();
+    });
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
@@ -213,32 +225,70 @@ class ChartWindow {
     }
   }
 
-  upsertIndicator(ind) {
-    if (!ind || !ind.id || !ind.points) return;
-    this.indicators[ind.id] = ind;
-    if (ind.id === "vwap" || this.bandSeries[ind.id]) {
-      // time series -> line series (vwap curve + band edges)
-      const points = ind.points.slice().sort((a, b) => a.ts - b.ts)
-        .map(p => ({ time: sec(p.ts), value: p.v }));
-      const ser = ind.id === "vwap" ? this.vwapSeries : this.bandSeries[ind.id];
-      if (ser) { ser.setData(points); this.drawOverlay(); }
+  /* Append-aware indicator upsert.
+   *
+   *   append=false (snapshot): the series carries its FULL history — replace
+   *   this window's copy and (re)build the line with setData().
+   *
+   *   append=true  (delta):   the series carries ONLY the points new since the
+   *   last publish. We merge them onto the accumulated copy and advance the
+   *   line with series.update() — one point, one incremental repaint —
+   *   instead of tearing the line down and setData()-ing the whole history.
+   *   This is the dashboard-side half of the append-only data flow. */
+  upsertIndicator(ind, append = false) {
+    if (!ind || !ind.id) return;
+    const newPts = (ind.points || []).slice();
+    let cur = this.indicators[ind.id];
+    if (!cur) {
+      cur = this.indicators[ind.id] =
+        { id: ind.id, producer: "", label: "", unit: "", points: [] };
+    }
+    if (append) {
+      // merge the fresh points onto the accumulated series (replace same-ts)
+      for (const p of newPts) {
+        const i = cur.points.findIndex(q => q.ts === p.ts);
+        if (i >= 0) cur.points[i] = p; else cur.points.push(p);
+      }
+      cur.producer = ind.producer || cur.producer;
+      cur.label = ind.label || cur.label;
+      cur.unit = ind.unit || cur.unit;
+    } else {
+      // snapshot: the payload is the whole series — replace outright
+      cur.points = newPts.slice();
+      cur.producer = ind.producer || "";
+      cur.label = ind.label || "";
+      cur.unit = ind.unit || "";
+    }
+    cur.points.sort((a, b) => a.ts - b.ts);
+
+    if (cur.id === "vwap" || this.bandSeries[cur.id]) {
+      const ser = cur.id === "vwap" ? this.vwapSeries : this.bandSeries[cur.id];
+      if (!ser) return;
+      if (append) {
+        for (const p of newPts) ser.update({ time: sec(p.ts), value: p.v });
+      } else {
+        ser.setData(cur.points.map(p => ({ time: sec(p.ts), value: p.v })));
+      }
+      this.scheduleOverlay();
       return;
     }
-    if ((ind.producer || "").includes("pivot")) {
-      // floor pivots: a fixed intraday grid -> dashed horizontal lines
-      this.drawStaticLines(ind);
+    if ((cur.producer || "").includes("pivot")) {
+      this.drawStaticLines(cur);
       return;
     }
     // unknown non-pivot, non-vwap series: draw as a generic line
-    let ser = this.indSeries[ind.id];
+    let ser = this.indSeries[cur.id];
     if (!ser) {
       ser = this.chart.addLineSeries({ color: "#a78bfa", lineWidth: 1,
         priceLineVisible: false, lastValueVisible: false,
         crosshairMarkerVisible: false });
-      this.indSeries[ind.id] = ser;
+      this.indSeries[cur.id] = ser;
     }
-    ser.setData(ind.points.slice().sort((a, b) => a.ts - b.ts)
-      .map(p => ({ time: sec(p.ts), value: p.v })));
+    if (append) {
+      for (const p of newPts) ser.update({ time: sec(p.ts), value: p.v });
+    } else {
+      ser.setData(cur.points.map(p => ({ time: sec(p.ts), value: p.v })));
+    }
   }
 
   drawStaticLines(ind) {
@@ -481,10 +531,46 @@ class ChartWindow {
     }
   }
 
+  /* Full state reconciliation for a fresh snapshot (first connect, or a
+   * reconnect where the server re-sends the whole picture): tear down every
+   * stale overlay — price lines, candle/indicator marker state, accumulated
+   * series, roster/gamma/zones/positions — so nothing from a previous session
+   * or a broken socket survives into the new picture. Call BEFORE re-rendering
+   * the snapshot payload. */
+  resetForSnapshot() {
+    const clearLines = (arr) => {
+      if (!arr) return;
+      for (const pl of arr) this.candleSeries && this.candleSeries.removePriceLine(pl);
+    };
+    clearLines(this.gammaLines);   this.gammaLines = [];
+    clearLines(this.staticLines);  this.staticLines = [];
+    for (const lbl in this.strategyLines) clearLines(this.strategyLines[lbl]);
+    this.strategyLines = {};
+    clearLines(this.positionLines); this.positionLines = [];
+    for (const id in this.indSeries) {
+      try { this.chart.removeSeries(this.indSeries[id]); } catch {}
+    }
+    this.indSeries = {};
+    this.fillMarkers = [];
+    if (this.candleSeries) this.candleSeries.setMarkers([]);
+    if (this.vwapSeries) this.vwapSeries.setData([]);
+    for (const k in this.bandSeries) if (this.bandSeries[k]) this.bandSeries[k].setData([]);
+    // accumulated data + state structures (racked fresh)
+    this.candles = [];
+    this.indicators = {};
+    this.gamma = null;
+    this.roster = [];
+    this.strategyOn = {};
+    this.zones = [];
+    this.positions = [];
+    if (this.ctx) this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+  }
+
   applySnapshot(msg) {
     const p = msg.payload || {};
+    this.resetForSnapshot();
     this.setCandles(p.bars || []);
-    for (const ind of p.indicators || []) this.upsertIndicator(ind);
+    for (const ind of p.indicators || []) this.upsertIndicatorSnapshot(ind);
     this.renderGamma(p.gamma);
     this.setRoster(p.strategies_roster || []);
     this.setZones(p.zones || []);
@@ -494,14 +580,19 @@ class ChartWindow {
     this.updateHeader();
   }
 
+  /* snapshot indicators carry the FULL series -> non-append replace */
+  upsertIndicatorSnapshot(ind) {
+    this.upsertIndicator(ind, false);
+  }
+
   applyDelta(msg) {
     const pl = msg.payload || {};
     switch (msg.kind) {
       case "bar": this.updateBar(pl.bar); break;
-      case "indicator": this.upsertIndicator(pl); break;
+      case "indicator": this.upsertIndicator(pl, true); break;
       case "gamma": this.renderGamma(pl.gamma); break;
       case "roster": this.setRoster(pl.roster); break;
-      case "zone": this.setZones([]); this.setZones(zonesFromDelta(this.zones, pl)); break;
+      case "zone": this.setZones(zonesFromDelta(this.zones, pl)); break;
       case "position": this.applyPositionDelta(pl.position); break;
       case "fill": this.addFillMarker(pl); break;
       case "log": appendLog(pl, false); break;
