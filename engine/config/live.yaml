@@ -10,8 +10,8 @@
 # live:  subset that ALSO routes to the NT8 broker ('' = pure paper)
 instruments:
   ES:
-    market_port: 36001
-    broker_port: 36002
+    market_port: 37301
+    broker_port: 37302
     draw_port: 36004
     # CUT 2026-08-25, on agreement between the full replay, the replay
     # restricted to sessions the live record also covers, and the live record
@@ -60,8 +60,8 @@ instruments:
     # backtest already measured at -$10,878. Stated here because the short
     # window is the one that will be visible day to day.
   NQ:
-    market_port: 36011
-    broker_port: 36012
+    market_port: 37301
+    broker_port: 37302
     draw_port: 36014
     # RAW DEPTH CAPTURE OFF 2026-09-02. NQ was writing 11.5M of the 15.5M daily
     # rows into claude_depth_live (ES 3.9M); the table stood at 272M rows over 27

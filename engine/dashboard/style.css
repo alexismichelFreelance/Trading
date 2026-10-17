@@ -193,7 +193,7 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
 
 /* ── VWAP sigma-band overlay canvas (band between hi/lo drawn as a filled area) ─ */
 .bandCanvas {
-  position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  position: absolute; inset: 0; z-index: 0; pointer-events: none;
 }
 .winTitle .regime { margin-left: 8px; }
 .winTitle .vwapPx { color: var(--orange); font-variant-numeric: tabular-nums; font-weight: 600; }

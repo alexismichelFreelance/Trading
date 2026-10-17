@@ -54,10 +54,11 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from typing import Any
 
-MAX_RAW_BARS = 300          # closed 1m bars retained per lane
-MAX_AGG_BARS = 400          # aggregated candles retained per TF per lane
+MAX_RAW_BARS = 50000          # closed 1m bars retained per lane
+MAX_AGG_BARS = 50000          # aggregated candles retained per TF per lane
 MAX_LOG = 200               # log records retained
 MAX_ERRORS = 60             # error/warning records retained
+SNAPSHOT_MAX_INDICATOR_POINTS = 50000  # snapshot truncation to keep frame < 1MB
 
 
 class StateStore:
@@ -123,25 +124,35 @@ class StateStore:
         bar" flow."""
         l = self._lane(lane)
         sid = series["id"]
-        pts = l["indicators"].setdefault(sid, {"id": sid, "producer": "",
-                                            "label": "", "unit": "",
-                                            "points": OrderedDict()})
-        # overwrite the metadata, keep the point ring
-        pts["producer"] = series.get("producer", pts.get("producer", ""))
-        pts["label"] = series.get("label", pts.get("label", ""))
-        pts["unit"] = series.get("unit", pts.get("unit", ""))
+        entry = l["indicators"].setdefault(sid, {"id": sid, "producer": "", "label": "", "unit": "", "points": OrderedDict()})
+        # overwrite metadata
+        entry["producer"] = series.get("producer", entry["producer"])
+        entry["label"] = series.get("label", entry["label"])
+        entry["unit"] = series.get("unit", entry["unit"])
+        points = entry["points"]
         new_points = []
         for p in series.get("points", []):
-            key = str(p.get("key", "{}-{}".format(p["ts"], p["v"])))
-            if key not in pts["points"]:
-                new_points.append({"ts": int(p["ts"]), "v": p["v"]})
-            pts["points"][key] = {"ts": int(p["ts"]), "v": p["v"], "key": key}
+            key = str(p.get("key", f"{p['ts']}-{p['v']}"))
+            if key not in points:
+                new_points.append({"ts": int(p["ts"]), "v": p["v"], "key": key})
+            points[key] = {"ts": int(p["ts"]), "v": p["v"], "key": key}
         if not new_points:
             return None
-        payload = {"id": sid, "producer": pts["producer"], "label": pts["label"],
-                   "unit": pts["unit"], "points": new_points}
+        # enforce max size
+        max_len = SNAPSHOT_MAX_INDICATOR_POINTS
+        if len(points) > max_len:
+            # remove oldest entries
+            excess = len(points) - max_len
+            for _ in range(excess):
+                points.popitem(last=False)
+        payload = {
+            "id": sid,
+            "producer": entry["producer"],
+            "label": entry["label"],
+            "unit": entry["unit"],
+            "points": [{"ts": p["ts"], "v": p["v"]} for p in points.values()],
+        }
         return self._next("indicator", lane, payload)
-
     def apply_gamma(self, lane: str, gamma_map: dict | None) -> dict | None:
         """Replace the lane's structured dealer-gamma map. The map carries the
         regime AT A PRICE, so it is refreshed per bar (the publisher recomputes
@@ -216,16 +227,35 @@ class StateStore:
         """Lane feed status: e.g. {"symbol": s, "action": "disconnect", "n": x}."""
         return self._next("lane", lane, status)
 
-    # ── snapshot ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _series_dict(sid: str, v: dict, limit: int = None) -> dict:
+        pts = v["points"]
+        if limit is not None:
+            # Take the last `limit` points (most recent) for the snapshot
+            items = list(pts.values())[-limit:]
+        else:
+            items = list(pts.values())
+        return {"id": sid, "producer": v["producer"], "label": v["label"],
+                "unit": v["unit"],
+                "points": [{"ts": p["ts"], "v": p["v"]} for p in items]}
+
+    # ── snapshot ─────────────────────────────────────────────────────
     def snapshot(self) -> dict:
         lanes = {}
         for sym, l in self._lanes.items():
+            # LightweightCharts requires strictly ascending, unique bar time —
+            # a backfill can append older bars AFTER newer ones, so sort the
+            # retained bars by ts before handing them to any client.
+            def _asc(b):
+                return sorted(list(b), key=lambda x: int(x.get("ts", 0)))
             lanes[sym] = {
                 "symbol": sym,
-                "bars_raw": list(l["bars_raw"]),
-                "bars": {tf: list(q) for tf, q in l["bars"].items()},
-                "indicators": [self._series_dict(sid, v) for sid, v
-                               in sorted(l["indicators"].items())],
+                "bars_raw": _asc(l["bars_raw"]),
+                "bars": {tf: _asc(q) for tf, q in l["bars"].items()},
+                "indicators": [
+                    StateStore._series_dict(sid, v, limit=SNAPSHOT_MAX_INDICATOR_POINTS)
+                    for sid, v in sorted(l["indicators"].items())
+                ],
                 "gamma": l["gamma"],
                 "strategies_roster": list(l["strategies_roster"]),
                 "zones": sorted(l["zones"].values(),
@@ -241,11 +271,6 @@ class StateStore:
             "errors": list(self._errors),
         }
 
-    @staticmethod
-    def _series_dict(sid: str, v: dict) -> dict:
-        return {"id": sid, "producer": v["producer"], "label": v["label"],
-                "unit": v["unit"],
-                "points": [{"ts": p["ts"], "v": p["v"]} for p in v["points"].values()]}
 
 
-__all__ = ["StateStore"]
+    __all__ = ["StateStore"]

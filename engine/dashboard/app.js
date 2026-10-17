@@ -50,6 +50,7 @@ class ChartWindow {
     this.zones = [];            // [{id, tf, top, bot, direction, virgin, touches}]
     this.positions = [];        // [{sleeve, qty, entry, target, stop}]
     this.fillMarkers = [];
+    this._logCount = 0;
 
     // series / line registries
     this.indSeries = {};        // id -> line series (vwap family line series)
@@ -92,9 +93,11 @@ class ChartWindow {
     this.gammaBtn = this.wrapper.querySelector('[data-action="gamma"]');
 
     // this window's own band overlay canvas
+    // insert BEFORE the LW chart so it's in the bottom layer (candles on top,
+    // VWAP bands below).  After init: chartBox children are [bandCanvas, LW div].
     this.canvas = document.createElement("canvas");
     this.canvas.className = "bandCanvas";
-    this.chartBox.appendChild(this.canvas);
+    this.chartBox.insertBefore(this.canvas, this.chartBox.firstChild);
     this.ctx = null;
 
     this.closeBtn.addEventListener("click", () => this.close());
@@ -106,15 +109,18 @@ class ChartWindow {
   }
 
   buildCharts() {
-    const opts = (el) => ({
+    const opts = () => ({
       layout: { background: { type: "solid", color: "#0b0e14" },
                 textColor: "#dbe2ea", fontSize: 11 },
       grid: { vertLines: { color: "#161c26" }, horzLines: { color: "#161c26" } },
       crosshair: { mode: 0 },   // Normal
-      timeScale: { borderColor: "#232c3b", timeVisible: true,
-                   secondsVisible: false, rightOffset: 3 },
+      timeScale: { visible: false, borderColor: "#232c3b", rightOffset: 3 },
       rightPriceScale: { borderColor: "#232c3b" },
+      // NO autoSize: we drive resize() ourselves after every setData / reflow
+      // so the LW internal size guard (this.ho===i && this.__===t → return)
+      // never blocks our explicit resize calls.
       autoSize: false,
+      width: 0, height: 0,  // ask LW to read from getBoundingClientRect on init
     });
     this.chart = LightweightCharts.createChart(this.chartBox, opts());
     this.volChart = LightweightCharts.createChart(this.volBox, {
@@ -125,10 +131,22 @@ class ChartWindow {
                    secondsVisible: false, borderColor: "#232c3b" },
       crosshair: { mode: 0 },
     });
-    // anchor the volume chart's time axis to the price chart's
-    this.volChart.timeScale().applyOptions({
-      rightOffset: 3,
+
+    // two-way time scale sync between price chart and volume chart
+    let syncing = false;
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+      if (syncing || !range) return;
+      syncing = true;
+      this.volChart.timeScale().setVisibleLogicalRange(range);
+      syncing = false;
+      });
+    this.volChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+      if (syncing || !range) return;
+      syncing = true;
+      this.chart.timeScale().setVisibleLogicalRange(range);
+      syncing = false;
     });
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.scheduleOverlay());
   }
 
   buildSeries() {
@@ -167,10 +185,15 @@ class ChartWindow {
 
   reflow() {
     const r = (el) => el.getBoundingClientRect();
-    this.chart.applyOptions({ width: Math.max(200, Math.floor(r(this.chartBox).width)),
-                             height: Math.max(120, Math.floor(r(this.chartBox).height)) });
-    this.volChart.applyOptions({ width: Math.max(200, Math.floor(r(this.volBox).width)),
-                                height: Math.max(60, Math.floor(r(this.volBox).height)) });
+    // Use resize() not applyOptions() — resize() ALWAYS applies the new size
+    // even when it equals the previous value, bypassing the internal
+    // (this.ho === h && this.__ === w → return) guard in LightweightCharts.
+    const cw = Math.max(200, Math.floor(r(this.chartBox).width));
+    const ch = Math.max(120, Math.floor(r(this.chartBox).height));
+    const vw = Math.max(200, Math.floor(r(this.volBox).width));
+    const vh = Math.max(60, Math.floor(r(this.volBox).height));
+    this.chart.resize(cw, ch);
+    this.volChart.resize(vw, vh);
     // keep canvas overlay in step
     const cr = r(this.chartBox);
     const dpr = window.devicePixelRatio || 1;
@@ -180,8 +203,6 @@ class ChartWindow {
     this.canvas.style.height = cr.height + "px";
     this.ctx = this.canvas.getContext("2d");
     this.scheduleOverlay();
-    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.scheduleOverlay());
-    this.chart.timeScale().subscribeVisibleTimeRangeChange(() => this.scheduleOverlay());
   }
 
   /* Every manual canvas redraw (band fills) is coalesced through
@@ -198,21 +219,65 @@ class ChartWindow {
 
   /* ── data ──────────────────────────────────────────────────────────── */
   setCandles(list) {
-    this.candles = list || [];
-    const cd = this.candles.map(b => ({ time: sec(b.ts), open: b.o, high: b.h,
-                                       low: b.l, close: b.c }));
+    this.candles = (list || []).filter(b =>
+      b && typeof b.ts === 'number' &&
+      typeof b.o === 'number' && !isNaN(b.o) &&
+      typeof b.h === 'number' && !isNaN(b.h) &&
+      typeof b.l === 'number' && !isNaN(b.l) &&
+      typeof b.c === 'number' && !isNaN(b.c)
+    );
+    // LightweightCharts needs strictly ascending, unique time: a backfill
+    // can deliver older bars after newer ones, so defensive-sort + dedupe.
+    this.candles.sort((a, b) => a.ts - b.ts);
+    const seen = new Set(); const uniq = [];
+    for (const c of this.candles) {
+      if (seen.has(c.ts)) continue;   // keep first occurrence of a ts
+      seen.add(c.ts); uniq.push(c);
+    }
+    this.candles = uniq;
+    const cd = this.candles.map(b => ({
+      time: sec(b.ts),
+      open: b.o,
+      high: b.h,
+      low: b.l,
+      close: b.c
+    }));
     this.candleSeries.setData(cd);
-    const vd = this.candles.map(b => ({ time: sec(b.ts), value: b.v,
-      color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)" }));
+
+    const vd = this.candles.map(b => ({
+      time: sec(b.ts),
+      value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0,
+      color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)"
+    }));
     this.volSeries.setData(vd);
     this.applyMarkers();
+
+    // Anchor BOTH charts at the newest bar so the user sees the latest
+    // candles, not a mid-history window (the old default after a backfill).
+    try {
+      const cd = this.candles;
+      if (cd.length > 0) {
+        // scrollToRealTime() alone is not enough when the dataset has far-future
+        // bars (e.g. stale backfill timestamps). Force the timeScale to show the
+        // LAST N bars so the latest candles are always in view.
+        const targetBars = Math.min(300, cd.length);
+        this.chart.timeScale().scrollToPosition(targetBars, false);
+        // Keep live updates in real-time from here on.
+        this.chart.timeScale().scrollToRealTime();
+      } else {
+        this.chart.timeScale().scrollToRealTime();
+      }
+    } catch (e) {}
+    const lrange = this.chart.timeScale().getVisibleLogicalRange();
+    if (lrange) this.volChart.timeScale().setVisibleLogicalRange(lrange);
   }
 
   updateBar(b) {
-    if (!b) return;
+    if (!b || typeof b.ts !== 'number' || typeof b.o !== 'number' ||
+        typeof b.h !== 'number' || typeof b.l !== 'number' || typeof b.c !== 'number') return;
     const last = this.candles.length ? this.candles[this.candles.length - 1] : null;
     const datum = { time: sec(b.ts), open: b.o, high: b.h, low: b.l, close: b.c };
-    const vdat = { time: sec(b.ts), value: b.v,
+    const vdat = { time: sec(b.ts), value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0,
       color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)" };
     if (last && last.ts === b.ts) {
       this.candles[this.candles.length - 1] = b;
@@ -296,7 +361,7 @@ class ChartWindow {
     this.staticLines.forEach(pl => this.candleSeries.removePriceLine(pl));
     this.staticLines = [];
     const seen = new Set();
-    for (const p of ind.points) {
+    for (const p of (ind && ind.points) || []) {
       const key = p.v.toFixed(4);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -499,7 +564,13 @@ class ChartWindow {
     this.ws.onopen = () => setStatus("ok", "connected");
     this.ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      self.handleMessage(msg);
+      // DIAGNOSTIC: log every incoming message type
+      console.log("[es-dash] WS msg type=" + (msg && msg.type) + " firstKeys=" + (msg ? Object.keys(msg).slice(0,5).join(",") : "none"));
+      try {
+        self.handleMessage(msg);
+      } catch (e) {
+        console.error('Error handling WS msg', e, msg);
+      }
     };
     this.ws.onclose = () => {
       if (self.closed) return;
@@ -526,7 +597,10 @@ class ChartWindow {
         populateSelects();
         this.updateHeader();
         break;
-      case "snapshot": this.applySnapshot(msg); break;
+      case "snapshot": 
+        // DEBUG: log bar count so we can see what arrived
+        console.log('[app] snapshot:', { bars_count: (msg.payload || {}).bars ? (msg.payload || {}).bars.length : 'NO BARS KEY', keys: Object.keys(msg.payload || {}) });
+        this.applySnapshot(msg); break;
       case "delta": this.applyDelta(msg); break;
     }
   }
@@ -567,7 +641,12 @@ class ChartWindow {
   }
 
   applySnapshot(msg) {
+    // DIAGNOSTIC: log what we receive so we can inspect from Python
     const p = msg.payload || {};
+    const barCount = (p.bars || []).length;
+    const indCount = (p.indicators || []).length;
+    const hasErrors = (msg.errors || []).length;
+    console.log("[es-dash] applySnapshot bars=" + barCount + " indicators=" + indCount + " errors=" + hasErrors + " status=" + document.getElementById("status").textContent);
     this.resetForSnapshot();
     this.setCandles(p.bars || []);
     for (const ind of p.indicators || []) this.upsertIndicatorSnapshot(ind);

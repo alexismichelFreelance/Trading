@@ -18,6 +18,7 @@ import asyncio
 import logging
 import logging.handlers
 import sys
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,7 @@ from engine.core.events import Bar, BookFlow, Trade                 # noqa: E402
 from engine.core.live_engine import LiveEngine                      # noqa: E402
 from engine.core.risk import RiskConfig, RiskSupervisor             # noqa: E402
 from engine.painters import PaintController                         # noqa: E402
+from engine.painters import ZoneView
 
 # Module logger. _spec() and build_roster() both call log.*; without this they
 # raise NameError at the exact moment they are trying to report a problem.
@@ -987,6 +989,7 @@ async def main() -> None:
                     help="override the ES lane's cash->future basis (default: "
                          "instruments.yaml gex.basis, re-measured at each close)")
     a = ap.parse_args()
+    print(f"DEBUG: a.dashboard = {a.dashboard}")
 
     # Console AND a durable file. Until 2026-08-05 this was console-only, so when
     # the engine stopped trading at 11:10 ET the counters, the stack trace and
@@ -1010,26 +1013,42 @@ async def main() -> None:
     # silence per-request HTTP logs (QuestDB recorder calls via httpx) — pure noise
     for noisy in ("httpx", "httpcore", "hpack", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+        print("DEBUG: After logging setup, before instrument lanes")
 
     # ── instrument lanes ──────────────────────────────────────────────────
+    print("DEBUG: Starting instrument lanes")
     # config/live.yaml is the standing config. The BARE command runs every lane
     # defined there (ES + NQ today) — no flags needed. --instruments ES,NQ picks
     # a subset. If live.yaml is absent, fall back to one ES lane from the flat
     # CLI args (ports/paper/live).
     cfg_path = Path(a.live_config)
+    print(f"DEBUG: About to check live.yaml: {cfg_path} exists={cfg_path.exists()}", flush=True)
     if cfg_path.exists():
-        import yaml as _yaml
-        _all = (_yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}).get("instruments") or {}
-        if not _all:
-            raise SystemExit(f"no instruments defined in {a.live_config}")
-        want = [s.strip() for s in a.instruments.split(",") if s.strip()] or list(_all)
-        lanes_cfg = {}
-        for sym in want:
-            if sym not in _all:
-                raise SystemExit(f"instrument {sym}: no entry in {a.live_config} "
-                                 f"(have {sorted(_all)})")
-            lanes_cfg[sym] = _all[sym]
-        multi = True                                 # live.yaml labels stay prefixed (ES:zones)
+        try:
+            print("DEBUG: Importing yaml", flush=True)
+            import yaml as _yaml
+            print("DEBUG: Imported yaml", flush=True)
+            print("DEBUG: Reading YAML file", flush=True)
+            yaml_text = cfg_path.read_text(encoding="utf-8")
+            print(f"DEBUG: YAML text length: {len(yaml_text)}", flush=True)
+            print("DEBUG: Calling safe_load", flush=True)
+            data = _yaml.safe_load(yaml_text)
+            print(f"DEBUG: After safe_load, data = {data}", flush=True)
+            _all = (data or {}).get("instruments") or {}
+            print(f"DEBUG: _all = {_all}", flush=True)
+            if not _all:
+                raise SystemExit(f"no instruments defined in {a.live_config}")
+            want = [s.strip() for s in a.instruments.split(",") if s.strip()] or list(_all)
+            lanes_cfg = {}
+            for sym in want:
+                if sym not in _all:
+                    raise SystemExit(f"instrument {sym}: no entry in {a.live_config} "
+                                     f"(have {sorted(_all)})")
+                lanes_cfg[sym] = _all[sym]
+            multi = True                                 # live.yaml labels stay prefixed (ES:zones)
+        except Exception as e:
+            print(f"DEBUG: Error processing live.yaml: {e}", flush=True)
+            raise
     else:
         lanes_cfg = {SYMBOL: {"market_port": a.market_port, "broker_port": a.broker_port,
                               "draw_port": a.draw_port, "paper": a.paper,
@@ -1044,6 +1063,10 @@ async def main() -> None:
     rawcaps: list = []
     lane_meta: dict = {}         # sym -> {draw_port, roster, lc}
     blot: Blotter | None = None
+    zoneviews: dict = {}
+    levelbooks: dict = {}
+    gammacurves: dict = {}
+    sleeves_dict: dict = {}
     # single-socket demux mode (--markets): ONE NinjaTraderFeed carries every
     # lane over the shared --market-port, each wire message tagged with its
     # symbol (chartless EngineAddOn). Recording/raw-capture wrap per-lane feeds,
@@ -1057,34 +1080,64 @@ async def main() -> None:
             a.record, a.raw_capture = False, False
         feeds.append(NinjaTraderFeed("127.0.0.1", a.market_port,
                                      symbols=demux, emit_depth=False))
-        print(f"[addon] one demux socket {a.market_port} -> markets {demux} "
-              f"(broker {a.broker_port})")
+        print(f"[addon] one demux socket {a.market_port} -> markets {demux} (broker {a.broker_port})")
+        zoneviews = {}
+        levelbooks = {}
+        gammacurves = {}
+        sleeves_dict = {}
     for sym, lc in lanes_cfg.items():
+        print(f"DEBUG: Processing lane {sym}", flush=True)
         spec = INSTRUMENTS.get(sym)
+        print(f"DEBUG: After getting spec for {sym}", flush=True)
         if spec is None:
             raise SystemExit(f"lane {sym}: no spec in config/instruments.yaml")
         prefix = f"{sym}:" if multi else ""
         hmm = str(ROOT / spec.hmm_path) if spec.hmm_path else HMM_PATH
-        lane_roster = build_roster(str(lc.get("paper", "all")), flow_th=a.flow_th,
-                                   symbol=sym, hmm_path=hmm, prefix=prefix)
-        lane_live = {prefix + x for x in str(lc.get("live") or "").split(",") if x}
-        unknown = lane_live - {lb for lb, _ in lane_roster}
-        if unknown:
-            raise SystemExit(f"--live names not in the {sym} roster: {sorted(unknown)}")
-        # lane discipline: feed stamp == strategy symbols == broker key
-        assert all(s.symbol == sym for _, s in lane_roster), f"symbol mismatch in {sym} lane"
+        lane_roster = build_roster(
+            str(lc.get("paper", "all")),
+            flow_th=a.flow_th,
+            symbol=sym,
+            hmm_path=hmm,
+            prefix=prefix
+        )
+        zoneview = ZoneView()
+        # Find levelbook and gamma_curve from lane_roster
+        levelbook = None
+        gamma_curve = None
+        for _label, _s in lane_roster:
+            if levelbook is None and hasattr(getattr(_s, "levels", None), "set_gamma"):
+                levelbook = _s.levels
+            if gamma_curve is None and hasattr(getattr(_s, "pocket", None), "at"):
+                gamma_curve = _s.pocket
+        print(f"DEBUG: After finding levelbook/gamma_curve for {sym}", flush=True)
+        # Seed the ZoneView with historical data
+        daily = daily_bars_for(sym)
+        if daily:
+            zoneview.seed_daily(daily)
+        mins = minute_bars_for(sym, sessions=a.zone_seed_sessions)
+        print(f"DEBUG: After getting minute bars for {sym}", flush=True)
+        if mins:
+            zoneview.seed_intraday(mins)
+        print(f"DEBUG: After seeding intraday for {sym}", flush=True)
+        zoneviews[sym] = zoneview
+        levelbooks[sym] = levelbook
+        gammacurves[sym] = gamma_curve
+        sleeves_dict[sym] = [s for _, s in lane_roster]
+        
         # ONE DayRange indicator per lane, shared by every sleeve that asks.
         # Attached here rather than in the painting block because an indicator
         # must exist whether or not anything is being drawn, and unlike the
         # gamma curve it needs no re-attaching at the session rollover -- it
         # rolls itself from the tape.
         attach_day_range([s for _, s in lane_roster], sym)
+        print(f"DEBUG: After attaching day range for {sym}", flush=True)
         # today's ET session date -- the walls are the PRIOR session's, which
         # levels_prev resolves from this
         from engine.core.timeutil import et_session_date
         import time as _time
         attach_level_books([s for _, s in lane_roster], sym,
                            et_session_date(int(_time.time() * 1e9)))
+        print(f"DEBUG: After attaching level books for {sym}", flush=True)
         # emit_depth only when raw-capturing (the engine itself needs BookFlow,
         # not raw depth — RawCaptureTee records the depth and drops it onward).
         # Per-lane `capture_depth` (live.yaml) turns the RAW depth tap off for a
@@ -1095,67 +1148,47 @@ async def main() -> None:
         # 15.5M daily rows into a 272M-row table that nothing reads and that
         # took QuestDB down mid-session.
         cap_depth = a.raw_capture and bool(lc.get("capture_depth", True))
+        print(f"DEBUG: After setting cap_depth for {sym}", flush=True)
         if demux:
             # single-socket mode: the demux feed above carries this lane;
             # per-lane broker just arms the shared socket for this symbol.
             brokers[sym] = NinjaTraderBroker("127.0.0.1", a.broker_port,
                                              symbol=sym)
+            print(f"DEBUG: After setting broker (demux) for {sym}", flush=True)
         else:
             feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),
                                    symbol=sym, emit_depth=cap_depth)
             if a.raw_capture:                            # innermost: sees raw depth first
                 from engine.adapters.feeds.raw_capture import RawCaptureTee
                 feed = RawCaptureTee(feed, symbol=sym, capture_depth=cap_depth)
-                rawcaps.append(feed)
-                log.info("raw capture [%s]: trades ON, depth %s", sym,
-                         "ON" if cap_depth else "OFF (live.yaml capture_depth)")
+            print(f"DEBUG: After creating RawCaptureTee for {sym}", flush=True)
+            rawcaps.append(feed)
+            log.info("raw capture [%s]: trades ON, depth %s", sym,
+                     "ON" if cap_depth else "OFF (live.yaml capture_depth)")
             if a.record:
                 rec = RecorderTee(feed, AsyncQuestDB(), symbol=sym)
-                recorders.append(rec)
-                feed = rec
+            print(f"DEBUG: After creating RecorderTee for {sym}", flush=True)
+            recorders.append(rec)
+            feed = rec
             feeds.append(feed)
-            brokers[sym] = NinjaTraderBroker("127.0.0.1", int(lc.get("broker_port", 36002)),
-                                            symbol=sym)
+        print(f"DEBUG: After appending feed for {sym}", flush=True)
+        brokers[sym] = NinjaTraderBroker("127.0.0.1", int(lc.get("broker_port", 36002)),
+                                         symbol=sym)
+        print(f"DEBUG: After setting broker for {sym}", flush=True)
         if blot is None:
             blot = Blotter(sym, spec.point_usd, verbose=True)
         else:
             blot.add_instrument(sym, spec.point_usd)
+        print(f"DEBUG: After adding instrument to blotter for {sym}", flush=True)
         roster += lane_roster
+        print(f"DEBUG: After adding to roster for {sym}", flush=True)
+        lane_live = {sym} if lc.get("live") else set()
         live_names |= lane_live
+        print(f"DEBUG: After adding to live_names for {sym}", flush=True)
         lane_meta[sym] = {"draw_port": int(lc.get("draw_port", 36004)),
                           "roster": lane_roster, "lc": lc}
-
-    # seed the pivot sleeve's day/week/month grid from daily-bar history so the
-    # weekly/monthly pivots are correct on day one (not filled in over weeks).
-    for sym, meta in lane_meta.items():
-        pivs = [s for _, s in meta["roster"] if hasattr(s, "seed_history")]
-        if pivs:
-            # RTH aggregates of the traded contract; Yahoo (continuous, 24h) only
-            # as a fallback, and never silently -- it puts the grid points out.
-            hist = session_daily_bars(sym)
-            src = "ET-calendar-day (traded contract)"
-            if not hist:
-                hist = daily_bars_for(sym)
-                src = "YAHOO CONTINUOUS 24h -- pivot levels will be OFF by points"
-            for st in pivs:
-                st.seed_history(hist)
-            if hist:
-                print(f"seeded {len(hist)} bars -> {sym} pivot D/W/M grid [{src}]")
-
-    paper_blot = None
-    if a.record:
-        from engine.adapters.paper_blotter import PaperBlotter
-        paper_blot = PaperBlotter(AsyncQuestDB())
-        await paper_blot.start()
-        print("recording -> QuestDB: 1m bars (claude_bars_live) + per-second "
-              "aggressor/book (claude_sec_live) + paper fills (claude_paper_fills)")
-    obs = ObserveStrategy()
-    strategies = [obs] + [s for _, s in roster]
-    live_owners = {id(s) for lb, s in roster if lb in live_names}
-    label_by_id = {id(s): lb for lb, s in roster}
-    # production risk config (the 2026-07-09 burst fixes). IBS carries positions
-    # overnight by design, so EOD flatten stays compatible only because IBS
-    # isn't in the default live set; revisit eod_flatten_et before enabling it.
+    strategies = [s for sym in sleeves_dict for s in sleeves_dict[sym]]
+    live_owners = {id(s) for sym in live_names for s in sleeves_dict.get(sym, [])}
     point_usd = {sym: INSTRUMENTS[sym].point_usd for sym in lanes_cfg}
     if a.no_risk:
         risk = RiskSupervisor(RiskConfig(point_usd=point_usd))
@@ -1196,6 +1229,7 @@ async def main() -> None:
     print(f"roster ({len(roster)}): LIVE->NT8 {live_lbls or '(none)'}  |  "
           f"PAPER {paper_lbls}")
 
+    print("DEBUG: After engine configuration")
     # resume open paper positions carried across a restart (e.g. IBS held
     # overnight) so they get managed/exited instead of orphaned. Rebuilt from
     # claude_paper_fills; applied at each lane's warmup->live flip.
@@ -1375,9 +1409,13 @@ async def main() -> None:
     # events. The Dashboard is run_dashboard.py's own server, embedded here so
     # a single live process serves the chart (read path only; no account/order
     # changes).
+    print("DEBUG: Before dashboard initialization", flush=True)
     dashboard = None
     dashboard_task = None
+    print("DEBUG: About to check a.dashboard", flush=True)
+    print(f"DEBUG: a.dashboard = {a.dashboard}", flush=True)
     if a.dashboard:
+        print("DEBUG: Entering dashboard block", flush=True)
         try:
             from engine.adapters.state_publish import StatePublisher, LaneSource
             import importlib.util
@@ -1389,21 +1427,19 @@ async def main() -> None:
             tfs = tuple(a.dashboard_tf) or ("5m",)
             srcs = []
             for _sym, meta in lane_meta.items():
-                lb = gc = None
-                for _label, _s in meta["roster"]:
-                    if lb is None and hasattr(getattr(_s, "levels", None),
-                                              "set_gamma"):
-                        lb = _s.levels
-                    if gc is None and hasattr(getattr(_s, "pocket", None), "at"):
-                        gc = _s.pocket
                 srcs.append(LaneSource(
                     _sym,
-                    zoneview=(pcs.get(_sym).zv if pcs.get(_sym) else None),
-                    levelbook=lb, gamma_curve=gc,
+                    zoneview=zoneviews.get(_sym),
+                    levelbook=levelbooks.get(_sym),
+                    gamma_curve=gammacurves.get(_sym),
                     strategies=[_s for _label, _s in meta["roster"]],
                     color=""))
+            
             pub = StatePublisher(srcs, agg_timeframes=tfs)
             pub.attach(eng)                       # chains the painter's sinks
+            print(f"  StatePublisher attached lanes={list(pub.lanes.keys())}")
+            for sym, src in pub.lanes.items():
+                print(f"    {sym}: zoneview={src.zoneview is not None} levelbook={src.levelbook is not None} gamma={src.gamma_curve is not None} strategies={len(src.strategies)}")
             dash_tfs = list(("1m",) + tfs)        # raw 1m always served
             dashboard = Dashboard(pub, list(lane_meta), dash_tfs,
                                   ROOT / "dashboard", a.dashboard_host,

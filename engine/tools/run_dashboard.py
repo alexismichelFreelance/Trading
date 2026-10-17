@@ -79,6 +79,10 @@ from engine.features.gamma_curve import GammaCurve                   # noqa: E40
 from engine.features.level_book import LevelBook                     # noqa: E402
 from engine.painters import ZoneView                                 # noqa: E402
 
+from engine.adapters.questdb import QuestDB  # noqa: E402
+from engine.features.bars import BarAggregator  # noqa: E402
+from engine.adapters.state_sources import indicators_from_levelbook  # noqa: E402
+
 log = logging.getLogger("engine.dashboard")
 NS = 1_000_000_000
 
@@ -339,6 +343,7 @@ class Dashboard:
     def _add_routes(self):
         self.app.router.add_get("/", self._index)
         self.app.router.add_get("/ws", self._ws)
+        self.app.router.add_get("/history", self._history)
         # serve the vendored lib + app + styles verbatim
         for name in ("app.js", "style.css",
                      "vendor/lightweight-charts.standalone.production.js"):
@@ -482,13 +487,113 @@ class Dashboard:
         except Exception as ex:             # noqa: BLE001
             log.warning("forward ended: %s", ex)
 
+    async def _history(self, request):
+        """Return historical bars/indicators for a symbol/timeframe.
+        Query params: symbol (required), tf (required, e.g., '5m'), start (epoch ms, optional),
+        end (epoch ms, optional), limit (int, optional, default 5000).
+        If start/end omitted, returns the most recent `limit` bars.
+        Returns JSON: {bars:{tf:[...]}, indicators:[...], zones:[], positions:[]}
+        """
+        try:
+            params = request.rel_url.query
+            symbol = params.get("symbol")
+            tf = params.get("tf")
+            if not symbol or not tf:
+                return web.json_response({"error": "symbol and tf required"}, status=400)
+            start_str = params.get("start")
+            end_str = params.get("end")
+            limit_str = params.get("limit")
+            limit = int(limit_str) if limit_str is not None else 5000
+            start = int(start_str) if start_str is not None else None
+            end = int(end_str) if end_str is not None else None
+
+            qdb = QuestDB()
+            print(f"qdb type: {type(qdb)}")
+            # fetch raw 1m bars
+            if not symbol.replace('.', '').isalnum():
+                raise ValueError("Invalid symbol")
+            if start is not None and end is not None:
+                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' AND ts >= {start} AND ts <= {end} ORDER BY ts"
+                raw = qdb.query(sql)
+            else:
+                if not symbol.replace('.', '').isalnum():
+                    raise ValueError("Invalid symbol")
+                limit_clause = f"LIMIT {limit}" if limit > 0 else ""
+                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC {limit_clause}"
+                desc = qdb.query(sql)
+                raw = list(reversed(desc))  # chronological
+
+            if not raw:
+                return web.json_response({"bars": {tf: []}, "indicators": [], "zones": [], "positions": []})
+
+            # convert to BarDict list
+            bars_raw = [{
+                "ts": int(r["ts"]),
+                "o": float(r["o"]),
+                "h": float(r["h"]),
+                "l": float(r["l"]),
+                "c": float(r["c"]),
+                "v": float(r["v"])
+            } for r in raw]
+
+            # compute VWAP indicator series
+            vol_sum = 0.0
+            tpv_sum = 0.0
+            vwap_points = []
+            for b in bars_raw:
+                tp = (b["h"] + b["l"] + b["c"]) / 3.0
+                vol_sum += b["v"]
+                tpv_sum += tp * b["v"]
+                vwap = tpv_sum / vol_sum if vol_sum != 0 else 0.0
+                vwap_points.append({"ts": b["ts"], "v": vwap})
+
+            indicators = [{
+                "id": "VWAP",
+                "producer": "engine",
+                "label": "VWAP",
+                "unit": "",
+                "points": vwap_points
+            }]
+
+            # aggregate to requested tf if not 1m
+            if tf != "1m":
+                agg = BarAggregator()
+                aggregated = agg.aggregate(bars_raw, tf)
+                bars = [{
+                    "ts": int(b["ts"]),
+                    "o": float(b["o"]),
+                    "h": float(b["h"]),
+                    "l": float(b["l"]),
+                    "c": float(b["c"]),
+                    "v": float(b["v"])
+                } for b in aggregated]
+            else:
+                bars = bars_raw
+
+            payload = {
+                "bars": {tf: bars},
+                "indicators": indicators,
+                "zones": [],
+                "positions": []
+            }
+            return web.json_response(payload)
+        except Exception as e:
+            log.exception("History endpoint error")
+            return web.json_response({"error": str(e)}, status=500)
+
     async def run(self):
         runner = web.AppRunner(self.app)
         await runner.setup()
         site = web.TCPSite(runner, self.host, self.port)
         await site.start()
-        print(f"[dashboard] http://{self.host}:{self.port}/   "
-              f"(windows: {', '.join(self.lanes)}; tfs: {', '.join(self.timeframes)})")
+        print(f'[dashboard] http://{self.host}:{self.port}/   ' f'(windows: {self.lanes} ; tfs: {self.timeframes})')
+        # Keep the server running until cancelled
+        try:
+            await asyncio.Future()  # waits forever
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await runner.cleanup()
 
 
 async def make_demo(host: str, port: int, tick_s: float, symbols,

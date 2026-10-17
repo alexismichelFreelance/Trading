@@ -61,6 +61,8 @@ class NinjaTraderFeed:
                  symbol: str = "ES", symbols: list[str] | None = None,
                  emit_depth: bool = False) -> None:
         self.host, self.port = host, port
+        print(f"NinjaTraderFeed.__init__: host={host} port={port}", flush=True)
+        logging.warning(f"NinjaTraderFeed.__init__: host={host} port={port}")
         self.symbol = symbol
         self.symbols = list(symbols) if symbols else []
         self.emit_depth = emit_depth
@@ -82,10 +84,14 @@ class NinjaTraderFeed:
         bars: dict[str, _BarBuilder] = {}
         sec_hi: dict[str, int] = {}          # last second boundary emitted, per lane
         try:
-            async for raw in reader:                 # StreamReader yields lines
-                line = raw.strip()
+            while True:
+                raw = await reader.readline()
+                if not raw:
+                    break
+                line = raw.decode().strip()
                 if not line:
                     continue
+                print(f"NinjaTraderFeed got line: {line[:100]}", flush=True)
                 try:
                     ev = decode_market(json.loads(line), self._default_sym)
                 except (json.JSONDecodeError, KeyError, ValueError) as ex:
@@ -122,10 +128,10 @@ class NinjaTraderFeed:
                         yield ev
                 else:
                     yield ev                          # Quote / Bar / BookFlow
+        finally:
             for sym, agg in aggs.items():             # flush final seconds
                 if sec_hi[sym] >= 0:
                     yield agg.snapshot(sec_hi[sym], sym)
-        finally:
             writer.close()
             try:
                 await writer.wait_closed()

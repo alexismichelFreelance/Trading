@@ -1,0 +1,16 @@
+# TEMP read-only observation config for the AddOn live test (t_df569d93).
+# Not tracked. Mirrors ES lane of config/live.yaml but with `live: ""` so
+# nothing routes to the NT8 broker — pure feed observation + dashboard.
+instruments:
+  ES:
+    market_port: 37301
+    broker_port: 37302
+    draw_port: 36004
+    paper: "zones,zones_15m,zones_gap,pivot,onfade"   # paper only, no real orders
+    live: ""
+  NQ:
+    market_port: 37301
+    broker_port: 37302
+    draw_port: 36004
+    paper: "zones,zones_15m,zones_gap,pivot"
+    live: ""
