@@ -157,6 +157,7 @@ class StatePublisher:
         self._log_h = None
         self._subs: dict[str, asyncio.Queue] = {}
         self._started = False
+        self._seeding = False
 
     # ── wiring ───────────────────────────────────────────────────────────
     def attach(self, engine) -> None:
@@ -224,30 +225,29 @@ class StatePublisher:
         src = self.lanes.get(sym)
         if src is None:
             return
-        for ind in indicators_from_levelbook(src.levelbook, bar["ts"]):
+        bar_ts = bar["ts"]
+        for ind in indicators_from_levelbook(src.levelbook, bar_ts):
             d = self.store.apply_indicator(sym, ind)
             if d is not None:
                 self.broadcast(d)
-        # structured dealer-gamma map at the LIVE close (regime crosses flips)
         price = bar["c"]
         gm = gamma_map_from(src.gamma_curve, src.levelbook, price)
         d = self.store.apply_gamma(sym, gm)
         if d is not None:
             self.broadcast(d)
-        # strategy roster with show/hide + per-strategy marks
-        d = self.store.apply_roster(sym, strategies_roster_from(src.strategies))
+        d = self.store.apply_roster(sym, strategies_roster_from(src.strategies, bar_ts))
         if d is not None:
             self.broadcast(d)
-        zones = zones_from_view(src.zoneview, bar["ts"])
+        zones = zones_from_view(src.zoneview, bar_ts)
         self.broadcast(self.store.apply_zones(sym, zones))
-        await self._publish_positions(sym)
+        await self._publish_positions(sym, bar_ts)
 
-    async def _publish_positions(self, sym: str) -> None:
+    async def _publish_positions(self, sym: str, bar_ts: int = 0) -> None:
         src = self.lanes.get(sym)
         if src is None:
             return
         blotter = getattr(self._engine, "blotter", None) if self._engine else None
-        for pos in positions_from_strategies(src.strategies, sym, blotter):
+        for pos in positions_from_strategies(src.strategies, sym, blotter, bar_ts):
             d = self.store.apply_position(pos)
             if d is not None:
                 self.broadcast(d)
@@ -258,17 +258,11 @@ class StatePublisher:
 
     # ── subscriber fan-out ───────────────────────────────────────────────
     def broadcast(self, delta: dict) -> None:
-        """Put a delta to every subscriber queue, dropping on overflow so a
-        slow consumer can never apply backpressure to the engine (same rule as
-        the engine's own sink queue). None is ignored: several store apply_*
-        methods return None when nothing changed, and the caller must be free
-        to hand that straight to broadcast without risking a null element on
-        the queue (a null would crash the drain loop with .get('type'))."""
-        if delta is None:
+        if delta is None or self._seeding:
             return
         for q in list(self._subs.values()):
             if q.full():
-                q.get_nowait()          # drop oldest, keep the newest flowing
+                q.get_nowait()
             else:
                 q.put_nowait(delta)
 

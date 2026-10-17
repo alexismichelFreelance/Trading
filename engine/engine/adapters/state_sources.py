@@ -147,7 +147,7 @@ def indicators_from_levelbook(levelbook, bar_ts: int) -> list:
     return out
 
 
-def positions_from_strategies(strategies, symbol: str, blotter=None) -> list:
+def positions_from_strategies(strategies, symbol: str, blotter=None, bar_ts: int = 0) -> list:
     """Open positions per sleeve, with the entry/target/stop rails from the
     declared chart_marks() protocol. READS real state: only sleeves that
     implement chart_marks() contribute; nothing is guessed.
@@ -156,8 +156,12 @@ def positions_from_strategies(strategies, symbol: str, blotter=None) -> list:
     chart_marks but no `avg_px`): it is the AUTHORITATIVE average-cost entry
     taken from the blotter's ledger for the symbol when a `blotter` is given
     (see core/blotter.py TradeLedger). Without a blotter, avg_px stays None and
-    the schema documents it as such — never a fabricated number."""
+    the schema documents it as such — never a fabricated number.
+
+    `bar_ts` (epoch-ns) bounds the drawn level in time: start_ts = bar_ts - 1 day,
+    end_ts = bar_ts (open-ended, extended by the client on each new bar)."""
     out = []
+    start_ts = (bar_ts - 86_400_000_000_000) if bar_ts else None
     for s in strategies or []:
         marks = getattr(s, "chart_marks", None)
         marks = marks() if callable(marks) else {}
@@ -166,14 +170,11 @@ def positions_from_strategies(strategies, symbol: str, blotter=None) -> list:
             qty = 0
         avg = getattr(s, "avg_px", None)
         if avg is None and blotter is not None:
-            # authoritative average-cost entry from the blotter ledger
             for sym, led in getattr(blotter, "_ledgers", {}).items():
                 if sym == (getattr(s, "symbol", "") or symbol):
                     avg = led.avg_px if led.qty else None
                     break
         if not qty:
-            # flat sleeves carry no mark; omit them so the dashboard isn't
-            # cluttered with +0 rows (mirrors the panel's decision).
             continue
         out.append({
             "sleeve": getattr(s, "label", "") or type(s).__name__,
@@ -183,6 +184,8 @@ def positions_from_strategies(strategies, symbol: str, blotter=None) -> list:
             "entry": _round(marks.get("entry")),
             "target": _round(marks.get("target")),
             "stop": _round(marks.get("stop")),
+            "start_ts": start_ts,
+            "end_ts": bar_ts if bar_ts else None,
         })
     return out
 
@@ -282,7 +285,7 @@ def gamma_map_from(gamma_curve, levelbook, price: float) -> dict | None:
     return None
 
 
-def strategies_roster_from(strategies) -> list:
+def strategies_roster_from(strategies, bar_ts: int = 0) -> list:
     """The engine's STRATEGY ROSTER (labels + enabled flags + per-strategy
     chart marks), as shown in the dashboard's strategy list with show/hide.
 
@@ -290,8 +293,12 @@ def strategies_roster_from(strategies) -> list:
     strategy with its roster `label`, whether it is `enabled`, its open
     `qty`/`entry_px`, and the declared chart_marks() overlay it draws on the
     chart (entry / target / stop). A strategy that is flat carries no mark and
-    contributes its name only — its toggle still shows/hides its category."""
+    contributes its name only — its toggle still shows/hides its category.
+
+    `bar_ts` (epoch-ns) bounds drawn levels: start_ts = bar_ts - 1 day,
+    end_ts = bar_ts (extended by the client on each new bar)."""
     out = []
+    start_ts = (bar_ts - 86_400_000_000_000) if bar_ts else None
     for s in strategies or []:
         marks = getattr(s, "chart_marks", None)
         marks = marks() if callable(marks) else {}
@@ -304,6 +311,8 @@ def strategies_roster_from(strategies) -> list:
             "entry": _round(marks.get("entry")),
             "target": _round(marks.get("target")),
             "stop": _round(marks.get("stop")),
+            "start_ts": start_ts,
+            "end_ts": bar_ts if bar_ts else None,
         })
     return out
 

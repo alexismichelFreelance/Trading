@@ -51,6 +51,8 @@ class ChartWindow {
     this.positions = [];        // [{sleeve, qty, entry, target, stop}]
     this.fillMarkers = [];
     this._logCount = 0;
+    this._reconnectDelay = 1500;
+    this._initialLoadDone = false;
 
     // series / line registries
     this.indSeries = {};        // id -> line series (vwap family line series)
@@ -109,51 +111,27 @@ class ChartWindow {
   }
 
   buildCharts() {
-    const opts = () => ({
+    this.chart = LightweightCharts.createChart(this.chartBox, {
       layout: { background: { type: "solid", color: "#0b0e14" },
                 textColor: "#dbe2ea", fontSize: 11 },
       grid: { vertLines: { color: "#161c26" }, horzLines: { color: "#161c26" } },
-      crosshair: { mode: 0 },   // Normal
-      timeScale: { visible: false, borderColor: "#232c3b", rightOffset: 3 },
-      rightPriceScale: { borderColor: "#232c3b" },
-      // NO autoSize: we drive resize() ourselves after every setData / reflow
-      // so the LW internal size guard (this.ho===i && this.__===t → return)
-      // never blocks our explicit resize calls.
-      autoSize: false,
-      width: 0, height: 0,  // ask LW to read from getBoundingClientRect on init
-    });
-    this.chart = LightweightCharts.createChart(this.chartBox, opts());
-    this.volChart = LightweightCharts.createChart(this.volBox, {
-      ...opts(), layout: { background: { type: "solid", color: "#0b0e14" },
-                           textColor: "#8494a8", fontSize: 10 },
-      rightPriceScale: { visible: false, borderColor: "#232c3b" },
-      timeScale: { visible: true, timeVisible: true,
-                   secondsVisible: false, borderColor: "#232c3b" },
       crosshair: { mode: 0 },
+      timeScale: { visible: true, timeVisible: true, secondsVisible: false,
+                   borderColor: "#232c3b", rightOffset: 3 },
+      rightPriceScale: { borderColor: "#232c3b" },
+      autoSize: false,
+      width: 0, height: 0,
     });
-
-    // two-way time scale sync between price chart and volume chart
-    let syncing = false;
-    this.chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
-      if (syncing || !range) return;
-      syncing = true;
-      this.volChart.timeScale().setVisibleLogicalRange(range);
-      syncing = false;
-      });
-    this.volChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
-      if (syncing || !range) return;
-      syncing = true;
-      this.chart.timeScale().setVisibleLogicalRange(range);
-      syncing = false;
-    });
+    const lwcContainer = this.chartBox.querySelector("div");
+    if (lwcContainer) lwcContainer.style.cssText += ";position:relative;z-index:1;";
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.scheduleOverlay());
   }
 
   buildSeries() {
     this.candleSeries = this.chart.addCandlestickSeries({
-      upColor: "#26a69a", downColor: "#ef5350",
-      borderUpColor: "#26a69a", borderDownColor: "#ef5350",
-      wickUpColor: "#4db6ac", wickDownColor: "#ef9a9a",
+      upColor: "#089981", downColor: "#f23645",
+      borderUpColor: "#089981", borderDownColor: "#f23645",
+      wickUpColor: "#089981", wickDownColor: "#f23645",
       priceLineVisible: false,
     });
 
@@ -161,11 +139,12 @@ class ChartWindow {
     this.vwapSeries = this.chart.addLineSeries({
       color: "#e2a03f", lineWidth: 2, priceLineVisible: false,
       lastValueVisible: true, crosshairMarkerVisible: false,
+      lineStyle: 0,
     });
     const bandSpec = {
-      vwap_2s_hi: { color: "#f0b64a", lineWidth: 1 },   // +2σ golden
-      vwap_2s_lo: { color: "#f0b64a", lineWidth: 1 },   // -2σ
-      vwap_3s_hi: { color: "#e08b2e", lineWidth: 1, lineStyle: 2 }, // dashed +3σ
+      vwap_2s_hi: { color: "#f0b64a", lineWidth: 1, lineStyle: 1 },
+      vwap_2s_lo: { color: "#f0b64a", lineWidth: 1, lineStyle: 1 },
+      vwap_3s_hi: { color: "#e08b2e", lineWidth: 1, lineStyle: 2 },
       vwap_3s_lo: { color: "#e08b2e", lineWidth: 1, lineStyle: 2 },
     };
     for (const key of ["vwap_2s_hi", "vwap_2s_lo", "vwap_3s_hi", "vwap_3s_lo"]) {
@@ -177,24 +156,21 @@ class ChartWindow {
       });
     }
 
-    this.volSeries = this.volChart.addHistogramSeries({
+    this.volSeries = this.chart.addHistogramSeries({
       priceFormat: { type: "volume" },
-      priceScaleId: "", scaleMargins: { top: 0.7, bottom: 0 },
+      priceScaleId: "volume",
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+    this.chart.priceScale("volume").applyOptions({
+      scaleMargins: { top: 0.8, bottom: 0 },
     });
   }
 
   reflow() {
     const r = (el) => el.getBoundingClientRect();
-    // Use resize() not applyOptions() — resize() ALWAYS applies the new size
-    // even when it equals the previous value, bypassing the internal
-    // (this.ho === h && this.__ === w → return) guard in LightweightCharts.
     const cw = Math.max(200, Math.floor(r(this.chartBox).width));
     const ch = Math.max(120, Math.floor(r(this.chartBox).height));
-    const vw = Math.max(200, Math.floor(r(this.volBox).width));
-    const vh = Math.max(60, Math.floor(r(this.volBox).height));
     this.chart.resize(cw, ch);
-    this.volChart.resize(vw, vh);
-    // keep canvas overlay in step
     const cr = r(this.chartBox);
     const dpr = window.devicePixelRatio || 1;
     this.canvas.width = Math.max(1, Math.floor(cr.width * dpr));
@@ -252,24 +228,24 @@ class ChartWindow {
     this.volSeries.setData(vd);
     this.applyMarkers();
 
-    // Anchor BOTH charts at the newest bar so the user sees the latest
-    // candles, not a mid-history window (the old default after a backfill).
-    try {
-      const cd = this.candles;
-      if (cd.length > 0) {
-        // scrollToRealTime() alone is not enough when the dataset has far-future
-        // bars (e.g. stale backfill timestamps). Force the timeScale to show the
-        // LAST N bars so the latest candles are always in view.
-        const targetBars = Math.min(300, cd.length);
-        this.chart.timeScale().scrollToPosition(targetBars, false);
-        // Keep live updates in real-time from here on.
-        this.chart.timeScale().scrollToRealTime();
-      } else {
-        this.chart.timeScale().scrollToRealTime();
-      }
-    } catch (e) {}
-    const lrange = this.chart.timeScale().getVisibleLogicalRange();
-    if (lrange) this.volChart.timeScale().setVisibleLogicalRange(lrange);
+    if (!this._initialLoadDone) {
+      this._initialLoadDone = true;
+      try {
+        const dataLen = cd.length;
+        const viewSize = 300;
+        if (dataLen > viewSize) {
+          this.chart.timeScale().setVisibleLogicalRange({
+            from: dataLen - viewSize,
+            to: dataLen + 5,
+          });
+        } else {
+          this.chart.timeScale().setVisibleLogicalRange({
+            from: 0,
+            to: dataLen + 5,
+          });
+        }
+      } catch (e) {}
+    }
   }
 
   updateBar(b) {
@@ -309,10 +285,11 @@ class ChartWindow {
         { id: ind.id, producer: "", label: "", unit: "", points: [] };
     }
     if (append) {
-      // merge the fresh points onto the accumulated series (replace same-ts)
+      const idx = new Map(cur.points.map((p, i) => [p.ts, i]));
       for (const p of newPts) {
-        const i = cur.points.findIndex(q => q.ts === p.ts);
-        if (i >= 0) cur.points[i] = p; else cur.points.push(p);
+        const i = idx.get(p.ts);
+        if (i >= 0) cur.points[i] = p;
+        else { cur.points.push(p); idx.set(p.ts, cur.points.length - 1); }
       }
       cur.producer = ind.producer || cur.producer;
       cur.label = ind.label || cur.label;
@@ -356,23 +333,42 @@ class ChartWindow {
     }
   }
 
+  nowTs() {
+    const last = this.candles.length ? this.candles[this.candles.length - 1] : null;
+    return last ? sec(last.ts) : Math.floor(Date.now() / 1000);
+  }
+
+  drawBoundedLevel(price, startTs, endTs, color, lineStyle, lineWidth) {
+    if (price == null) return null;
+    const now = this.nowTs();
+    if (startTs == null) startTs = now - 86400;
+    if (endTs == null) endTs = now;
+    const series = this.chart.addLineSeries({
+      color, lineWidth: lineWidth || 1, lineStyle: lineStyle || 0,
+      priceLineVisible: false, lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    series.setData([
+      { time: sec(startTs), value: price },
+      { time: sec(endTs), value: price },
+    ]);
+    return series;
+  }
+
   drawStaticLines(ind) {
-    // remove previous lines for this indicator id
-    this.staticLines.forEach(pl => this.candleSeries.removePriceLine(pl));
+    for (const ser of this.staticLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.staticLines = [];
     const seen = new Set();
+    const now = this.nowTs();
     for (const p of (ind && ind.points) || []) {
       const key = p.v.toFixed(4);
       if (seen.has(key)) continue;
       seen.add(key);
-      this.staticLines.push(this.candleSeries.createPriceLine({
-        price: p.v, color: "#a78bfa", lineWidth: 1,
-        lineStyle: 2, axisLabelVisible: true, title: "pivot",
-      }));
+      const ser = this.drawBoundedLevel(p.v, now - 86400, now, "#a78bfa", 2, 1);
+      if (ser) this.staticLines.push(ser);
     }
   }
 
-  /* ── overlay: translucent VWAP sigma-band fills ───────────────────── */
   drawOverlay() {
     const ctx = this.ctx;
     if (!ctx || !this.chart) return;
@@ -380,22 +376,25 @@ class ChartWindow {
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const pairs = [["vwap_2s_lo", "vwap_2s_hi", "rgba(226,160,63,0.16)"],
-                   ["vwap_3s_lo", "vwap_3s_hi", "rgba(226,160,63,0.09)"]];
-    for (const [loId, hiId, fill] of pairs) {
-      const lo = this.indicators[loId], hi = this.indicators[hiId];
-      if (!lo || !hi || !lo.points || !hi.points) continue;
-      const loPts = this.project(lo.points);
-      const hiPts = this.project(hi.points);
-      if (loPts.length < 2 || hiPts.length < 2) continue;
-      ctx.beginPath();
-      ctx.moveTo(loPts[0][0], loPts[0][1]);
-      for (let i = 1; i < loPts.length; i++) ctx.lineTo(loPts[i][0], loPts[i][1]);
-      for (let i = hiPts.length - 1; i >= 0; i--) ctx.lineTo(hiPts[i][0], hiPts[i][1]);
-      ctx.closePath();
-      ctx.fillStyle = fill;
-      ctx.fill();
-    }
+    this.drawBand(ctx, "vwap", "vwap_2s_hi", "rgba(70,130,220,0.10)");
+    this.drawBand(ctx, "vwap_2s_lo", "vwap", "rgba(70,130,220,0.10)");
+    this.drawBand(ctx, "vwap_2s_hi", "vwap_3s_hi", "rgba(70,130,220,0.15)");
+    this.drawBand(ctx, "vwap_3s_lo", "vwap_2s_lo", "rgba(70,130,220,0.15)");
+  }
+
+  drawBand(ctx, baseId, edgeId, fill) {
+    const base = this.indicators[baseId], edge = this.indicators[edgeId];
+    if (!base || !edge || !base.points || !edge.points) return;
+    const basePts = this.project(base.points);
+    const edgePts = this.project(edge.points);
+    if (basePts.length < 2 || edgePts.length < 2) return;
+    ctx.beginPath();
+    ctx.moveTo(basePts[0][0], basePts[0][1]);
+    for (let i = 1; i < basePts.length; i++) ctx.lineTo(basePts[i][0], basePts[i][1]);
+    for (let i = edgePts.length - 1; i >= 0; i--) ctx.lineTo(edgePts[i][0], edgePts[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
   }
 
   project(points) {
@@ -493,9 +492,8 @@ class ChartWindow {
     const lines = [];
     const add = (price, color, style, label) => {
       if (price == null) return;
-      lines.push(this.candleSeries.createPriceLine({
-        price, color, lineWidth: 1, lineStyle: style,
-        axisLabelVisible: true, title: label }));
+      const ser = this.drawBoundedLevel(price, s.start_ts, s.end_ts, color, style, 1);
+      if (ser) lines.push(ser);
     };
     if (s.entry) add(s.entry, "#4f9cf9", 0, s.label + " entry");
     if (s.target) add(s.target, "#26a69a", 2, s.label + " target");
@@ -508,15 +506,17 @@ class ChartWindow {
     this.drawZones();
   }
   drawZones() {
-    this.staticLines.forEach(pl => this.candleSeries.removePriceLine(pl));
+    for (const ser of this.staticLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.staticLines = [];
+    const now = this.nowTs();
     for (const z of this.zones) {
-      const color = (z.direction || 0) > 0 ? "#26a69a" : "#ef5350";
+      const color = (z.direction || 0) > 0 ? "#089981" : "#f23645";
+      const startTs = z.formed_ts || (now - 86400);
+      const endTs = z.end_ts || (startTs + 86400);
       for (const [pr, nm] of [[z.top, "zone-top"], [z.bot, "zone-bot"]]) {
         if (pr == null) continue;
-        this.staticLines.push(this.candleSeries.createPriceLine({
-          price: pr, color, lineWidth: 1, lineStyle: 1,
-          axisLabelVisible: false, title: z.tf + " " + nm }));
+        const ser = this.drawBoundedLevel(pr, startTs, endTs, color, 1, 1);
+        if (ser) this.staticLines.push(ser);
       }
     }
   }
@@ -526,18 +526,21 @@ class ChartWindow {
     this.drawPositions();
   }
   drawPositions() {
-    this.positionLines.forEach(pl => this.candleSeries.removePriceLine(pl));
+    for (const ser of this.positionLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.positionLines = [];
     for (const p of this.positions) {
-      if (p.entry) this.positionLines.push(this.candleSeries.createPriceLine({
-        price: p.entry, color: "#4f9cf9", lineWidth: 1, lineStyle: 0,
-        axisLabelVisible: true, title: (p.sleeve||"pos") + " entry" }));
-      if (p.target) this.positionLines.push(this.candleSeries.createPriceLine({
-        price: p.target, color: "#26a69a", lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: (p.sleeve||"pos") + " target" }));
-      if (p.stop) this.positionLines.push(this.candleSeries.createPriceLine({
-        price: p.stop, color: "#ef5350", lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: (p.sleeve||"pos") + " stop" }));
+      if (p.entry) {
+        const ser = this.drawBoundedLevel(p.entry, p.start_ts, p.end_ts, "#4f9cf9", 0, 1);
+        if (ser) this.positionLines.push(ser);
+      }
+      if (p.target) {
+        const ser = this.drawBoundedLevel(p.target, p.start_ts, p.end_ts, "#089981", 2, 1);
+        if (ser) this.positionLines.push(ser);
+      }
+      if (p.stop) {
+        const ser = this.drawBoundedLevel(p.stop, p.start_ts, p.end_ts, "#f23645", 2, 1);
+        if (ser) this.positionLines.push(ser);
+      }
     }
   }
 
@@ -561,11 +564,9 @@ class ChartWindow {
     const url = `ws://${location.host}/ws?symbol=${encodeURIComponent(this.symbol)}&tf=${encodeURIComponent(this.tf)}`;
     this.ws = new WebSocket(url);
     const self = this;
-    this.ws.onopen = () => setStatus("ok", "connected");
+    this.ws.onopen = () => { this._reconnectDelay = 1500; setStatus("ok", "connected"); };
     this.ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      // DIAGNOSTIC: log every incoming message type
-      console.log("[es-dash] WS msg type=" + (msg && msg.type) + " firstKeys=" + (msg ? Object.keys(msg).slice(0,5).join(",") : "none"));
       try {
         self.handleMessage(msg);
       } catch (e) {
@@ -575,7 +576,8 @@ class ChartWindow {
     this.ws.onclose = () => {
       if (self.closed) return;
       setStatus("err", "disconnected — retrying");
-      setTimeout(() => self.connect(), 1500);
+      setTimeout(() => self.connect(), self._reconnectDelay);
+      self._reconnectDelay = Math.min(self._reconnectDelay * 2, 30000);
     };
     this.ws.onerror = () => setStatus("err", "ws error");
   }
@@ -597,10 +599,11 @@ class ChartWindow {
         populateSelects();
         this.updateHeader();
         break;
-      case "snapshot": 
-        // DEBUG: log bar count so we can see what arrived
-        console.log('[app] snapshot:', { bars_count: (msg.payload || {}).bars ? (msg.payload || {}).bars.length : 'NO BARS KEY', keys: Object.keys(msg.payload || {}) });
+      case "snapshot":
         this.applySnapshot(msg); break;
+      case "__post_seed__":
+        this.applySnapshot({type: "snapshot", payload: msg.payload.lanes[this.symbol] ? {bars: msg.payload.lanes[this.symbol].bars_raw, indicators: msg.payload.lanes[this.symbol].indicators, gamma: msg.payload.lanes[this.symbol].gamma, strategies_roster: msg.payload.lanes[this.symbol].strategies_roster, zones: [], positions: []} : {}, log: msg.payload.log || [], errors: msg.payload.errors || []});
+        break;
       case "delta": this.applyDelta(msg); break;
     }
   }
@@ -641,12 +644,6 @@ class ChartWindow {
   }
 
   applySnapshot(msg) {
-    // DIAGNOSTIC: log what we receive so we can inspect from Python
-    const p = msg.payload || {};
-    const barCount = (p.bars || []).length;
-    const indCount = (p.indicators || []).length;
-    const hasErrors = (msg.errors || []).length;
-    console.log("[es-dash] applySnapshot bars=" + barCount + " indicators=" + indCount + " errors=" + hasErrors + " status=" + document.getElementById("status").textContent);
     this.resetForSnapshot();
     this.setCandles(p.bars || []);
     for (const ind of p.indicators || []) this.upsertIndicatorSnapshot(ind);
@@ -695,7 +692,6 @@ class ChartWindow {
     this.closed = true;
     this.disconnect();
     this.chart && this.chart.remove();
-    this.volChart && this.volChart.remove();
     this.wrapper && this.wrapper.remove();
     windows.delete(this.id);
   }
@@ -851,5 +847,8 @@ $("tfSel").addEventListener("change", (ev) => {
 /* ── boot: one chart-first window from the URL, chart fills the screen ─ */
 window.addEventListener("resize", () =>
   requestAnimationFrame(() => [...windows.values()].forEach(w => w.reflow())));
+window.addEventListener("pagehide", () => {
+  for (const w of [...windows.values()]) w.close();
+});
 populateSelects();
 addWindow(qs.get("symbol") || "ES", qs.get("tf") || "5m");

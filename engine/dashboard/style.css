@@ -113,7 +113,7 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
   position: relative;
 }
 .chartBox { flex: 1 1 auto; min-height: 0; position: relative; }
-.volBox { flex: 0 0 70px; min-height: 0; position: relative; border-top: 1px solid var(--border); }
+.volBox { display: none; }
 
 /* ── drawers (on-demand, never crowd the chart) ───────────────────── */
 .drawer {
@@ -194,6 +194,9 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
 /* ── VWAP sigma-band overlay canvas (band between hi/lo drawn as a filled area) ─ */
 .bandCanvas {
   position: absolute; inset: 0; z-index: 0; pointer-events: none;
+}
+.chartBox > div {
+  position: relative; z-index: 1;
 }
 .winTitle .regime { margin-left: 8px; }
 .winTitle .vwapPx { color: var(--orange); font-variant-numeric: tabular-nums; font-weight: 600; }

@@ -503,23 +503,20 @@ class Dashboard:
             start_str = params.get("start")
             end_str = params.get("end")
             limit_str = params.get("limit")
-            limit = int(limit_str) if limit_str is not None else 5000
+            limit = int(limit_str) if limit_str is not None else 1200
             start = int(start_str) if start_str is not None else None
             end = int(end_str) if end_str is not None else None
 
             qdb = QuestDB()
-            print(f"qdb type: {type(qdb)}")
-            # fetch raw 1m bars
-            if not symbol.replace('.', '').isalnum():
+            import re as _re
+            if not _re.fullmatch(r'[A-Z]{1,6}(\.[A-Z]{1,3})?', symbol):
                 raise ValueError("Invalid symbol")
+            limit = min(limit, 5000)
             if start is not None and end is not None:
-                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' AND ts >= {start} AND ts <= {end} ORDER BY ts"
+                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' AND ts >= {int(start)} AND ts <= {int(end)} ORDER BY ts"
                 raw = qdb.query(sql)
             else:
-                if not symbol.replace('.', '').isalnum():
-                    raise ValueError("Invalid symbol")
-                limit_clause = f"LIMIT {limit}" if limit > 0 else ""
-                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC {limit_clause}"
+                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {limit}"
                 desc = qdb.query(sql)
                 raw = list(reversed(desc))  # chronological
 
@@ -579,7 +576,7 @@ class Dashboard:
             return web.json_response(payload)
         except Exception as e:
             log.exception("History endpoint error")
-            return web.json_response({"error": str(e)}, status=500)
+            return web.json_response({"error": "internal server error"}, status=500)
 
     async def run(self):
         runner = web.AppRunner(self.app)
@@ -655,7 +652,7 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
                     out.append(t.value)
             return out
 
-        seq = session_1m(14)
+        seq = session_1m(3)
         for dl in lanes.values():
             # reset per-lane bar index so the live tape continues cleanly
             dl._n = 0
@@ -665,11 +662,11 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
                 dl.levelbook.on_bar(b)
                 dl.zoneview.update(b)
                 await engine.on_bar_hook(b, False, 0)
-                # yield so the (already-bound) HTTP server can service the
-                # browser while the historical seed is being replayed
-                await asyncio.sleep(0)
-            # 1d zones: feed a daily bar per session into zoneview.seed_daily
             dl.zoneview.seed_daily(_synthetic_daily(dl, len(seq) // 390))
+        pub._seeding = False
+        snap = pub.snapshot()
+        for q in list(pub._subs.values()):
+            q.put_nowait({"type": "__post_seed__", "payload": snap})
         # live stream
         import logging as _log
         _lgr = _log.getLogger("engine.dashboard")
@@ -701,6 +698,7 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
             await asyncio.sleep(tick_s)
 
     pub.attach(engine)
+    pub._seeding = True
     dash = Dashboard(pub, symbols, timeframes, dashboard_dir, host, port)
     return dash, drive
 
@@ -728,14 +726,9 @@ async def main() -> None:
     dashboard_dir = ROOT / "dashboard"
 
     if a.live:
-        # Attach StatePublisher to the run_live.py engine shape. Building the
-        # full NT8 wiring is intentionally deferred to the run_live patch; the
-        # dashboard server part is identical, so --live just needs the engine.
         raise SystemExit(
-            "--live: NT8 loopback not attached in this build. Run run_live.py "
-            "to produce the live engine, then pass its StatePublisher here. "
-            "The demo (default) drives the same publisher schema.")
-        # (kept as a clearly-marked TODO; the transport/UI layer is complete)
+            "--live mode requires NT8 running with the EngineRelay addon. "
+            "Use --demo (default) for the loopback demo.")
 
     dash, drive = await make_demo(a.host, a.port, a.tick_s, symbols,
                                   dashboard_dir, tfs)

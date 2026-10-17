@@ -54,11 +54,11 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from typing import Any
 
-MAX_RAW_BARS = 50000          # closed 1m bars retained per lane
-MAX_AGG_BARS = 50000          # aggregated candles retained per TF per lane
+MAX_RAW_BARS = 1800          # closed 1m bars retained per lane (~3 trading days)
+MAX_AGG_BARS = 600           # aggregated candles retained per TF per lane
 MAX_LOG = 200               # log records retained
 MAX_ERRORS = 60             # error/warning records retained
-SNAPSHOT_MAX_INDICATOR_POINTS = 50000  # snapshot truncation to keep frame < 1MB
+SNAPSHOT_MAX_INDICATOR_POINTS = 1800  # snapshot truncation to keep frame small
 
 
 class StateStore:
