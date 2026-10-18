@@ -46,6 +46,10 @@ WS PROTOCOL (JSON text frames)
               log:[...], errors:[...]}
   server -> {type:"delta", symbol, kind, payload}   kind in
              {bar,indicator,zone,position,fill,log,error,session,lane}
+  server -> {type:"delta_batch", symbol, deltas:[...]}  the same delta
+             objects, flushed once the buffer holds BATCH_BARS bars (or a
+             short latency cap elapses) so a fast tape costs one WS frame +
+             one client render pass per burst instead of one per bar
   bars per window are delivered for the window's chosen tf only (from the
   engine-aggregated store); raw 1m is always available under '1m'.
 
@@ -451,7 +455,30 @@ class Dashboard:
 
     async def _forward(self, ws, symbol: str, tf: str):
         """Stream state-publish deltas, delivering each client only the bars for
-        its chosen tf (raw 1m under '1m') plus all shared log/errors."""
+        its chosen tf (raw 1m under '1m') plus all shared log/errors.
+
+        BATCHING: outgoing deltas are buffered and flushed as one
+        {"type":"delta_batch","deltas":[...]} frame once the buffer holds
+        BATCH_BARS bars, so a fast tape costs one WS frame + one client
+        render pass per burst instead of one per bar. A short latency cap
+        (FLUSH_S) keeps the demo smooth when bars arrive slower than the
+        batch floor, and error-kind deltas flush immediately so the error
+        surface never sits in the buffer."""
+        BATCH_BARS = 50
+        FLUSH_S = 0.3
+        buf: list = []
+        bar_count = 0
+        last_flush = time.monotonic()
+
+        async def flush():
+            nonlocal buf, bar_count, last_flush
+            if not buf:
+                return
+            await ws.send_json({"type": "delta_batch", "symbol": symbol,
+                                "deltas": buf})
+            buf, bar_count = [], 0
+            last_flush = time.monotonic()
+
         try:
             async for m in self.pub.subscribe():
                 kind = m["type"]
@@ -465,8 +492,8 @@ class Dashboard:
                     # explicit lane check a window would mix GC/NQ bars in)
                     if m.get("lane") != symbol or (bar or {}).get("tf") != tf:
                         continue
-                    await ws.send_json({"type": "delta", "symbol": symbol,
-                                        "kind": "bar", "payload": {"bar": bar}})
+                    out = {"type": "delta", "symbol": symbol,
+                           "kind": "bar", "payload": {"bar": bar}}
                 elif kind in ("indicator", "gamma", "roster", "zone",
                               "position", "fill"):
                     if m.get("lane") != symbol:
@@ -477,11 +504,19 @@ class Dashboard:
                         # just bound how much of its history each window shows)
                         payload = dict(payload)
                         payload["points"] = payload.get("points", [])[-600:]
-                    await ws.send_json({"type": "delta", "symbol": symbol,
-                                        "kind": kind, "payload": payload})
+                    out = {"type": "delta", "symbol": symbol,
+                           "kind": kind, "payload": payload}
                 else:                       # log/error/session/lane are global
-                    await ws.send_json({"type": "delta", "symbol": symbol,
-                                        "kind": kind, "payload": payload})
+                    out = {"type": "delta", "symbol": symbol,
+                           "kind": kind, "payload": payload}
+                buf.append(out)
+                if out["kind"] == "bar":
+                    bar_count += 1
+                if (bar_count >= BATCH_BARS
+                        or "error" in (d.get("kind") for d in buf)
+                        or time.monotonic() - last_flush >= FLUSH_S):
+                    await flush()
+            await flush()
         except asyncio.CancelledError:
             raise
         except Exception as ex:             # noqa: BLE001
@@ -711,7 +746,7 @@ async def main() -> None:
                     help="lane symbols (default ES,NQ,GC)")
     ap.add_argument("--tf", action="append", default=[],
                     help="aggregate timeframes (default all standard; pick per window)")
-    ap.add_argument("--tick-s", type=float, default=0.5,
+    ap.add_argument("--tick-s", type=float, default=0.05,
                     help="demo: seconds per 1m bar per lane")
     ap.add_argument("--live", action="store_true",
                     help="attach to the NT8 live feed instead of loopback demo")

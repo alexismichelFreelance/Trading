@@ -191,10 +191,6 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
 
 #overlay { position: absolute; inset: 0; z-index: 30; pointer-events: none; }
 
-/* ── VWAP sigma-band overlay canvas (band between hi/lo drawn as a filled area) ─ */
-.bandCanvas {
-  position: absolute; inset: 0; z-index: 0; pointer-events: none;
-}
 .chartBox > div {
   position: relative; z-index: 1;
 }

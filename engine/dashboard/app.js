@@ -94,14 +94,6 @@ class ChartWindow {
     this.stratBtn = this.wrapper.querySelector('[data-action="strategy"]');
     this.gammaBtn = this.wrapper.querySelector('[data-action="gamma"]');
 
-    // this window's own band overlay canvas
-    // insert BEFORE the LW chart so it's in the bottom layer (candles on top,
-    // VWAP bands below).  After init: chartBox children are [bandCanvas, LW div].
-    this.canvas = document.createElement("canvas");
-    this.canvas.className = "bandCanvas";
-    this.chartBox.insertBefore(this.canvas, this.chartBox.firstChild);
-    this.ctx = null;
-
     this.closeBtn.addEventListener("click", () => this.close());
     this.popBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -124,10 +116,61 @@ class ChartWindow {
     });
     const lwcContainer = this.chartBox.querySelector("div");
     if (lwcContainer) lwcContainer.style.cssText += ";position:relative;z-index:1;";
-    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.scheduleOverlay());
   }
 
   buildSeries() {
+    /* VWAP sigma bands as native LWC area series (no canvas overlay).
+     *
+     * An area series fills from its line DOWN to the bottom of the pane with
+     * a topColor->bottomColor gradient (topColor sits on the line). So each
+     * band is TWO series: a fill on the band's UPPER edge (gradient wash
+     * fading downward) and a MASK on the band's LOWER edge filled with the
+     * opaque chart background, which erases the fill below the band.
+     *
+     * Creation order = z-order (bottom -> top), and it is load-bearing:
+     * every fill must sit above the masks of the bands ABOVE it (so those
+     * masks can clip it) and below nothing else. The verified stack:
+     *   1. mask@2s_hi   (opaque)   5. fill@vwap    (strong, lower inner)
+     *   2. fill@3s_hi   (light)    6. mask@2s_lo   (opaque)
+     *   3. mask@vwap    (opaque)   7. fill@2s_lo   (light, lower outer)
+     *   4. fill@2s_hi   (strong)   8. mask@3s_lo   (opaque)
+     * which yields exactly: strong fill VWAP<->2s, light fill 2s<->3s, and
+     * clean background everywhere else — on BOTH sides.
+     *
+     * All band series are created BEFORE the candle series, so the opaque
+     * masks sit behind the candles while the dashed edge lines and VWAP line
+     * (created after) stay on top. Because these are real series on the main
+     * price scale, the bands track the crosshair, price scale and visible
+     * range exactly like TradingView's native bands. */
+    const BG = "#0b0e14";
+    const bandFill = (top, bottom) => ({
+      topColor: top, bottomColor: bottom,
+      lineVisible: false, priceLineVisible: false,
+      lastValueVisible: false, crosshairMarkerVisible: false,
+    });
+    const bandMask = () => ({
+      topColor: BG, bottomColor: BG,
+      lineVisible: false, priceLineVisible: false,
+      lastValueVisible: false, crosshairMarkerVisible: false,
+    });
+    // [area series, source indicator id it mirrors]
+    this.bandAreas = [];
+    const mkArea = (opts, src) => {
+      const ser = this.chart.addAreaSeries(opts);
+      this.bandAreas.push({ ser, src });
+      return ser;
+    };
+    const STRONG = ["rgba(240,182,74,0.16)", "rgba(240,182,74,0.03)"];
+    const LIGHT = ["rgba(224,139,46,0.08)", "rgba(224,139,46,0.015)"];
+    mkArea(bandMask(), "vwap_2s_hi");                        // 1
+    mkArea(bandFill(...LIGHT), "vwap_3s_hi");                // 2
+    mkArea(bandMask(), "vwap");                              // 3
+    mkArea(bandFill(...STRONG), "vwap_2s_hi");               // 4
+    mkArea(bandFill(...STRONG), "vwap");                     // 5
+    mkArea(bandMask(), "vwap_2s_lo");                        // 6
+    mkArea(bandFill(...LIGHT), "vwap_2s_lo");                // 7
+    mkArea(bandMask(), "vwap_3s_lo");                        // 8
+
     this.candleSeries = this.chart.addCandlestickSeries({
       upColor: "#089981", downColor: "#f23645",
       borderUpColor: "#089981", borderDownColor: "#f23645",
@@ -166,31 +209,27 @@ class ChartWindow {
     });
   }
 
+  /* Push one indicator's points into every band area that mirrors it.
+   * append=true carries only the new tail (series.update per point); a
+   * snapshot carries the full history (series.setData). Values come from the
+   * engine-published indicator store — never re-derived here. */
+  syncBandAreas(id, append, newPts) {
+    const src = this.indicators[id];
+    const pts = append ? newPts : (src ? src.points : null);
+    if (!pts || !pts.length) return;
+    const mapped = pts.map(p => ({ time: sec(p.ts), value: p.v }));
+    for (const a of this.bandAreas) {
+      if (a.src !== id) continue;
+      if (append) for (const p of mapped) a.ser.update(p);
+      else a.ser.setData(mapped);
+    }
+  }
+
   reflow() {
     const r = (el) => el.getBoundingClientRect();
     const cw = Math.max(200, Math.floor(r(this.chartBox).width));
     const ch = Math.max(120, Math.floor(r(this.chartBox).height));
     this.chart.resize(cw, ch);
-    const cr = r(this.chartBox);
-    const dpr = window.devicePixelRatio || 1;
-    this.canvas.width = Math.max(1, Math.floor(cr.width * dpr));
-    this.canvas.height = Math.max(1, Math.floor(cr.height * dpr));
-    this.canvas.style.width = cr.width + "px";
-    this.canvas.style.height = cr.height + "px";
-    this.ctx = this.canvas.getContext("2d");
-    this.scheduleOverlay();
-  }
-
-  /* Every manual canvas redraw (band fills) is coalesced through
-   * requestAnimationFrame so a burst of bar/indicator deltas cannot block the
-   * UI thread with one synchronous repaint per message — we draw at most once
-   * per animation frame. */
-  scheduleOverlay() {
-    if (this._overlayRaf) return;
-    this._overlayRaf = requestAnimationFrame(() => {
-      this._overlayRaf = 0;
-      this.drawOverlay();
-    });
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
@@ -271,10 +310,15 @@ class ChartWindow {
    *   append=false (snapshot): the series carries its FULL history — replace
    *   this window's copy and (re)build the line with setData().
    *
-   *   append=true  (delta):   the series carries ONLY the points new since the
-   *   last publish. We merge them onto the accumulated copy and advance the
-   *   line with series.update() — one point, one incremental repaint —
-   *   instead of tearing the line down and setData()-ing the whole history.
+   *   append=true  (delta):   the engine's indicator deltas carry the series'
+   *   accumulated history (bounded to the most recent 600 points
+   *   server-side), not just the new points. We merge them onto the
+   *   accumulated copy, then advance the chart series with update() for ONLY
+   *   the points newer than what the series already holds — LWC rejects
+   *   update() with a time <= the series' last time ("Cannot update oldest
+   *   data"), so re-sending the overlapping head of the history would throw
+   *   on every delta. The merge above makes the stored copy idempotent; the
+   *   tail filter makes the series advance exactly one repaint per new point.
    *   This is the dashboard-side half of the append-only data flow. */
   upsertIndicator(ind, append = false) {
     if (!ind || !ind.id) return;
@@ -284,7 +328,9 @@ class ChartWindow {
       cur = this.indicators[ind.id] =
         { id: ind.id, producer: "", label: "", unit: "", points: [] };
     }
+    let tail = newPts;
     if (append) {
+      const prevLast = cur.points.length ? cur.points[cur.points.length - 1].ts : null;
       const idx = new Map(cur.points.map((p, i) => [p.ts, i]));
       for (const p of newPts) {
         const i = idx.get(p.ts);
@@ -294,6 +340,8 @@ class ChartWindow {
       cur.producer = ind.producer || cur.producer;
       cur.label = ind.label || cur.label;
       cur.unit = ind.unit || cur.unit;
+      tail = prevLast == null ? newPts.slice()
+                              : newPts.filter(p => p.ts > prevLast);
     } else {
       // snapshot: the payload is the whole series — replace outright
       cur.points = newPts.slice();
@@ -307,11 +355,12 @@ class ChartWindow {
       const ser = cur.id === "vwap" ? this.vwapSeries : this.bandSeries[cur.id];
       if (!ser) return;
       if (append) {
-        for (const p of newPts) ser.update({ time: sec(p.ts), value: p.v });
+        for (const p of tail) ser.update({ time: sec(p.ts), value: p.v });
       } else {
         ser.setData(cur.points.map(p => ({ time: sec(p.ts), value: p.v })));
       }
-      this.scheduleOverlay();
+      // band areas are native series now — no canvas overlay to repaint
+      this.syncBandAreas(cur.id, append, tail);
       return;
     }
     if ((cur.producer || "").includes("pivot")) {
@@ -327,7 +376,7 @@ class ChartWindow {
       this.indSeries[cur.id] = ser;
     }
     if (append) {
-      for (const p of newPts) ser.update({ time: sec(p.ts), value: p.v });
+      for (const p of tail) ser.update({ time: sec(p.ts), value: p.v });
     } else {
       ser.setData(cur.points.map(p => ({ time: sec(p.ts), value: p.v })));
     }
@@ -367,45 +416,6 @@ class ChartWindow {
       const ser = this.drawBoundedLevel(p.v, now - 86400, now, "#a78bfa", 2, 1);
       if (ser) this.staticLines.push(ser);
     }
-  }
-
-  drawOverlay() {
-    const ctx = this.ctx;
-    if (!ctx || !this.chart) return;
-    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    const dpr = window.devicePixelRatio || 1;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    this.drawBand(ctx, "vwap", "vwap_2s_hi", "rgba(70,130,220,0.10)");
-    this.drawBand(ctx, "vwap_2s_lo", "vwap", "rgba(70,130,220,0.10)");
-    this.drawBand(ctx, "vwap_2s_hi", "vwap_3s_hi", "rgba(70,130,220,0.15)");
-    this.drawBand(ctx, "vwap_3s_lo", "vwap_2s_lo", "rgba(70,130,220,0.15)");
-  }
-
-  drawBand(ctx, baseId, edgeId, fill) {
-    const base = this.indicators[baseId], edge = this.indicators[edgeId];
-    if (!base || !edge || !base.points || !edge.points) return;
-    const basePts = this.project(base.points);
-    const edgePts = this.project(edge.points);
-    if (basePts.length < 2 || edgePts.length < 2) return;
-    ctx.beginPath();
-    ctx.moveTo(basePts[0][0], basePts[0][1]);
-    for (let i = 1; i < basePts.length; i++) ctx.lineTo(basePts[i][0], basePts[i][1]);
-    for (let i = edgePts.length - 1; i >= 0; i--) ctx.lineTo(edgePts[i][0], edgePts[i][1]);
-    ctx.closePath();
-    ctx.fillStyle = fill;
-    ctx.fill();
-  }
-
-  project(points) {
-    const out = [];
-    for (const p of points) {
-      let x = this.chart.timeScale().timeToCoordinate(sec(p.ts));
-      let y = this.candleSeries.priceToCoordinate(p.v);
-      if (x == null || y == null) continue;
-      out.push([x, y]);
-    }
-    return out;
   }
 
   /* ── dealer-gamma: multi-wall price lines + regime in header ───────── */
@@ -480,8 +490,12 @@ class ChartWindow {
   }
 
   applyStrategyMarks() {
+    // strategy marks are bounded line SEGMENTS (drawBoundedLevel line series),
+    // not price lines — remove them as series
     for (const lbl in this.strategyLines)
-      this.strategyLines[lbl].forEach(pl => this.candleSeries.removePriceLine(pl));
+      this.strategyLines[lbl].forEach(ser => {
+        try { this.chart.removeSeries(ser); } catch {}
+      });
     this.strategyLines = {};
     for (const s of this.roster) {
       if (this.strategyOn[s.label] !== false) this.drawStrategy(s);
@@ -605,7 +619,55 @@ class ChartWindow {
         this.applySnapshot({type: "snapshot", payload: msg.payload.lanes[this.symbol] ? {bars: msg.payload.lanes[this.symbol].bars_raw, indicators: msg.payload.lanes[this.symbol].indicators, gamma: msg.payload.lanes[this.symbol].gamma, strategies_roster: msg.payload.lanes[this.symbol].strategies_roster, zones: [], positions: []} : {}, log: msg.payload.log || [], errors: msg.payload.errors || []});
         break;
       case "delta": this.applyDelta(msg); break;
+      case "delta_batch": this.applyDeltaBatch(msg); break;
     }
+  }
+
+  /* Batched deltas (server flushed a burst). Two phases: FIRST mutate the
+   * model for every delta in the batch (bars collected into pending arrays,
+   * indicators merged, overlays applied), THEN run a single render pass —
+   * one series.update() per bar (LWC coalesces these into one repaint per
+   * animation frame) and one marker refresh. A 50-bar burst therefore costs
+   * one WS frame, one JSON parse and one repaint, not 50 of each. */
+  applyDeltaBatch(msg) {
+    const deltas = msg.deltas || [];
+    if (!deltas.length) return;
+    const barData = [], volData = [];
+    let sawBar = false, sawFill = false;
+    for (const d of deltas) {
+      if (!d || !d.kind) continue;
+      const pl = d.payload || {};
+      switch (d.kind) {
+        case "bar": {
+          const b = pl.bar;
+          if (!b || typeof b.ts !== 'number' || typeof b.o !== 'number' ||
+              typeof b.h !== 'number' || typeof b.l !== 'number' ||
+              typeof b.c !== 'number') break;
+          const last = this.candles.length ? this.candles[this.candles.length - 1] : null;
+          if (last && last.ts === b.ts) this.candles[this.candles.length - 1] = b;
+          else this.candles.push(b);
+          barData.push({ time: sec(b.ts), open: b.o, high: b.h, low: b.l, close: b.c });
+          volData.push({ time: sec(b.ts),
+            value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0,
+            color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)" });
+          sawBar = true;
+          break;
+        }
+        case "indicator": this.upsertIndicator(pl, true); break;
+        case "gamma": this.renderGamma(pl.gamma); break;
+        case "roster": this.setRoster(pl.roster); break;
+        case "zone": this.setZones(zonesFromDelta(this.zones, pl)); break;
+        case "position": this.applyPositionDelta(pl.position); break;
+        case "fill": this.addFillMarker(pl); sawFill = true; break;
+        case "log": appendLog(pl, false); break;
+        case "error": appendLog(pl, true); break;
+      }
+    }
+    if (sawBar) {
+      for (const p of barData) this.candleSeries.update(p);
+      for (const p of volData) this.volSeries.update(p);
+    }
+    if (sawFill) this.applyMarkers();
   }
 
   /* Full state reconciliation for a fresh snapshot (first connect, or a
@@ -620,8 +682,14 @@ class ChartWindow {
       for (const pl of arr) this.candleSeries && this.candleSeries.removePriceLine(pl);
     };
     clearLines(this.gammaLines);   this.gammaLines = [];
-    clearLines(this.staticLines);  this.staticLines = [];
-    for (const lbl in this.strategyLines) clearLines(this.strategyLines[lbl]);
+    for (const ser of this.staticLines) {
+      try { this.chart.removeSeries(ser); } catch {}
+    }
+    this.staticLines = [];
+    for (const lbl in this.strategyLines)
+      this.strategyLines[lbl].forEach(ser => {
+        try { this.chart.removeSeries(ser); } catch {}
+      });
     this.strategyLines = {};
     clearLines(this.positionLines); this.positionLines = [];
     for (const id in this.indSeries) {
@@ -632,6 +700,7 @@ class ChartWindow {
     if (this.candleSeries) this.candleSeries.setMarkers([]);
     if (this.vwapSeries) this.vwapSeries.setData([]);
     for (const k in this.bandSeries) if (this.bandSeries[k]) this.bandSeries[k].setData([]);
+    for (const a of this.bandAreas) { try { a.ser.setData([]); } catch {} }
     // accumulated data + state structures (racked fresh)
     this.candles = [];
     this.indicators = {};
@@ -640,10 +709,10 @@ class ChartWindow {
     this.strategyOn = {};
     this.zones = [];
     this.positions = [];
-    if (this.ctx) this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
   applySnapshot(msg) {
+    const p = msg.payload || {};
     this.resetForSnapshot();
     this.setCandles(p.bars || []);
     for (const ind of p.indicators || []) this.upsertIndicatorSnapshot(ind);
