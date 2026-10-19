@@ -17,13 +17,14 @@ WHY THIS EXISTS (acceptance from the user):
   * dark theme that actually works
 
 HOW IT RUNS
-  * --demo (default): drives the REAL engine feature pipeline (real LevelBook,
-    real ZoneView, real Blotter, real BarAggregator, real ZoneDetector) from a
-    synthetic-but-plausible 1m tape, and publishes the exact same state-publish
-    schema the live engine publishes. This is the real computation, not a mock:
-    VWAP comes from AnchoredVWAP fed real bars, zones come from ZoneView/ZoneBook
-    fed real bars, positions come from real strategies' chart_marks + a real
-    blotter ledger. Use it to inspect the UI without NT8/QuestDB.
+  * --demo (default): seeds each lane from REAL 1m history (the most recent
+    3 sessions in QuestDB's claude_bars_live, --synthetic-seed forces the old
+    synthetic tape), driving the REAL engine feature pipeline (real LevelBook,
+    real ZoneView, real Blotter, real BarAggregator, real ZoneDetector) over
+    genuine sessions, then continues with a synthetic live tick from the last
+    real close. Indicators are the engine's computation on real bars: VWAP
+    from AnchoredVWAP, zones from ZoneView/ZoneBook, positions from real
+    strategies' chart_marks + a real blotter ledger.
   * --live (NT8): attaches the SAME StatePublisher to the engine's NT8 feed via
     the run_live.py building blocks (NinjaTraderFeed + broker). This path needs
     NT8 running with the EngineRelay addon; it reuses run_live's exact wiring so
@@ -133,6 +134,22 @@ def _synthetic_daily(dl, sessions: int):
                        round(c, 4), int(dl.vol * random.uniform(0.6, 1.4)),
                        dl.symbol))
         px = c
+    return out
+
+
+def _real_seed_bars(qdb, symbol: str, sessions: int = 3) -> list:
+    """Most recent real 1m bars for a symbol from QuestDB, chronological.
+
+    Pulls the last `sessions` sessions' worth (390 bars each) directly from
+    the ingest table so the demo opens on genuine history; the engine
+    pipeline then computes VWAP bands / zones / pivots over real sessions."""
+    df = qdb.df(
+        "SELECT ts, o, h, l, c, vol FROM claude_bars_live "
+        f"WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {sessions * 390}")
+    out = []
+    for r in df.iloc[::-1].itertuples():
+        out.append(Bar(r.ts.value, "1m", float(r.o), float(r.h), float(r.l),
+                      float(r.c), int(r.vol), symbol))
     return out
 
 
@@ -548,25 +565,23 @@ class Dashboard:
                 raise ValueError("Invalid symbol")
             limit = min(limit, 5000)
             if start is not None and end is not None:
-                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' AND ts >= {int(start)} AND ts <= {int(end)} ORDER BY ts"
-                raw = qdb.query(sql)
+                # DB ts is microsecond precision; start/end arrive as epoch ms
+                sql = f"SELECT ts, o, h, l, c, vol FROM claude_bars_live WHERE symbol = '{symbol}' AND ts >= {int(start)} * 1000 AND ts <= {int(end)} * 1000 ORDER BY ts"
             else:
-                sql = f"SELECT ts, o, h, l, c, v FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {limit}"
-                desc = qdb.query(sql)
-                raw = list(reversed(desc))  # chronological
-
-            if not raw:
+                sql = f"SELECT ts, o, h, l, c, vol FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {limit}"
+            df = qdb.df(sql)
+            if df.empty:
                 return web.json_response({"bars": {tf: []}, "indicators": [], "zones": [], "positions": []})
 
-            # convert to BarDict list
+            # convert to BarDict list (df ts is epoch ns via the client)
             bars_raw = [{
-                "ts": int(r["ts"]),
-                "o": float(r["o"]),
-                "h": float(r["h"]),
-                "l": float(r["l"]),
-                "c": float(r["c"]),
-                "v": float(r["v"])
-            } for r in raw]
+                "ts": r.ts.value,
+                "o": float(r.o),
+                "h": float(r.h),
+                "l": float(r.l),
+                "c": float(r.c),
+                "v": float(r.vol),
+            } for r in df.iloc[::-1].itertuples()]
 
             # compute VWAP indicator series
             vol_sum = 0.0
@@ -587,18 +602,23 @@ class Dashboard:
                 "points": vwap_points
             }]
 
-            # aggregate to requested tf if not 1m
+            # aggregate to requested tf if not 1m (engine's own BarAggregator,
+            # fed exactly like the live publisher feeds it)
             if tf != "1m":
-                agg = BarAggregator()
-                aggregated = agg.aggregate(bars_raw, tf)
+                agg = BarAggregator(timeframes=(tf,), input_tf="1m")
+                agg_bars = []
+                for b in bars_raw:
+                    for ab in agg.update(Bar(b["ts"], "1m", b["o"], b["h"],
+                                            b["l"], b["c"], b["v"], symbol)):
+                        agg_bars.append(ab)
                 bars = [{
-                    "ts": int(b["ts"]),
-                    "o": float(b["o"]),
-                    "h": float(b["h"]),
-                    "l": float(b["l"]),
-                    "c": float(b["c"]),
-                    "v": float(b["v"])
-                } for b in aggregated]
+                    "ts": int(ab.ts),
+                    "o": float(ab.o),
+                    "h": float(ab.h),
+                    "l": float(ab.l),
+                    "c": float(ab.c),
+                    "v": float(ab.v),
+                } for ab in agg_bars]
             else:
                 bars = bars_raw
 
@@ -630,7 +650,8 @@ class Dashboard:
 
 async def make_demo(host: str, port: int, tick_s: float, symbols,
                     dashboard_dir: Path,
-                    timeframes: tuple = TIMEFRAMES) -> tuple[Dashboard, Any]:
+                    timeframes: tuple = TIMEFRAMES,
+                    synthetic_seed: bool = False) -> tuple[Dashboard, Any]:
     """Build a real-engine loopback demo: real LevelBook/ZoneView/Blotter fed a
     synthetic tape, published through the exact state-publish adapter."""
     lanes = {}
@@ -688,16 +709,61 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
             return out
 
         seq = session_1m(3)
+        # Seed from REAL QuestDB 1m history (most recent 3 sessions with
+        # data) so the chart opens on genuine sessions — VWAP sigma bands,
+        # zones and pivots are the ENGINE's computation over real bars, not
+        # a redraw. The live tick then continues synthetically from the last
+        # real close. Lanes with no real data (or --synthetic-seed) fall
+        # back to the synthetic tape.
+        real: dict[str, list] = {}
+        if not synthetic_seed:
+            try:
+                qdb = QuestDB()
+                for sym in lanes:
+                    real[sym] = _real_seed_bars(qdb, sym, sessions=3)
+            except Exception as ex:                     # noqa: BLE001
+                log.warning("real-history seed unavailable (%s); "
+                            "using synthetic seed", ex)
+                real = {}
+        # Reject cross-lane duplicate data: the NQ ingest has lately been
+        # mirroring ES rows exactly (same ts/close/volume), and feeding that
+        # as "NQ" would paint a fake chart — polluted lanes go synthetic.
+        es = real.get("ES") or []
+        if len(es) >= 50:
+            es_tail = [(b.ts, b.c) for b in es[-50:]]
+            for sym in [s for s in real if s != "ES"]:
+                rows = real[sym]
+                if len(rows) >= 50 and \
+                        [(b.ts, b.c) for b in rows[-50:]] == es_tail:
+                    log.warning("real seed: %s tail duplicates ES — "
+                                "using synthetic seed for it", sym)
+                    del real[sym]
         for dl in lanes.values():
             # reset per-lane bar index so the live tape continues cleanly
             dl._n = 0
-            dl._px = dl.start_px + random.uniform(-2, 2)
-            for ts in seq:
-                b = dl.bar(ts)
-                dl.levelbook.on_bar(b)
-                dl.zoneview.update(b)
-                await engine.on_bar_hook(b, False, 0)
-            dl.zoneview.seed_daily(_synthetic_daily(dl, len(seq) // 390))
+            bars = real.get(dl.symbol) or []
+            if bars:
+                for i, b in enumerate(bars):
+                    dl.levelbook.on_bar(b)
+                    dl.zoneview.update(b)
+                    await engine.on_bar_hook(b, False, 0)
+                    if i % 60 == 59:
+                        # yield so the HTTP socket opens while the seed is
+                        # still running (real QuestDB seeds take ~20s)
+                        await asyncio.sleep(0)
+                dl.zoneview.seed_daily(
+                    _synthetic_daily(dl, max(1, len(bars) // 390)))
+                # continue the synthetic tape from the last REAL close
+                dl._px = bars[-1].c
+            else:
+                dl._px = dl.start_px + random.uniform(-2, 2)
+                for ts in seq:
+                    b = dl.bar(ts)
+                    dl.levelbook.on_bar(b)
+                    dl.zoneview.update(b)
+                    await engine.on_bar_hook(b, False, 0)
+                    await asyncio.sleep(0)
+                dl.zoneview.seed_daily(_synthetic_daily(dl, len(seq) // 390))
         pub._seeding = False
         snap = pub.snapshot()
         for q in list(pub._subs.values()):
@@ -750,6 +816,9 @@ async def main() -> None:
                     help="demo: seconds per 1m bar per lane")
     ap.add_argument("--live", action="store_true",
                     help="attach to the NT8 live feed instead of loopback demo")
+    ap.add_argument("--synthetic-seed", action="store_true",
+                    help="seed with the synthetic tape instead of real QuestDB "
+                         "history (default: real history when available)")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -766,7 +835,8 @@ async def main() -> None:
             "Use --demo (default) for the loopback demo.")
 
     dash, drive = await make_demo(a.host, a.port, a.tick_s, symbols,
-                                  dashboard_dir, tfs)
+                                   dashboard_dir, tfs,
+                                   synthetic_seed=a.synthetic_seed)
     async def shutdown(app):
         drive_task.cancel()
     dash.app.on_shutdown.append(shutdown)   # BEFORE run() freezes the list
