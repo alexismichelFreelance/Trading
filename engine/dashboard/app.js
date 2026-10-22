@@ -106,6 +106,14 @@ class ChartWindow {
     this.zoneCanvas = document.createElement("canvas");
     this.zoneCanvas.style.cssText = "position:absolute;inset:0;pointer-events:none;z-index:2;";
     this.chartBox.appendChild(this.zoneCanvas);
+    // floating right-side label panel (pinned labels, not overlaying price)
+    this.levelLabels = document.createElement("div");
+    this.levelLabels.className = "levelLabels";
+    this.chartBox.appendChild(this.levelLabels);
+    // floating right-side label panel (pinned labels, not overlaying price)
+    this.levelLabels = document.createElement("div");
+    this.levelLabels.className = "levelLabels";
+    this.chartBox.appendChild(this.levelLabels);
     this.winTitle = this.wrapper.querySelector(".winTitle");
     this.closeBtn = this.wrapper.querySelector(".closeBtn");
     this.popBtn = this.wrapper.querySelector(".popBtn");
@@ -250,6 +258,7 @@ class ChartWindow {
     const ch = Math.max(120, Math.floor(r(this.chartBox).height));
     this.chart.resize(cw, ch);
     this.drawZoneRects();
+    this.renderLevelLabels();
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
@@ -625,16 +634,32 @@ class ChartWindow {
       const ser = this.drawBoundedLevel(price, startSec, endSec, color, 2, 1);
       const arr = isMulti ? this.pivotLinesMulti : this.pivotLinesDaily;
       if (ser) arr.push(ser);
-      // price line for right-side label (invisible line, visible label)
-      const plArr = isMulti ? this.pivotPriceLinesMulti : this.pivotPriceLinesDaily;
-      const pl = this.candleSeries.createPriceLine({
-        price, color: "#0b0e14", lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}`,
-      });
-      if (pl) plArr.push(pl);
+      const labArr = isMulti ? (this.pivotLabelsMulti = this.pivotLabelsMulti || []) : (this.pivotLabelsDaily = this.pivotLabelsDaily || []);
+      labArr.push({ price, color, text: lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}` });
     }
+    this.renderLevelLabels();
     this.pivotMarkers = [];
     this.applyMarkers();
+  }
+
+  renderLevelLabels() {
+    const host = this.levelLabels;
+    if (!host) return;
+    host.innerHTML = "";
+    const labels = [];
+    if (this.indicatorOn["__gamma__"] !== false && this.gammaLabels) labels.push(...this.gammaLabels);
+    if (this.indicatorOn["mpivots"] !== false && this.pivotLabelsMulti) labels.push(...this.pivotLabelsMulti);
+    if (this.indicatorOn["pivots"] !== false && this.pivotLabelsDaily) labels.push(...this.pivotLabelsDaily);
+    const ps = this.candleSeries;
+    const chartRect = this.chartBox.getBoundingClientRect();
+    for (const lab of labels) {
+      const y = ps.priceToCoordinate(lab.price);
+      if (y == null || y < 0 || y > chartRect.height) continue;
+      const div = document.createElement("div");
+      div.style.cssText = `position:absolute;right:0;top:${y - 8}px;font-size:10px;color:${lab.color};white-space:nowrap;pointer-events:none;`;
+      div.textContent = lab.text;
+      host.appendChild(div);
+    }
   }
 
   rightEdgeSec() {
@@ -676,9 +701,6 @@ class ChartWindow {
     if (!this.gammaMarkers) this.gammaMarkers = [];
     this.gammaMarkers = [];
     if (!g || !g.ok) { this.setRegime(g && g.local_sign); renderGammaDrawerFor(this); return; }
-    if (!this.gammaPriceLines) this.gammaPriceLines = [];
-    for (const pl of this.gammaPriceLines) { try { this.candleSeries.removePriceLine(pl); } catch {} }
-    this.gammaPriceLines = [];
     const rng = this.lastSessionRange();
     const startSec = rng ? rng.from : null;
     const endSec = this.rightEdgeSec();
@@ -688,11 +710,7 @@ class ChartWindow {
       if (px == null) continue;
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#e6a9ff", 0, 1);
       if (ser) this.gammaLines.push(ser);
-      const pl = this.candleSeries.createPriceLine({
-        price: px, color: "#0b0e14", lineWidth: 1, lineStyle: 0,
-        axisLabelVisible: true, title: `flip ${px.toFixed(2)}`,
-      });
-      if (pl) this.gammaPriceLines.push(pl);
+      this.gammaLabels.push({ price: px, color: "#e6a9ff", text: `flip ${px.toFixed(2)}` });
     }
     for (const w of (g.call_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
@@ -701,11 +719,7 @@ class ChartWindow {
       if (px == null) continue;
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#ffa500", 2, 1);
       if (ser) this.gammaLines.push(ser);
-      const pl = this.candleSeries.createPriceLine({
-        price: px, color: "#0b0e14", lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: `call wall ${px.toFixed(2)}`,
-      });
-      if (pl) this.gammaPriceLines.push(pl);
+      this.gammaLabels.push({ price: px, color: "#ffa500", text: `call wall ${px.toFixed(2)}` });
     }
     for (const w of (g.put_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
@@ -714,14 +728,11 @@ class ChartWindow {
       if (px == null) continue;
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#1e90ff", 2, 1);
       if (ser) this.gammaLines.push(ser);
-      const pl = this.candleSeries.createPriceLine({
-        price: px, color: "#0b0e14", lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: `put wall ${px.toFixed(2)}`,
-      });
-      if (pl) this.gammaPriceLines.push(pl);
+      this.gammaLabels.push({ price: px, color: "#1e90ff", text: `put wall ${px.toFixed(2)}` });
     }
     this.gammaMarkers = [];
     this.applyMarkers();
+    this.renderLevelLabels();
     this.setRegime(g.local_sign);
     renderGammaDrawerFor(this);
   }
@@ -833,6 +844,7 @@ class ChartWindow {
             this.gammaPriceLines = [];
             this.gammaMarkers = [];
             this.applyMarkers();
+            this.renderLevelLabels();
           } else if (this.gamma) this.renderGamma(this.gamma);
         } else if (id === "__zones__") {
           if (this.indicatorOn[id] === false) {
@@ -841,6 +853,7 @@ class ChartWindow {
         } else {
           const ind = this.indicators[id];
           if (ind) this.upsertIndicator(ind, false);
+          this.renderLevelLabels();
         }
       });
     });
@@ -1198,6 +1211,7 @@ class ChartWindow {
     clearSeries(this.staticLines);    this.staticLines = [];
     clearSeries(this.zoneLines);      this.zoneLines = [];
     this.drawZoneRects();
+    this.renderLevelLabels();
     for (const lbl in this.strategyLines)
       clearSeries(this.strategyLines[lbl]);
     this.strategyLines = {};
