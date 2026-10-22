@@ -76,6 +76,10 @@ class ChartWindow {
     this.buildCharts();
     this.buildSeries();
     this.reflow();
+    // redraw zone rectangles on pan/zoom
+    try {
+      this.chart.timeScale().subscribeVisibleTimeRangeChange(() => this.drawZoneRects());
+    } catch (e) {}
   }
 
   buildDom(container) {
@@ -98,6 +102,10 @@ class ChartWindow {
       </div>`;
     this.chartBox = this.wrapper.querySelector(".chartBox");
     this.volBox = this.wrapper.querySelector(".volBox");
+    // canvas overlay for zone rectangles
+    this.zoneCanvas = document.createElement("canvas");
+    this.zoneCanvas.style.cssText = "position:absolute;inset:0;pointer-events:none;z-index:2;";
+    this.chartBox.appendChild(this.zoneCanvas);
     this.winTitle = this.wrapper.querySelector(".winTitle");
     this.closeBtn = this.wrapper.querySelector(".closeBtn");
     this.popBtn = this.wrapper.querySelector(".popBtn");
@@ -241,6 +249,7 @@ class ChartWindow {
     const cw = Math.max(200, Math.floor(r(this.chartBox).width));
     const ch = Math.max(120, Math.floor(r(this.chartBox).height));
     this.chart.resize(cw, ch);
+    this.drawZoneRects();
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
@@ -278,29 +287,6 @@ class ChartWindow {
     this.volSeries.setData(vd);
     this.computeSessionMarkers();
     this.applyMarkers();
-
-    if (!this._initialLoadDone) {
-      this._initialLoadDone = true;
-      try {
-        const dataLen = cd.length;
-        const viewSize = 300;
-        if (dataLen > viewSize) {
-          // anchor in TIME: the logical index space is the union of every
-          // series' timestamps and shifts as overlays come and go.
-          const step = this.gridStep();
-          const lastT = cd[cd.length - 1].time;
-          const to = lastT + step * 3;
-          this.chart.timeScale().setVisibleRange({
-            from: to - viewSize * step, to,
-          });
-        } else {
-          this.chart.timeScale().setVisibleRange({
-            from: cd.length ? cd[0].time : 0,
-            to: cd.length ? cd[cd.length - 1].time + 60 : 0,
-          });
-        }
-      } catch (e) {}
-    }
   }
 
   updateBar(b) {
@@ -604,8 +590,8 @@ class ChartWindow {
     for (const ser of this.pivotLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.pivotLines = [];
     const rng = this.lastSessionRange();
+    const rightEdge = this.rightEdgeSec();
     const seen = new Set();
-    const markers = (this.pivotMarkers = []);
     for (const p of (ind && ind.points) || []) {
       const lbl = p.label || "";
       const key = lbl + "|" + Number(p.v).toFixed(4);
@@ -618,14 +604,19 @@ class ChartWindow {
       else if (/\bS\d/i.test(lbl)) color = "#22c55e";
       else if (/\bR\d/i.test(lbl)) color = "#ef4444";
       const startSec = rng ? rng.from : null;
-      const endSec = rng ? rng.to : null;
+      const endSec = rightEdge;
       const ser = this.drawBoundedLevel(price, startSec, endSec, color, 2, 1);
       if (ser) this.pivotLines.push(ser);
-      if (rng) markers.push({ time: rng.to, position: "aboveBar",
-        color, shape: "text", text: lbl });
     }
-    this.pivotMarkers = markers;
+    this.pivotMarkers = [];
     this.applyMarkers();
+  }
+
+  rightEdgeSec() {
+    const c = this.candles;
+    if (!c.length) return null;
+    const step = this.gridStep();
+    return sec(c[c.length - 1].ts) + Math.round(step * 3);
   }
 
   /* ── dealer-gamma: multi-wall price lines + regime in header ───────── */
@@ -654,15 +645,13 @@ class ChartWindow {
     if (!g || !g.ok) { this.setRegime(g && g.local_sign); renderGammaDrawerFor(this); return; }
     const rng = this.lastSessionRange();
     const startSec = rng ? rng.from : null;
-    const endSec = rng ? rng.to : null;
-    const markers = [];
+    const endSec = this.rightEdgeSec();
     const flips = g.flips || [];
     for (const f of flips) {
       const px = this.priceSanity(f);
       if (px == null) continue;
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#e6a9ff", 0, 1);
       if (ser) this.gammaLines.push(ser);
-      if (rng) markers.push({ time: rng.to, position: "aboveBar", color: "#e6a9ff", shape: "text", text: `flip` });
     }
     for (const w of (g.call_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
@@ -680,7 +669,7 @@ class ChartWindow {
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#1e90ff", 2, 1);
       if (ser) this.gammaLines.push(ser);
     }
-    this.gammaMarkers = markers;
+    this.gammaMarkers = [];
     this.applyMarkers();
     this.setRegime(g.local_sign);
     renderGammaDrawerFor(this);
@@ -794,8 +783,7 @@ class ChartWindow {
           } else if (this.gamma) this.renderGamma(this.gamma);
         } else if (id === "__zones__") {
           if (this.indicatorOn[id] === false) {
-            for (const ser of (this.zoneLines || [])) try { this.chart.removeSeries(ser); } catch {}
-            this.zoneLines = [];
+            this.drawZoneRects();
           } else this.drawZones();
         } else {
           const ind = this.indicators[id];
@@ -826,34 +814,60 @@ class ChartWindow {
     this.drawZones();
   }
   drawZones() {
-    // zone edges live in their OWN registry: drawStaticLines() (pivots) also
-    // owns staticLines and used to wipe the zone lines on every pivot delta.
     for (const ser of this.zoneLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.zoneLines = [];
-    const now = this.nowTs();
-    // Limit clutter: draw all unbroken zones + only the most recent broken ones.
-    const sorted = (this.zones || []).slice().sort((a, b) =>
-      (b.formed_ts || 0) - (a.formed_ts || 0));
-    const toDraw = [];
-    let brokenCount = 0;
-    for (const z of sorted) {
-      if (!z.broken) { toDraw.push(z); continue; }
-      if (brokenCount < 20) { toDraw.push(z); brokenCount++; }
-    }
-    for (const z of toDraw) {
-      let color = (z.direction || 0) > 0 ? "#089981" : "#f23645";
-      let style = 1;   // dashed for edges
-      if (z.broken) { color = "#6b7280"; style = 2; }
-      if (z.flipped_from != null) { color = "#f59e0b"; }
-      const startSec = z.formed_ts != null ? sec(z.formed_ts) : (now - 86400);
-      let endSec = z.end_ts != null ? sec(z.end_ts) : now;
+    this.drawZoneRects();
+  }
+
+  /* Filled translucent rectangles for zones (canvas overlay). */
+  drawZoneRects() {
+    const canvas = this.zoneCanvas;
+    if (!canvas) return;
+    const rect = this.chartBox.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(rect.width * dpr);
+    canvas.height = Math.floor(rect.height * dpr);
+    canvas.style.width = rect.width + "px";
+    canvas.style.height = rect.height + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+    if (this.indicatorOn["__zones__"] === false) return;
+    const ts = this.chart.timeScale();
+    const ps = this.chart.priceScale("right");
+    const rng = this.lastSessionRange();
+    for (const z of (this.zones || [])) {
+      if (z.top == null || z.bot == null) continue;
+      const top = Math.min(z.top, z.bot);
+      const bot = Math.max(z.top, z.bot);
+      const startSec = z.formed_ts != null ? sec(z.formed_ts) : (this.nowTs() - 86400);
+      let endSec = z.end_ts != null ? sec(z.end_ts) : this.nowTs();
       if (z.broken && z.broken_ts != null) endSec = sec(z.broken_ts);
-      for (const pr of [z.top, z.bot]) {
-        if (pr == null) continue;
-        const ser = this.drawBoundedLevel(pr, startSec, endSec, color, style, 1);
-        if (ser) this.zoneLines.push(ser);
-      }
+      const x1 = ts.timeToCoordinate(startSec);
+      const x2 = ts.timeToCoordinate(endSec);
+      const y1 = ps.priceToCoordinate(bot);
+      const y2 = ps.priceToCoordinate(top);
+      if (x1 == null || x2 == null || y1 == null || y2 == null) continue;
+      const x = Math.min(x1, x2);
+      const w = Math.abs(x2 - x1);
+      const y = Math.min(y1, y2);
+      const h = Math.abs(y2 - y1);
+      if (w < 1 || h < 1) continue;
+      const isSupply = (z.direction || 0) < 0;
+      const color = z.broken ? "rgba(107,114,128,0.15)"
+        : (isSupply ? "rgba(239,83,80,0.18)" : "rgba(38,166,154,0.18)");
+      const stroke = z.broken ? "rgba(107,114,128,0.4)"
+        : (isSupply ? "rgba(239,83,80,0.6)" : "rgba(38,166,154,0.6)");
+      ctx.fillStyle = color;
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x, y, w, h);
     }
+  }
+
+  _indicatorOn(id) {
+    return this.indicatorOn[id] !== false;
   }
 
   setPositions(list) {
@@ -1114,6 +1128,7 @@ class ChartWindow {
     clearSeries(this.pivotLines);    this.pivotLines = [];
     clearSeries(this.staticLines);    this.staticLines = [];
     clearSeries(this.zoneLines);      this.zoneLines = [];
+    this.drawZoneRects();
     for (const lbl in this.strategyLines)
       clearSeries(this.strategyLines[lbl]);
     this.strategyLines = {};
@@ -1149,6 +1164,28 @@ class ChartWindow {
     for (const rec of (msg.log || [])) appendLog(rec, false);
     for (const rec of (msg.errors || [])) appendLog(rec, true);
     this.updateHeader();
+    // initial zoom based ONLY on candles (never on indicators/levels)
+    if (!this._initialLoadDone) {
+      this._initialLoadDone = true;
+      try {
+        const cd = this.candles.map(b => ({ time: sec(b.ts) }));
+        const dataLen = cd.length;
+        const viewSize = 300;
+        if (dataLen > viewSize) {
+          const step = this.gridStep();
+          const lastT = cd[cd.length - 1].time;
+          const to = lastT + step * 3;
+          this.chart.timeScale().setVisibleRange({
+            from: to - viewSize * step, to,
+          });
+        } else if (dataLen) {
+          this.chart.timeScale().setVisibleRange({
+            from: cd[0].time,
+            to: cd[cd.length - 1].time + 60,
+          });
+        }
+      } catch (e) {}
+    }
   }
 
   /* snapshot indicators carry the FULL series -> non-append replace */
