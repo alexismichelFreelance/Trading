@@ -54,6 +54,7 @@ class ChartWindow {
     this.roster = [];           // [{label, enabled, qty, entry, target, stop}]
     this.strategyOn = {};       // label -> bool
     this.strategySolo = null;
+    this.indicatorOn = {};      // id -> bool
     this.zones = [];            // [{id, tf, top, bot, direction, virgin, touches}]
     this.positions = [];        // [{sleeve, qty, entry, target, stop}]
     this.fillMarkers = [];
@@ -721,7 +722,8 @@ class ChartWindow {
     const ids = Object.keys(this.indicators);
     host.innerHTML = ids.map(id => {
       const on = this.indicatorOn[id] !== false;
-      const lbl = (this.indicators[id].label || id);
+      const info = this.indicators[id] || {};
+      const lbl = (info.label || id);
       return `<div class="rosterRow ${on ? "" : "off"}">
         <span class="sw ${on ? "on" : ""}" data-id="${escapeHtml(id)}"></span>
         <span class="name">${escapeHtml(lbl)}</span>
@@ -834,14 +836,22 @@ class ChartWindow {
     const seen = new Set();
     for (const c of this.candles) {
       const d = new Date(c.ts / 1e6);
-      // RTH open ~ 09:30 ET; approximate with UTC-4 (EDT). Good enough for a marker.
-      const etHour = (d.getUTCHours() + 20) % 24; // rough
+      // ET = UTC-4 (EDT) approx. Good enough for session markers.
+      const etHour = (d.getUTCHours() + 20) % 24;
       const etMin = d.getUTCMinutes();
       const dayKey = d.toISOString().slice(0, 10);
-      if (etHour === 9 && etMin === 30 && !seen.has(dayKey)) {
-        seen.add(dayKey);
+      const key = (h, m, label) => `${dayKey}-${label}`;
+      // London open 03:00 ET
+      if (etHour === 3 && etMin === 0 && !seen.has(key(3,0,"LON"))) {
+        seen.add(key(3,0,"LON"));
         out.push({ time: sec(c.ts), position: "aboveBar",
-          color: "#4f9cf9", shape: "arrowDown", text: "RTH" });
+          color: "#22c55e", shape: "text", text: "LON" });
+      }
+      // RTH open 09:30 ET
+      if (etHour === 9 && etMin === 30 && !seen.has(key(9,30,"RTH"))) {
+        seen.add(key(9,30,"RTH"));
+        out.push({ time: sec(c.ts), position: "aboveBar",
+          color: "#4f9cf9", shape: "text", text: "RTH" });
       }
     }
     this.sessionMarkers = out;
