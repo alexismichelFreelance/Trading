@@ -131,6 +131,16 @@ def session_daily_bars(sym: str) -> list:
             f"ORDER BY ts")
         if not len(df):
             return []
+        # claude_bars_live carries 4,140 ES rows stamped with NQ prices
+        # (2026-09-29..10-02). A daily bar aggregated over that block reports
+        # a high of 31,280 and poisons the pivot grid. Drop the outliers.
+        from engine.core.barsanity import filter_frame
+        df, dropped = filter_frame(df)
+        if dropped:
+            log.warning("session daily bars: dropped %d implausible rows for %s",
+                        dropped, sym)
+        if not len(df):
+            return []
         et = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("America/New_York")
         mod = et.dt.hour * 60 + et.dt.minute
         df = df.copy()
@@ -179,6 +189,15 @@ def minute_bars_for(sym: str, sessions: int = 60) -> list:
             f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
             f"WHERE symbol = '{sym}' AND ts > dateadd('d', -{int(sessions * 1.5)}, now()) "
             f"ORDER BY ts")
+        # claude_bars_live carries 4,140 ES rows stamped with NQ prices
+        # (2026-09-29..10-02). The zone detector seeds its book from this
+        # history, so a bad block produces zones with edges at 31,159 -- which
+        # then stretch the dashboard's price scale and hide the candles.
+        from engine.core.barsanity import filter_frame
+        df, dropped = filter_frame(df)
+        if dropped:
+            log.warning("zone seed: dropped %d implausible 1m rows for %s",
+                        dropped, sym)
         for r in df.itertuples():
             bars.append(_Bar(int(pd.Timestamp(r.ts).value), "1m",
                              float(r.o), float(r.h), float(r.l), float(r.c),

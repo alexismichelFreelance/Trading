@@ -95,6 +95,18 @@ NS = 1_000_000_000
 # the client to 1m. Order matters for the picker.
 TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
 
+# How much REAL history the demo seeds the engine with.
+#
+# The zone detectors are RTH-gated and need 20 bars of their own timeframe
+# before they can score a departure at all (13 a session at 30m, 6.5 at 1h,
+# 1.6 at 4h) -- the live engine seeds 60 sessions for exactly this reason.
+# The demo used to seed three sessions of OVERNIGHT bars, which the RTH gate
+# discards wholesale: the demo therefore detected NO zones and NO floor
+# pivots at all, while showing candles.
+DEEP_HISTORY_DAYS = 45
+# How much of that history the CHART opens on.
+CHART_SESSIONS = 3
+
 # Per-lane demo generators (see _DemoLane). These produce the raw 1m tape.
 _GEN_SEED = {"ES": 7000.0, "NQ": 21000.0, "GC": 3900.0}
 _GEN_POINT = {"ES": 50.0, "NQ": 20.0, "GC": 100.0}
@@ -137,19 +149,53 @@ def _synthetic_daily(dl, sessions: int):
     return out
 
 
-def _real_seed_bars(qdb, symbol: str, sessions: int = 3) -> list:
-    """Most recent real 1m bars for a symbol from QuestDB, chronological.
+def _real_history(qdb, symbol: str, days: int = DEEP_HISTORY_DAYS) -> list:
+    """Real 1m bars over the last `days` days, chronological.
 
-    Pulls the last `sessions` sessions' worth (390 bars each) directly from
-    the ingest table so the demo opens on genuine history; the engine
-    pipeline then computes VWAP bands / zones / pivots over real sessions."""
+    The ENGINE's structure -- zones, floor pivots -- needs far more history
+    than the chart does, and the demo was seeding three sessions of OVERNIGHT
+    bars, which the RTH gate throws away wholesale. The detectors therefore
+    never saw an eligible bar and the demo drew NO zones and NO pivots at
+    all. The live engine seeds 60 sessions for exactly this reason; the demo
+    does the same, over a real date window.
+    """
     df = qdb.df(
         "SELECT ts, o, h, l, c, vol FROM claude_bars_live "
-        f"WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {sessions * 390}")
+        f"WHERE symbol = '{symbol}' AND ts > dateadd('d', -{int(days)}, now()) "
+        "ORDER BY ts")
+    from engine.core.barsanity import filter_frame
+    df, dropped = filter_frame(df)
+    if dropped:
+        log.warning("real history: dropped %d implausible rows for %s",
+                    dropped, symbol)
+    return [Bar(r.ts.value, "1m", float(r.o), float(r.h), float(r.l),
+                float(r.c), int(r.vol), symbol)
+            for r in df.itertuples()]
+
+
+def _real_daily_bars(bars_1m: list, symbol: str) -> list:
+    """Real 1d bars from 1m history, on the ET calendar day.
+
+    The 1d zone detector needs a real price history. The demo used to
+    fabricate dailies around a made-up seed price (7,000 for ES) while the
+    candles traded at 7,772 -- the 1d structure was then anchored to the
+    wrong market entirely.
+    """
+    import pandas as pd
+    from engine.core.timeutil import et
+    by_day: dict[str, list] = {}
+    for b in bars_1m:
+        day = et(b.ts).strftime("%Y-%m-%d")
+        by_day.setdefault(day, []).append(b)
     out = []
-    for r in df.iloc[::-1].itertuples():
-        out.append(Bar(r.ts.value, "1m", float(r.o), float(r.h), float(r.l),
-                      float(r.c), int(r.vol), symbol))
+    for day in sorted(by_day):
+        g = by_day[day]
+        if len(g) < 300:                      # partial session
+            continue
+        ts = int(pd.Timestamp(f"{day} 23:59", tz="America/New_York").value)
+        out.append(Bar(ts, "1d", float(g[0].c),
+                       float(max(x.h for x in g)), float(min(x.l for x in g)),
+                       float(g[-1].c), int(sum(x.v for x in g)), symbol))
     return out
 
 
@@ -171,6 +217,11 @@ class _DemoLane:
         self.blotter = Blotter(symbol, point_usd)
         self.start_px = _GEN_SEED.get(symbol, 7000.0)
         self._px = self.start_px
+        # The level the synthetic tape mean-reverts to. It starts at the
+        # synthetic seed price, but a lane seeded from REAL history must orbit
+        # the real close -- otherwise the demo drifts away from the market it
+        # is standing in for (it used to decay from 7,772 toward 7,000).
+        self._anchor_px = self.start_px
         self.bar_ts = 0
         self.scale = {"ES": 26.0, "NQ": 90.0, "GC": 16.0}.get(symbol, 20.0)
         self.vol = {"ES": 1300, "NQ": 1800, "GC": 600}.get(symbol, 800)
@@ -199,7 +250,7 @@ class _DemoLane:
         if self._regime == "burst":
             self._px += random.choice([-1, 1]) * self.scale * random.uniform(0.6, 1.2)
         # hard range bound so price stays sensible
-        self._px += (self.start_px - self._px) * 0.00006
+        self._px += (self._anchor_px - self._px) * 0.00006
         return self._px
 
     def bar(self, ts: int, complete: bool = True) -> Bar:
@@ -241,7 +292,10 @@ class _DemoLane:
         gex at a few strikes produce multiple ranked walls, a zero-crossing
         flip and the short-gamma pocket, all through the ACTUAL GammaCurve."""
         import random as _r
-        px = self.start_px
+        # The ladder is built AROUND SPOT: a dealer-gamma curve whose strikes
+        # sit at a different price than the candles is not a gamma curve, it is
+        # decoration -- the walls have to be where the price actually trades.
+        px = self._px
         per = {}
         # a few heavy put strikes below spot (support walls) and call strikes
         # above (resistance walls); lighter noise in between keeps the curve
@@ -265,6 +319,28 @@ class _DemoLane:
         self.gamma_curve = GammaCurve(rows, px, basis=0.0, underlying=und,
                                       sess="demo")
 
+    def reanchor_to(self, px: float) -> None:
+        """Re-anchor the lane to a new spot price.
+
+        The lane is built BEFORE its history seed lands, so the gamma ladder
+        and the open-position entries are priced off the synthetic seed
+        (7,000 for ES). Once the REAL close is known, everything that IS a
+        price has to move with it: a dealer-gamma curve whose strikes sit at
+        a different level than the candles is decoration, not structure --
+        the walls were landing ~700 points below the market.
+        """
+        self._px = px
+        self._anchor_px = px
+        self.build_gamma()
+        log.info("reanchor %s: spot=%.2f (gamma ladder, sleeves and the "
+                 "open-position average moved with it)", self.symbol, px)
+        for sleeve in self.strategies:
+            if getattr(sleeve, "pos", 0):
+                sleeve.entry = px
+        led = self.blotter._ledgers[self.symbol]
+        if led.qty:
+            led.avg_px = px
+
     def build_roster(self):
         """The engine-strategy roster for this lane. Each entry is a real-lane
         sleeve whose chart_marks() overlay comes from the lane's REAL engine
@@ -273,7 +349,6 @@ class _DemoLane:
         lb = self.levelbook
         beta = self.start_px * 0.003
         s = self.symbol
-        g = getattr(self, "gamma_curve", None)
 
         def piv_prices():
             try:
@@ -294,6 +369,10 @@ class _DemoLane:
             return sorted(out)
 
         def walls(pick):
+            # Resolve the curve at CALL time: the lane re-anchors its gamma
+            # ladder to the real close once the history seed lands, and the
+            # roster must follow the new curve, not the one it was built with.
+            g = getattr(self, "gamma_curve", None)
             if g is None or not getattr(g, "ok", False):
                 return []
             try:
@@ -499,14 +578,38 @@ class Dashboard:
         try:
             async for m in self.pub.subscribe():
                 kind = m["type"]
-                if kind == "__snapshot__":
+                if kind in ("__snapshot__", "__post_seed__"):
+                    # The subscriber yields the initial snapshot as
+                    # "__snapshot__" (the post-seed snapshot arrives as
+                    # "__post_seed__"); the browser client only understands
+                    # "snapshot", so relay both with the lane payload mapped
+                    # into its expected shape.
+                    snap = m.get("payload", {})
+                    lane = (snap.get("lanes") or {}).get(symbol) or {}
+                    # Relay the timeframe-AGGREGATED bars (bars[tf]) — bars_raw
+                    # is the raw feed tape (e.g. 1m) and would paint a chart
+                    # far denser than the window's timeframe.
+                    out = {"type": "snapshot", "symbol": symbol,
+                           "payload": {
+                               "bars": lane.get("bars", {}).get(tf)
+                                       or lane.get("bars_raw", []),
+                               "indicators": lane.get("indicators", []),
+                               "gamma": lane.get("gamma"),
+                               "strategies_roster": lane.get("strategies_roster", []),
+                               "zones": lane.get("zones", []),
+                               "positions": lane.get("positions", []),
+                           },
+                           "log": snap.get("log", []),
+                           "errors": snap.get("errors", [])}
+                    await ws.send_json(out)
                     continue
                 payload = m.get("payload", {})
                 if kind == "bar":
                     bar = payload.get("bar", {})
-                    # deliver only this window's lane AND timeframe (bar deltas
-                    # are broadcast for every lane at the same ts, so without an
-                    # explicit lane check a window would mix GC/NQ bars in)
+                    # deliver only this window's lane AND timeframe (bar
+                    # deltas are broadcast for every lane at the same ts, so
+                    # without an explicit lane check a window would mix
+                    # GC/NQ bars in)
                     if m.get("lane") != symbol or (bar or {}).get("tf") != tf:
                         continue
                     out = {"type": "delta", "symbol": symbol,
@@ -516,14 +619,15 @@ class Dashboard:
                     if m.get("lane") != symbol:
                         continue
                     if kind == "indicator":
-                        # relay only the recent engine points per series (values
-                        # are untouched — the INDICATOR is still the engine's; we
-                        # just bound how much of its history each window shows)
+                        # relay only the recent engine points per series
+                        # (values are untouched — the INDICATOR is still the
+                        # engine's; we just bound how much of its history
+                        # each window shows)
                         payload = dict(payload)
                         payload["points"] = payload.get("points", [])[-600:]
                     out = {"type": "delta", "symbol": symbol,
                            "kind": kind, "payload": payload}
-                else:                       # log/error/session/lane are global
+                else:                   # log/error/session/lane are global
                     out = {"type": "delta", "symbol": symbol,
                            "kind": kind, "payload": payload}
                 buf.append(out)
@@ -572,6 +676,13 @@ class Dashboard:
             df = qdb.df(sql)
             if df.empty:
                 return web.json_response({"bars": {tf: []}, "indicators": [], "zones": [], "positions": []})
+            # a range window can reach the 2026-09-29..10-02 block where the
+            # recorder wrote NQ prices under the ES symbol -- drop those rows
+            # before they reach the chart
+            from engine.core.barsanity import filter_frame
+            df, dropped = filter_frame(df)
+            if dropped:
+                log.warning("history: dropped %d implausible rows for %s", dropped, symbol)
 
             # convert to BarDict list (df ts is epoch ns via the client)
             bars_raw = [{
@@ -697,15 +808,26 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
         import pandas as pd
 
         def session_1m(sessions: int = 14):
-            """Chronological RTH 1m bar close-times for `sessions` ET days."""
+            """Chronological RTH 1m bar close-times for `sessions` ET days.
+
+            ONLY sessions that have already CLOSED are included. Today's
+            09:30-16:00 ET session is still in the future at 01:00 ET, and a
+            lane seeded with future bars pins the whole tape into the future:
+            the tape's start ts is the MAX over the lanes, so one future lane
+            stalled the market for every lane (no bars, stale gamma, stale
+            average price). Weekends are skipped -- there is no session."""
             out = []
-            base = pd.Timestamp.now(tz="America/New_York").normalize()
-            for d in range(sessions - 1, -1, -1):
-                day = (base - pd.Timedelta(days=d)).strftime("%Y-%m-%d")
-                for m in range(0, 390):            # 09:30 .. 16:00 ET closes
-                    t = pd.Timestamp(f"{day} 09:30", tz="America/New_York") \
-                        + pd.Timedelta(minutes=m)
-                    out.append(t.value)
+            now_et = pd.Timestamp.now(tz="America/New_York")
+            day = now_et.normalize()
+            want = sessions * 390
+            while len(out) < want:
+                if day.weekday() < 5 and \
+                        (day + pd.Timedelta(hours=16)) <= now_et:
+                    for m in range(0, 390):        # 09:30 .. 16:00 ET closes
+                        t = day + pd.Timedelta(hours=9, minutes=30) \
+                            + pd.Timedelta(minutes=m)
+                        out.append(t.value)
+                day = day - pd.Timedelta(days=1)
             return out
 
         seq = session_1m(3)
@@ -716,15 +838,25 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
         # real close. Lanes with no real data (or --synthetic-seed) fall
         # back to the synthetic tape.
         real: dict[str, list] = {}
+        deep: dict[str, list] = {}
         if not synthetic_seed:
             try:
                 qdb = QuestDB()
                 for sym in lanes:
-                    real[sym] = _real_seed_bars(qdb, sym, sessions=3)
+                    hist = _real_history(qdb, sym)
+                    if not hist:
+                        continue
+                    deep[sym] = hist
+                    # the CHART opens on the tail of that history
+                    real[sym] = hist[-CHART_SESSIONS * 390:]
+                    log.info("real seed [%s]: %d 1m bars over %d days "
+                             "(%d for the chart)",
+                             sym, len(hist), DEEP_HISTORY_DAYS, len(real[sym]))
             except Exception as ex:                     # noqa: BLE001
                 log.warning("real-history seed unavailable (%s); "
                             "using synthetic seed", ex)
                 real = {}
+                deep = {}
         # Reject cross-lane duplicate data: the NQ ingest has lately been
         # mirroring ES rows exactly (same ts/close/volume), and feeding that
         # as "NQ" would paint a fake chart — polluted lanes go synthetic.
@@ -738,23 +870,56 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
                     log.warning("real seed: %s tail duplicates ES — "
                                 "using synthetic seed for it", sym)
                     del real[sym]
+                    deep.pop(sym, None)
         for dl in lanes.values():
             # reset per-lane bar index so the live tape continues cleanly
             dl._n = 0
             bars = real.get(dl.symbol) or []
-            if bars:
-                for i, b in enumerate(bars):
+            hist = deep.get(dl.symbol) or []
+            if hist:
+                # DEEP history first, and to the ENGINE only: the LevelBook
+                # needs RTH bars to build the floor-pivot grid, and the zone
+                # detectors need 20 bars of their own timeframe. The chart
+                # below only ever shows the tail of it.
+                daily = _real_daily_bars(hist, dl.symbol)
+                if daily:
+                    dl.zoneview.seed_daily(daily)
+                for b in hist:
                     dl.levelbook.on_bar(b)
                     dl.zoneview.update(b)
+            if bars:
+                for i, b in enumerate(bars):
                     await engine.on_bar_hook(b, False, 0)
                     if i % 60 == 59:
                         # yield so the HTTP socket opens while the seed is
                         # still running (real QuestDB seeds take ~20s)
                         await asyncio.sleep(0)
-                dl.zoneview.seed_daily(
-                    _synthetic_daily(dl, max(1, len(bars) // 390)))
-                # continue the synthetic tape from the last REAL close
-                dl._px = bars[-1].c
+                if not hist:
+                    dl.zoneview.seed_daily(
+                        _synthetic_daily(dl, max(1, len(bars) // 390)))
+                # continue the synthetic tape from the last REAL close, and
+                # orbit THAT close -- the demo must not drift away from the
+                # market it is standing in for
+                dl.reanchor_to(bars[-1].c)
+                # the live tape continues from the last REAL bar, not from
+                # epoch zero (bar_ts is only set by dl.bar(), which the real
+                # seed path never calls)
+                dl.bar_ts = bars[-1].ts
+                # the publisher holds the lane's gamma curve by reference:
+                # hand it the re-anchored one
+                for src in srcs:
+                    if src.symbol == dl.symbol:
+                        src.gamma_curve = dl.gamma_curve
+                led = dl.blotter._ledgers[dl.symbol]
+                eng_led = engine.blotter._ledgers[dl.symbol]
+                eng_led.qty = led.qty
+                eng_led.avg_px = led.avg_px
+                # the seed published the PRE-anchor state into the store
+                # (gamma walls/flips around the synthetic seed price, the
+                # 7000s): re-publish the lane now that it is anchored to the
+                # real close, so no subscriber ever sees the stale map
+                await pub._publish_lane(dl.symbol,
+                                        {"ts": bars[-1].ts, "c": bars[-1].c})
             else:
                 dl._px = dl.start_px + random.uniform(-2, 2)
                 for ts in seq:
@@ -764,38 +929,56 @@ async def make_demo(host: str, port: int, tick_s: float, symbols,
                     await engine.on_bar_hook(b, False, 0)
                     await asyncio.sleep(0)
                 dl.zoneview.seed_daily(_synthetic_daily(dl, len(seq) // 390))
+        # No lane may be stamped in the FUTURE: the tape's start ts is the
+        # MAX over the lanes, so a single lane seeded with future bars stalls
+        # the whole market (no bars at all, and every lane keeps the values
+        # the seed published). The synthetic fallback only seeds CLOSED
+        # sessions now, but the tape must never trust that.
+        now_ns = int(time.time()) * NS
+        for dl in lanes.values():
+            if dl.bar_ts > now_ns:
+                dl.bar_ts = now_ns - 60 * NS
         pub._seeding = False
         snap = pub.snapshot()
         for q in list(pub._subs.values()):
             q.put_nowait({"type": "__post_seed__", "payload": snap})
-        # live stream
+        # live stream -- ON THE WALL CLOCK
+        #
+        # One 1m bar per real minute, stamped with that minute. A demo that
+        # advances 60s of market time every 0.05s of wall time races into the
+        # future: the chart's time axis ended up a year ahead of the market it
+        # was standing in for, so every timestamp on screen was a lie. The
+        # tape now starts at the seeded history's last bar and walks forward
+        # to "now", catching up on whatever gap the recorder left behind.
         import logging as _log
         _lgr = _log.getLogger("engine.dashboard")
         _sent_error = False
         ts = max((l.bar_ts for l in lanes.values()), default=seq[-1]) + 60 * NS
         bar_idx = 0
         while True:
-            for dl in lanes.values():
-                b = dl.bar(ts)
-                dl.levelbook.on_bar(b)
-                dl.zoneview.update(b)
-                await engine.on_bar_hook(b, True, 0)
-                # occasional log lines so the engine log / error surface is
-                # visibly live (mimics run_live's periodic runner chatter)
-                if bar_idx % 12 == 0:
-                    _lgr.info("[%s] bar %d open: %s..%s vwap=%s", dl.symbol,
-                              bar_idx, b.o, b.c,
-                              round(dl.levelbook.vwap.value, 2) if getattr(
-                                  dl.levelbook.vwap, "value", None) else "n/a")
-                if bar_idx % 47 == 0 and not _sent_error:
-                    _sent_error = True
-                    _lgr.info("[%s] demo note: dealer-gamma map live (local sign "
-                              "%s at %.2f, %d flips) — drive the real tape with "
-                              "--live", dl.symbol,
-                              _gsign(dl), dl._px if hasattr(dl, "_px") else 0,
-                              _nflips(dl))
-                bar_idx += 1
-            ts += 60 * NS
+            now_min = int(time.time()) * NS
+            while ts <= now_min:
+                for dl in lanes.values():
+                    b = dl.bar(ts)
+                    dl.levelbook.on_bar(b)
+                    dl.zoneview.update(b)
+                    await engine.on_bar_hook(b, True, 0)
+                    # occasional log lines so the engine log / error surface is
+                    # visibly live (mimics run_live's periodic runner chatter)
+                    if bar_idx % 12 == 0:
+                        _lgr.info("[%s] bar %d open: %s..%s vwap=%s", dl.symbol,
+                                  bar_idx, b.o, b.c,
+                                  round(dl.levelbook.vwap.value, 2) if getattr(
+                                      dl.levelbook.vwap, "value", None) else "n/a")
+                    if bar_idx % 47 == 0 and not _sent_error:
+                        _sent_error = True
+                        _lgr.info("[%s] demo note: dealer-gamma map live (local sign "
+                                  "%s at %.2f, %d flips) — drive the real tape with "
+                                  "--live", dl.symbol,
+                                  _gsign(dl), dl._px if hasattr(dl, "_px") else 0,
+                                  _nflips(dl))
+                    bar_idx += 1
+                ts += 60 * NS
             await asyncio.sleep(tick_s)
 
     pub.attach(engine)
@@ -813,7 +996,8 @@ async def main() -> None:
     ap.add_argument("--tf", action="append", default=[],
                     help="aggregate timeframes (default all standard; pick per window)")
     ap.add_argument("--tick-s", type=float, default=0.05,
-                    help="demo: seconds per 1m bar per lane")
+                    help="demo: how often the wall-clock tape checks for a new "
+                         "minute (the tape itself runs one bar per real minute)")
     ap.add_argument("--live", action="store_true",
                     help="attach to the NT8 live feed instead of loopback demo")
     ap.add_argument("--synthetic-seed", action="store_true",
@@ -841,6 +1025,17 @@ async def main() -> None:
         drive_task.cancel()
     dash.app.on_shutdown.append(shutdown)   # BEFORE run() freezes the list
     drive_task = asyncio.create_task(drive())   # run loop, so it also runs
+    # A dead drive() used to fail SILENTLY: the task's exception was never
+    # retrieved, the HTTP server kept serving the last snapshot, and the
+    # dashboard looked "live" while the tape had stopped minutes ago. Report
+    # it instead -- a dead tape must be visible in the log.
+    def _drive_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.error("demo drive task died", exc_info=exc)
+    drive_task.add_done_callback(_drive_done)
     # Bind the HTTP server first, then let the demo tape proceed in the
     # background (a slow historical seed never blocks the socket coming up;
     # the seeding loop yields per bar and drive() runs concurrently).

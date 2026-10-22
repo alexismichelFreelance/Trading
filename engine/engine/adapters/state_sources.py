@@ -97,20 +97,26 @@ def _vwap_bands(vwap, bar_ts: int) -> list:
     out.append({"id": "vwap", "producer": "levelbook:avwap",
                 "label": "anchored VWAP", "unit": "price",
                 "points": [{"ts": ts, "v": _round(v)}]})
+    # sigma is undefined until the band has accumulated enough data; emit
+    # NOTHING for those bars (never a null point — LWC rejects null values)
     lo2, hi2 = vwap.band(2.0)
-    out.append({"id": "vwap_2s_hi", "producer": "levelbook:avwap",
-                "label": "VWAP +2σ", "unit": "price",
-                "points": [{"ts": ts, "v": _round(hi2)}]})
-    out.append({"id": "vwap_2s_lo", "producer": "levelbook:avwap",
-                "label": "VWAP −2σ", "unit": "price",
-                "points": [{"ts": ts, "v": _round(lo2)}]})
+    if hi2 is not None and hi2 == hi2:
+        out.append({"id": "vwap_2s_hi", "producer": "levelbook:avwap",
+                    "label": "VWAP +2σ", "unit": "price",
+                    "points": [{"ts": ts, "v": _round(hi2)}]})
+    if lo2 is not None and lo2 == lo2:
+        out.append({"id": "vwap_2s_lo", "producer": "levelbook:avwap",
+                    "label": "VWAP −2σ", "unit": "price",
+                    "points": [{"ts": ts, "v": _round(lo2)}]})
     lo3, hi3 = vwap.band(3.0)
-    out.append({"id": "vwap_3s_hi", "producer": "levelbook:avwap",
-                "label": "VWAP +3σ", "unit": "price",
-                "points": [{"ts": ts, "v": _round(hi3)}]})
-    out.append({"id": "vwap_3s_lo", "producer": "levelbook:avwap",
-                "label": "VWAP −3σ", "unit": "price",
-                "points": [{"ts": ts, "v": _round(lo3)}]})
+    if hi3 is not None and hi3 == hi3:
+        out.append({"id": "vwap_3s_hi", "producer": "levelbook:avwap",
+                    "label": "VWAP +3σ", "unit": "price",
+                    "points": [{"ts": ts, "v": _round(hi3)}]})
+    if lo3 is not None and lo3 == lo3:
+        out.append({"id": "vwap_3s_lo", "producer": "levelbook:avwap",
+                    "label": "VWAP −3σ", "unit": "price",
+                    "points": [{"ts": ts, "v": _round(lo3)}]})
     return out
 
 

@@ -29,6 +29,12 @@ let windowCounter = 0;
 const sec = (ns) => Math.floor(ns / 1e9);
 const fmtPx = (x) => x == null ? "—" : Number(x).toFixed(2);
 const pad = (n) => String(n).padStart(2, "0");
+/* LWC throws "Value is null" on a null/NaN in setData/update — and one
+ * throwing series setData corrupts the shared chart model (blank chart).
+ * Indicator points from the engine can legitimately carry nulls (sigma
+ * bands undefined early-session), so nothing invalid ever reaches LWC. */
+const validPt = (p) => p && typeof p.ts === 'number' &&
+  typeof p.v === 'number' && !isNaN(p.v);
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g,
     c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -56,7 +62,8 @@ class ChartWindow {
 
     // series / line registries
     this.indSeries = {};        // id -> line series (vwap family line series)
-    this.staticLines = [];      // pivot/zone price lines on candleSeries
+    this.staticLines = [];      // pivot / gamma-level horizontal lines
+    this.zoneLines = [];        // zone edge horizontal lines
     this.gammaLines = [];
     this.strategyLines = {};    // label -> [priceLine, ...]
     this.positionLines = [];
@@ -215,9 +222,10 @@ class ChartWindow {
    * engine-published indicator store — never re-derived here. */
   syncBandAreas(id, append, newPts) {
     const src = this.indicators[id];
-    const pts = append ? newPts : (src ? src.points : null);
-    if (!pts || !pts.length) return;
-    const mapped = pts.map(p => ({ time: sec(p.ts), value: p.v }));
+    const pts = (append ? newPts : (src ? src.points : null)) || [];
+    const ok = pts.filter(validPt);
+    if (!ok.length) return;
+    const mapped = ok.map(p => ({ time: sec(p.ts), value: p.v }));
     for (const a of this.bandAreas) {
       if (a.src !== id) continue;
       if (append) for (const p of mapped) a.ser.update(p);
@@ -273,14 +281,18 @@ class ChartWindow {
         const dataLen = cd.length;
         const viewSize = 300;
         if (dataLen > viewSize) {
-          this.chart.timeScale().setVisibleLogicalRange({
-            from: dataLen - viewSize,
-            to: dataLen + 5,
+          // anchor in TIME: the logical index space is the union of every
+          // series' timestamps and shifts as overlays come and go.
+          const step = this.gridStep();
+          const lastT = cd[cd.length - 1].time;
+          const to = lastT + step * 3;
+          this.chart.timeScale().setVisibleRange({
+            from: to - viewSize * step, to,
           });
         } else {
-          this.chart.timeScale().setVisibleLogicalRange({
-            from: 0,
-            to: dataLen + 5,
+          this.chart.timeScale().setVisibleRange({
+            from: cd.length ? cd[0].time : 0,
+            to: cd.length ? cd[cd.length - 1].time + 60 : 0,
           });
         }
       } catch (e) {}
@@ -291,6 +303,12 @@ class ChartWindow {
     if (!b || typeof b.ts !== 'number' || typeof b.o !== 'number' ||
         typeof b.h !== 'number' || typeof b.l !== 'number' || typeof b.c !== 'number') return;
     const last = this.candles.length ? this.candles[this.candles.length - 1] : null;
+    // LightweightCharts only accepts ASCENDING updates: pushing an older bar
+    // onto a newer series throws "Cannot update oldest data" and blanks the
+    // chart. The NT8 feed replays its startup backfill newest-first, so a
+    // client that connects mid-warmup really does receive older bars after
+    // newer ones -- drop them (the snapshot already carries the history).
+    if (last && b.ts < last.ts) return;
     const datum = { time: sec(b.ts), open: b.o, high: b.h, low: b.l, close: b.c };
     const vdat = { time: sec(b.ts), value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0,
       color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)" };
@@ -302,6 +320,7 @@ class ChartWindow {
       this.candles.push(b);
       this.candleSeries.update(datum);
       this.volSeries.update(vdat);
+      this.followEnd();
     }
   }
 
@@ -342,6 +361,8 @@ class ChartWindow {
       cur.unit = ind.unit || cur.unit;
       tail = prevLast == null ? newPts.slice()
                               : newPts.filter(p => p.ts > prevLast);
+      // align the advancing tail onto the candle grid too (see snapToGrid)
+      tail = this.snapToGrid(tail);
     } else {
       // snapshot: the payload is the whole series — replace outright
       cur.points = newPts.slice();
@@ -350,21 +371,55 @@ class ChartWindow {
       cur.unit = ind.unit || "";
     }
     cur.points.sort((a, b) => a.ts - b.ts);
+    // A STATIC LEVEL series (floor pivots, dealer gamma) is not a time
+    // series: the engine stamps the WHOLE grid for EVERY session it spans,
+    // at that session's ts. Keeping one point per ts collapses the nine
+    // pivot levels into one; keeping them all would draw 21 sessions of
+    // grids at once. Take the CURRENT session's grid and let
+    // drawStaticLines() dedupe it by price.
+    const staticLevel = (cur.producer || "").includes("pivot") ||
+                        (cur.producer || "").includes("gamma_levels");
+    if (staticLevel) {
+      const maxTs = cur.points.length ? cur.points[cur.points.length - 1].ts : null;
+      cur.points = cur.points.filter((p) => p.ts === maxTs);
+    } else {
+      // LWC's renderer throws "Value is null" on duplicate times inside one
+      // series (engine stamps several indicators at the session ts) — keep the
+      // last point per ts so every series is strictly ascending.
+      cur.points = cur.points.filter((p, i) =>
+        i === cur.points.length - 1 || cur.points[i + 1].ts !== p.ts);
+      // LWC derives the time scale's time-per-slot from the SMALLEST gap
+      // between consecutive time points across ALL series. The engine emits
+      // indicator points per tick (60s) while candles are per bar (300s) —
+      // that dense tail collapses the whole time scale to 60s/slot and every
+      // bar is painted 5x too narrow. Snap each indicator point to the
+      // nearest candle time so every series shares the bar grid.
+      cur.points = this.snapToGrid(cur.points);
+    }
 
     if (cur.id === "vwap" || this.bandSeries[cur.id]) {
       const ser = cur.id === "vwap" ? this.vwapSeries : this.bandSeries[cur.id];
       if (!ser) return;
       if (append) {
-        for (const p of tail) ser.update({ time: sec(p.ts), value: p.v });
+        for (const p of tail) if (validPt(p))
+          ser.update({ time: sec(p.ts), value: p.v });
       } else {
-        ser.setData(cur.points.map(p => ({ time: sec(p.ts), value: p.v })));
+        const pts = cur.points.filter(validPt);
+        ser.setData(pts.map(p => ({ time: sec(p.ts), value: p.v })));
       }
       // band areas are native series now — no canvas overlay to repaint
       this.syncBandAreas(cur.id, append, tail);
       return;
     }
+    // pivots and gamma walls are static price LEVELS (the engine stamps all
+    // their points with the session ts — duplicates that would crash LWC's
+    // series renderer) — draw one bounded level per distinct price.
     if ((cur.producer || "").includes("pivot")) {
-      this.drawStaticLines(cur);
+      this.drawStaticLines(cur, "#a78bfa");
+      return;
+    }
+    if ((cur.producer || "").includes("gamma_levels")) {
+      this.drawStaticLines(cur, "#e6a9ff");
       return;
     }
     // unknown non-pivot, non-vwap series: draw as a generic line
@@ -376,10 +431,32 @@ class ChartWindow {
       this.indSeries[cur.id] = ser;
     }
     if (append) {
-      for (const p of tail) ser.update({ time: sec(p.ts), value: p.v });
+      for (const p of tail) if (validPt(p))
+        ser.update({ time: sec(p.ts), value: p.v });
     } else {
-      ser.setData(cur.points.map(p => ({ time: sec(p.ts), value: p.v })));
+      const pts = cur.points.filter(validPt);
+      ser.setData(pts.map(p => ({ time: sec(p.ts), value: p.v })));
     }
+  }
+
+  /* Snap indicator points onto the candle time grid (single forward scan —
+   * both inputs are sorted ascending). Points farther than `tol` from any
+   * candle are dropped; duplicates are left for the caller's dedupe. */
+  snapToGrid(pts, tol = 200) {
+    const g = this.candles;
+    if (!g.length || !pts.length) return pts;
+    const out = [];
+    let gi = 0, lastTs = null;
+    for (const p of pts) {
+      const t = sec(p.ts);
+      while (gi < g.length - 1 &&
+             Math.abs(sec(g[gi + 1].ts) - t) <= Math.abs(sec(g[gi].ts) - t)) gi++;
+      const snapped = sec(g[gi].ts);
+      if (Math.abs(snapped - t) > tol) continue;
+      if (snapped === lastTs) out[out.length - 1].v = p.v;  // keep latest
+      else { out.push({ ts: g[gi].ts, v: p.v }); lastTs = snapped; }
+    }
+    return out;
   }
 
   nowTs() {
@@ -387,33 +464,109 @@ class ChartWindow {
     return last ? sec(last.ts) : Math.floor(Date.now() / 1000);
   }
 
-  drawBoundedLevel(price, startTs, endTs, color, lineStyle, lineWidth) {
+  /* Bar spacing (seconds) of the candle grid — the width of one slot on the
+   * time axis. */
+  gridStep() {
+    const c = this.candles;
+    if (c.length < 2) return 300;
+    const n = Math.min(c.length - 1, 20);
+    let sum = 0;
+    for (let i = c.length - n; i < c.length; i++) sum += (c[i].ts - c[i - 1].ts) / 1e9;
+    const step = sum / n;
+    return (step > 0 && isFinite(step)) ? step : 300;
+  }
+
+  /* Nearest candle time (epoch SECONDS) for an arbitrary instant, clamped to
+   * the grid's bounds.
+   *
+   * EVERY series on the chart has to share one time grid. LWC derives the
+   * time scale's slot width from the SMALLEST gap between consecutive points
+   * across ALL series, so one stray timestamp that sits off the bar grid
+   * (a zone formed weeks earlier, a level anchored to "now - 1 day") either
+   * collapses the slot width to a fraction of a bar — every bar renders
+   * microns wide — or stretches the scale so the bars vanish off-screen. */
+  snapTimeToGrid(tSec) {
+    const c = this.candles;
+    if (!c.length) return tSec;
+    const g0 = sec(c[0].ts), g1 = sec(c[c.length - 1].ts);
+    if (tSec <= g0) return g0;
+    if (tSec >= g1) return g1;
+    let lo = 0, hi = c.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sec(c[mid].ts) < tSec) lo = mid + 1; else hi = mid;
+    }
+    const up = sec(c[lo].ts);
+    const dn = lo > 0 ? sec(c[lo - 1].ts) : up;
+    return (tSec - dn) <= (up - tSec) ? dn : up;
+  }
+
+  /* Overlay levels share the price scale with the candles, so ONE corrupt
+   * level destroys the whole chart: a zone edge at 31,159 (NQ prices the
+   * recorder wrote under the ES symbol) stretches the scale 4x and squeezes
+   * the candles into an invisible sliver at the bottom of the pane.
+   *
+   * A level more than 50% away from the current price is data corruption,
+   * not market structure -- ES at 7,750 has no legitimate level at 30,700.
+   * Returns null for such a level so the caller skips it. */
+  priceSanity(price) {
+    if (typeof price !== "number" || !isFinite(price)) return null;
+    const c = this.candles;
+    if (!c.length) return price;
+    const ref = c[c.length - 1].c;
+    if (!ref || !isFinite(ref) || ref <= 0) return price;
+    if (price > ref * 1.5 || price < ref * 0.5) return null;
+    return price;
+  }
+
+  /* A horizontal LEVEL line (gamma wall, pivot, zone edge, position level).
+   * Times are epoch SECONDS. Both endpoints are snapped onto the candle grid
+   * and forced strictly ascending: LWC throws "Value is null" when a series
+   * carries the same timestamp twice, and that error blanks the whole chart. */
+  drawBoundedLevel(price, startSec, endSec, color, lineStyle, lineWidth) {
     if (price == null) return null;
-    const now = this.nowTs();
-    if (startTs == null) startTs = now - 86400;
-    if (endTs == null) endTs = now;
+    price = this.priceSanity(price);
+    if (price == null) return null;
+    let t0 = startSec, t1 = endSec;
+    if (this.candles.length) {
+      const c = this.candles;
+      const g0 = sec(c[0].ts), g1 = sec(c[c.length - 1].ts);
+      const step = this.gridStep();
+      t0 = t0 == null ? g0 : this.snapTimeToGrid(t0);
+      t1 = t1 == null ? g1 : this.snapTimeToGrid(t1);
+      if (t1 < t0) { const s = t0; t0 = t1; t1 = s; }
+      if (t1 === t0) { t0 = g0; t1 = g1; }        // degenerate: span the window
+      if (t1 === t0) t1 = t0 + step;              // single-bar grid
+    } else {
+      const now = this.nowTs();
+      if (t0 == null) t0 = now - 86400;
+      if (t1 == null) t1 = now;
+      if (t1 < t0) { const s = t0; t0 = t1; t1 = s; }
+      if (t1 === t0) t1 = t0 + 60;
+    }
     const series = this.chart.addLineSeries({
       color, lineWidth: lineWidth || 1, lineStyle: lineStyle || 0,
       priceLineVisible: false, lastValueVisible: false,
       crosshairMarkerVisible: false,
     });
     series.setData([
-      { time: sec(startTs), value: price },
-      { time: sec(endTs), value: price },
+      { time: t0, value: price },
+      { time: t1, value: price },
     ]);
     return series;
   }
 
-  drawStaticLines(ind) {
+  drawStaticLines(ind, color) {
     for (const ser of this.staticLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.staticLines = [];
     const seen = new Set();
-    const now = this.nowTs();
     for (const p of (ind && ind.points) || []) {
       const key = p.v.toFixed(4);
       if (seen.has(key)) continue;
       seen.add(key);
-      const ser = this.drawBoundedLevel(p.v, now - 86400, now, "#a78bfa", 2, 1);
+      // a static LEVEL spans the whole visible window (null/null -> grid ends)
+      const ser = this.drawBoundedLevel(p.v, null, null,
+                                        color || "#a78bfa", 2, 1);
       if (ser) this.staticLines.push(ser);
     }
   }
@@ -421,27 +574,35 @@ class ChartWindow {
   /* ── dealer-gamma: multi-wall price lines + regime in header ───────── */
   renderGamma(g) {
     this.gamma = g;
-    this.gammaLines.forEach(pl => this.candleSeries.removePriceLine(pl));
+    this.gammaLines.forEach(pl => {
+      try { this.candleSeries.removePriceLine(pl); } catch {}
+    });
     this.gammaLines = [];
     if (!g || !g.ok) { this.setRegime(g && g.local_sign); return; }
     const flips = g.flips || [];
     for (const f of flips) {
+      const px = this.priceSanity(f);
+      if (px == null) continue;
       this.gammaLines.push(this.candleSeries.createPriceLine({
-        price: f, color: "#e6a9ff", lineWidth: 1, lineStyle: 0,
+        price: px, color: "#e6a9ff", lineWidth: 1, lineStyle: 0,
         axisLabelVisible: true, title: "flip" }));
     }
     for (const w of (g.call_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
       if (k == null) continue;
+      const px = this.priceSanity(k);
+      if (px == null) continue;
       this.gammaLines.push(this.candleSeries.createPriceLine({
-        price: k, color: "#ffa500", lineWidth: 1, lineStyle: 2,
+        price: px, color: "#ffa500", lineWidth: 1, lineStyle: 2,
         axisLabelVisible: true, title: "call wall" }));
     }
     for (const w of (g.put_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
       if (k == null) continue;
+      const px = this.priceSanity(k);
+      if (px == null) continue;
       this.gammaLines.push(this.candleSeries.createPriceLine({
-        price: k, color: "#1e90ff", lineWidth: 1, lineStyle: 2,
+        price: px, color: "#1e90ff", lineWidth: 1, lineStyle: 2,
         axisLabelVisible: true, title: "put wall" }));
     }
     this.setRegime(g.local_sign);
@@ -504,9 +665,12 @@ class ChartWindow {
 
   drawStrategy(s) {
     const lines = [];
+    // engine timestamps are epoch-NANOSECONDS -> convert once, here
+    const st = s.start_ts != null ? sec(s.start_ts) : null;
+    const et = s.end_ts != null ? sec(s.end_ts) : null;
     const add = (price, color, style, label) => {
       if (price == null) return;
-      const ser = this.drawBoundedLevel(price, s.start_ts, s.end_ts, color, style, 1);
+      const ser = this.drawBoundedLevel(price, st, et, color, style, 1);
       if (ser) lines.push(ser);
     };
     if (s.entry) add(s.entry, "#4f9cf9", 0, s.label + " entry");
@@ -520,17 +684,19 @@ class ChartWindow {
     this.drawZones();
   }
   drawZones() {
-    for (const ser of this.staticLines) { try { this.chart.removeSeries(ser); } catch {} }
-    this.staticLines = [];
+    // zone edges live in their OWN registry: drawStaticLines() (pivots) also
+    // owns staticLines and used to wipe the zone lines on every pivot delta.
+    for (const ser of this.zoneLines) { try { this.chart.removeSeries(ser); } catch {} }
+    this.zoneLines = [];
     const now = this.nowTs();
     for (const z of this.zones) {
       const color = (z.direction || 0) > 0 ? "#089981" : "#f23645";
-      const startTs = z.formed_ts || (now - 86400);
-      const endTs = z.end_ts || (startTs + 86400);
-      for (const [pr, nm] of [[z.top, "zone-top"], [z.bot, "zone-bot"]]) {
+      const startSec = z.formed_ts != null ? sec(z.formed_ts) : (now - 86400);
+      const endSec = z.end_ts != null ? sec(z.end_ts) : now;
+      for (const pr of [z.top, z.bot]) {
         if (pr == null) continue;
-        const ser = this.drawBoundedLevel(pr, startTs, endTs, color, 1, 1);
-        if (ser) this.staticLines.push(ser);
+        const ser = this.drawBoundedLevel(pr, startSec, endSec, color, 1, 1);
+        if (ser) this.zoneLines.push(ser);
       }
     }
   }
@@ -543,16 +709,13 @@ class ChartWindow {
     for (const ser of this.positionLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.positionLines = [];
     for (const p of this.positions) {
-      if (p.entry) {
-        const ser = this.drawBoundedLevel(p.entry, p.start_ts, p.end_ts, "#4f9cf9", 0, 1);
-        if (ser) this.positionLines.push(ser);
-      }
-      if (p.target) {
-        const ser = this.drawBoundedLevel(p.target, p.start_ts, p.end_ts, "#089981", 2, 1);
-        if (ser) this.positionLines.push(ser);
-      }
-      if (p.stop) {
-        const ser = this.drawBoundedLevel(p.stop, p.start_ts, p.end_ts, "#f23645", 2, 1);
+      const st = p.start_ts != null ? sec(p.start_ts) : null;
+      const et = p.end_ts != null ? sec(p.end_ts) : null;
+      for (const [pr, color, style] of [[p.entry, "#4f9cf9", 0],
+                                        [p.target, "#089981", 2],
+                                        [p.stop, "#f23645", 2]]) {
+        if (pr == null) continue;
+        const ser = this.drawBoundedLevel(pr, st, et, color, style, 1);
         if (ser) this.positionLines.push(ser);
       }
     }
@@ -613,6 +776,14 @@ class ChartWindow {
         populateSelects();
         this.updateHeader();
         break;
+      case "__snapshot__":
+        // server relays the subscriber's initial snapshot under this type
+        this.applySnapshot({
+          type: "snapshot",
+          payload: msg.payload && msg.payload.lanes ? msg.payload.lanes[this.symbol] : msg.payload,
+          log: msg.log || [], errors: msg.errors || [],
+        });
+        break;
       case "snapshot":
         this.applySnapshot(msg); break;
       case "__post_seed__":
@@ -634,6 +805,10 @@ class ChartWindow {
     if (!deltas.length) return;
     const barData = [], volData = [];
     let sawBar = false, sawFill = false;
+    // LWC rejects a bar older than the series' last one (see updateBar): the
+    // batch path needs the same guard, tracked across the batch.
+    let lastBarTs = this.candles.length
+      ? this.candles[this.candles.length - 1].ts : null;
     for (const d of deltas) {
       if (!d || !d.kind) continue;
       const pl = d.payload || {};
@@ -643,9 +818,11 @@ class ChartWindow {
           if (!b || typeof b.ts !== 'number' || typeof b.o !== 'number' ||
               typeof b.h !== 'number' || typeof b.l !== 'number' ||
               typeof b.c !== 'number') break;
+          if (lastBarTs !== null && b.ts < lastBarTs) break;   // out of order
           const last = this.candles.length ? this.candles[this.candles.length - 1] : null;
           if (last && last.ts === b.ts) this.candles[this.candles.length - 1] = b;
           else this.candles.push(b);
+          lastBarTs = b.ts;
           barData.push({ time: sec(b.ts), open: b.o, high: b.h, low: b.l, close: b.c });
           volData.push({ time: sec(b.ts),
             value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0,
@@ -666,8 +843,40 @@ class ChartWindow {
     if (sawBar) {
       for (const p of barData) this.candleSeries.update(p);
       for (const p of volData) this.volSeries.update(p);
+      this.followEnd();
     }
     if (sawFill) this.applyMarkers();
+  }
+
+  /* Keep the view pinned to the newest bars.
+   *
+   * LWC's own "shiftVisibleRangeOnNewBar" keeps the visible TIME window
+   * fixed, so as the tape grows the chart drifts LEFT off the data and the
+   * newest bars scroll out of sight. We re-anchor on every new bar instead.
+   *
+   * The anchor is expressed in TIME, not logical indices: the logical index
+   * space is the union of every series' timestamps, which shifts whenever an
+   * overlay series is added or removed, so an index-based anchor silently
+   * lands in the wrong place. A user who deliberately scrolled back is left
+   * alone — we only re-anchor when the view is still parked at the right edge.
+   */
+  followEnd() {
+    const ts = this.chart.timeScale();
+    const c = this.candles;
+    if (!c.length) return;
+    const last = c[c.length - 1];
+    const prev = c.length > 1 ? c[c.length - 2] : last;
+    const step = Math.max(1, (last.ts - prev.ts) / 1e9);
+    const lastT = sec(last.ts);
+    let vr = null;
+    try { vr = ts.getVisibleRange(); } catch { return; }
+    if (!vr) return;
+    // the user scrolled away from the right edge -> stop following
+    if (vr.to < lastT - step * 2) { this._following = false; return; }
+    this._following = true;
+    const span = Math.max(step, vr.to - vr.from);
+    const to = lastT + step * 3;             // rightOffset worth of padding
+    try { ts.setVisibleRange({ from: to - span, to }); } catch {}
   }
 
   /* Full state reconciliation for a fresh snapshot (first connect, or a
@@ -677,21 +886,26 @@ class ChartWindow {
    * or a broken socket survives into the new picture. Call BEFORE re-rendering
    * the snapshot payload. */
   resetForSnapshot() {
-    const clearLines = (arr) => {
+    // gamma walls are LWC price lines; every other overlay is a SERIES.
+    // Passing a series to removePriceLine() throws "t._w is not a function",
+    // which aborted this method (and the whole snapshot) mid-way.
+    const clearPriceLines = (arr) => {
       if (!arr) return;
-      for (const pl of arr) this.candleSeries && this.candleSeries.removePriceLine(pl);
+      for (const pl of arr) {
+        try { this.candleSeries && this.candleSeries.removePriceLine(pl); } catch {}
+      }
     };
-    clearLines(this.gammaLines);   this.gammaLines = [];
-    for (const ser of this.staticLines) {
-      try { this.chart.removeSeries(ser); } catch {}
-    }
-    this.staticLines = [];
+    const clearSeries = (arr) => {
+      if (!arr) return;
+      for (const ser of arr) { try { this.chart.removeSeries(ser); } catch {} }
+    };
+    clearPriceLines(this.gammaLines); this.gammaLines = [];
+    clearSeries(this.staticLines);    this.staticLines = [];
+    clearSeries(this.zoneLines);      this.zoneLines = [];
     for (const lbl in this.strategyLines)
-      this.strategyLines[lbl].forEach(ser => {
-        try { this.chart.removeSeries(ser); } catch {}
-      });
+      clearSeries(this.strategyLines[lbl]);
     this.strategyLines = {};
-    clearLines(this.positionLines); this.positionLines = [];
+    clearSeries(this.positionLines);  this.positionLines = [];
     for (const id in this.indSeries) {
       try { this.chart.removeSeries(this.indSeries[id]); } catch {}
     }
@@ -800,6 +1014,7 @@ function addWindow(symbol, tf) {
   const container = $("grid");
   const w = new ChartWindow("w" + (++windowCounter), symbol, tf, container);
   windows.set(w.id, w);
+  window.__chartWin = w;   // debug/testing hook
   w.connect();
   updateGrid();
   return w;

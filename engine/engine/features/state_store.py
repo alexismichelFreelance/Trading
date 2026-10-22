@@ -56,6 +56,22 @@ from typing import Any
 
 MAX_RAW_BARS = 1800          # closed 1m bars retained per lane (~3 trading days)
 MAX_AGG_BARS = 600           # aggregated candles retained per TF per lane
+
+
+def _trim_oldest(win: dict, limit: int) -> None:
+    """Keep the `limit` NEWEST entries of a ts-keyed window.
+
+    The window is bounded by TIME, not by arrival order. The NT8 feed
+    replays its startup backfill NEWEST-FIRST, so a FIFO ring (deque with
+    maxlen) ends up holding the OLDEST slice of the replay plus whatever
+    live bars came after it -- the dashboard then renders a chart that ends
+    days before the live edge. Trimming by ts keeps the window anchored to
+    the newest bars whatever order the feed used."""
+    excess = len(win) - limit
+    if excess <= 0:
+        return
+    for old in sorted(win)[:excess]:
+        win.pop(old, None)
 MAX_LOG = 200               # log records retained
 MAX_ERRORS = 60             # error/warning records retained
 SNAPSHOT_MAX_INDICATOR_POINTS = 1800  # snapshot truncation to keep frame small
@@ -76,8 +92,8 @@ class StateStore:
         lane = self._lanes.get(sym)
         if lane is None:
             lane = self._lanes[sym] = {
-                "bars_raw": deque(maxlen=MAX_RAW_BARS),
-                "bars": {},                       # tf -> deque
+                "bars_raw": {},                    # ts -> BarDict (newest window)
+                "bars": {},                        # tf -> {ts -> BarDict}
                 "indicators": {},                 # id -> {"id","producer","label",
                                                   #        "unit","points": deque}
                 "gamma": None,                    # GammaMap (structured, per lane)
@@ -97,7 +113,9 @@ class StateStore:
         """Record one closed bar (raw 1m canonical). `b` is a BarDict dict."""
         lane = self._lane(b["symbol"])
         self.ts = max(self.ts, b["ts"])
-        lane["bars_raw"].append(b)
+        raw = lane["bars_raw"]
+        raw[int(b["ts"])] = b
+        _trim_oldest(raw, MAX_RAW_BARS)
         return self._next("bar", b["symbol"], {"bar": b})
 
     def apply_agg_bar(self, b: dict) -> dict | None:
@@ -106,8 +124,9 @@ class StateStore:
         unknown (cannot place without a lane)."""
         lane = self._lane(b["symbol"])
         self.ts = max(self.ts, b["ts"])
-        q = lane["bars"].setdefault(b["tf"], deque(maxlen=MAX_AGG_BARS))
-        q.append(b)
+        q = lane["bars"].setdefault(b["tf"], {})
+        q[int(b["ts"])] = b
+        _trim_oldest(q, MAX_AGG_BARS)
         return self._next("bar", b["symbol"], {"bar": b, "aggregated": True})
 
     def apply_indicator(self, lane: str, series: dict) -> dict | None:
@@ -150,7 +169,12 @@ class StateStore:
             "producer": entry["producer"],
             "label": entry["label"],
             "unit": entry["unit"],
-            "points": [{"ts": p["ts"], "v": p["v"]} for p in points.values()],
+            # DELTA, not the whole series: sending every point again on every
+            # bar is the "resend the whole history every bar" flow this
+            # contract exists to prevent (a 600-bar VWAP x 6 band series
+            # per bar, per lane). The client merges by ts, so it only needs
+            # what is new; the full series travels in the snapshot.
+            "points": [{"ts": p["ts"], "v": p["v"]} for p in new_points],
         }
         return self._next("indicator", lane, payload)
     def apply_gamma(self, lane: str, gamma_map: dict | None) -> dict | None:
@@ -250,8 +274,8 @@ class StateStore:
                 return sorted(list(b), key=lambda x: int(x.get("ts", 0)))
             lanes[sym] = {
                 "symbol": sym,
-                "bars_raw": _asc(l["bars_raw"]),
-                "bars": {tf: _asc(q) for tf, q in l["bars"].items()},
+                "bars_raw": _asc(l["bars_raw"].values()),
+                "bars": {tf: _asc(q.values()) for tf, q in l["bars"].items()},
                 "indicators": [
                     StateStore._series_dict(sid, v, limit=SNAPSHOT_MAX_INDICATOR_POINTS)
                     for sid, v in sorted(l["indicators"].items())

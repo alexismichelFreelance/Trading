@@ -62,6 +62,47 @@ def test_store_agg_bar_rings_by_tf():
     assert snap["bars"]["5m"][1]["tf"] == "5m"
 
 
+def test_store_bar_window_is_kept_by_time_not_arrival():
+    """The retained bar window is the NEWEST bars by TIME.
+
+    The NT8 feed replays its startup backfill newest-first, so a FIFO ring
+    (deque with maxlen) ends up holding the OLDEST slice of the replay: the
+    dashboard then renders a chart that ends days before the live edge. The
+    store must trim by ts, whatever order the bars arrive in."""
+    store = StateStore()
+    # a newest-first replay of 5 one-minute bars
+    for i in (5, 4, 3, 2, 1):
+        store.apply_bar({"ts": i * NS, "tf": "1m", "o": 1, "h": 2, "l": 1,
+                         "c": 1.5, "v": 10, "symbol": "ES", "complete": True})
+        store.apply_agg_bar({"ts": i * NS, "tf": "5m", "o": 1, "h": 2, "l": 1,
+                             "c": 1.5, "v": 10, "symbol": "ES", "complete": True})
+    # then one live bar, the newest of all
+    store.apply_bar({"ts": 6 * NS, "tf": "1m", "o": 1.5, "h": 3, "l": 1.5,
+                     "c": 2, "v": 12, "symbol": "ES", "complete": True})
+    store.apply_agg_bar({"ts": 6 * NS, "tf": "5m", "o": 1.5, "h": 3, "l": 1.5,
+                         "c": 2, "v": 12, "symbol": "ES", "complete": True})
+    lane = store.snapshot()["lanes"]["ES"]
+    assert [b["ts"] for b in lane["bars_raw"]] == [1 * NS, 2 * NS, 3 * NS,
+                                                   4 * NS, 5 * NS, 6 * NS]
+    assert [b["ts"] for b in lane["bars"]["5m"]] == [1 * NS, 2 * NS, 3 * NS,
+                                                     4 * NS, 5 * NS, 6 * NS]
+    assert lane["bars_raw"][-1]["ts"] == 6 * NS          # the newest bar is kept
+
+
+def test_store_bar_window_trims_to_the_newest():
+    """Over a long newest-first replay the window keeps the NEWEST N bars."""
+    from engine.features.state_store import MAX_AGG_BARS
+    store = StateStore()
+    n = MAX_AGG_BARS + 25
+    for i in range(n, 0, -1):            # newest first
+        store.apply_agg_bar({"ts": i * NS, "tf": "5m", "o": 1, "h": 2, "l": 1,
+                             "c": 1.5, "v": 10, "symbol": "ES", "complete": True})
+    bars = store.snapshot()["lanes"]["ES"]["bars"]["5m"]
+    assert len(bars) == MAX_AGG_BARS
+    assert bars[-1]["ts"] == n * NS                        # newest kept
+    assert bars[0]["ts"] == (n - MAX_AGG_BARS + 1) * NS   # oldest dropped
+
+
 def test_store_indicator_delta_carries_only_new_points():
     """APPEND-ONLY DELTA contract (the self-DOS fix): the returned delta's
     `points` are ONLY the not-yet-seen points, not the full accumulated
