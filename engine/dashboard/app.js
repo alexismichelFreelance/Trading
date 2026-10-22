@@ -766,7 +766,16 @@ class ChartWindow {
     for (const ser of this.zoneLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.zoneLines = [];
     const now = this.nowTs();
-    for (const z of this.zones) {
+    // Limit clutter: draw all unbroken zones + only the most recent broken ones.
+    const sorted = (this.zones || []).slice().sort((a, b) =>
+      (b.formed_ts || 0) - (a.formed_ts || 0));
+    const toDraw = [];
+    let brokenCount = 0;
+    for (const z of sorted) {
+      if (!z.broken) { toDraw.push(z); continue; }
+      if (brokenCount < 20) { toDraw.push(z); brokenCount++; }
+    }
+    for (const z of toDraw) {
       let color = (z.direction || 0) > 0 ? "#089981" : "#f23645";
       let style = 1;   // dashed for edges
       if (z.broken) { color = "#6b7280"; style = 2; }
