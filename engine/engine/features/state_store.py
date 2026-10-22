@@ -165,14 +165,20 @@ class StateStore:
         for p in series.get("points", []):
             key = str(p.get("key", f"{p['ts']}-{p['v']}"))
             ts = int(p["ts"])
+            lbl = p.get("label")
+            np_ = {"ts": ts, "v": p["v"], "key": key}
+            pp_ = {"ts": ts, "v": p["v"], "key": key}
+            if lbl is not None:
+                np_["label"] = lbl
+                pp_["label"] = lbl
             if key not in points:
-                new_points.append({"ts": ts, "v": p["v"], "key": key})
+                new_points.append(np_)
                 # one heap entry per point, not per publication: a static
                 # series (the pivot grid) republishes the same keys on every
                 # bar, and a heap that grew with every republication would
                 # dwarf the series it guards.
                 heapq.heappush(heap, (ts, key))
-            points[key] = {"ts": ts, "v": p["v"], "key": key}
+            points[key] = pp_
             heapq.heappush(heap, (ts, key))
             if ts > l["ind_max_ts"]:
                 l["ind_max_ts"] = ts
@@ -202,7 +208,9 @@ class StateStore:
             # contract exists to prevent (a 600-bar VWAP x 6 band series
             # per bar, per lane). The client merges by ts, so it only needs
             # what is new; the full series travels in the snapshot.
-            "points": [{"ts": p["ts"], "v": p["v"]} for p in new_points],
+            "points": [{"ts": p["ts"], "v": p["v"]} |
+                       ({"label": p["label"]} if p.get("label") is not None else {})
+                       for p in new_points],
         }
         return self._next("indicator", lane, payload)
 
@@ -304,9 +312,14 @@ class StateStore:
         items = sorted(pts.values(), key=lambda p: int(p["ts"]))
         if limit is not None:
             items = items[-limit:]
+        def _pt(p):
+            d = {"ts": p["ts"], "v": p["v"]}
+            if p.get("label") is not None:
+                d["label"] = p["label"]
+            return d
         return {"id": sid, "producer": v["producer"], "label": v["label"],
                 "unit": v["unit"],
-                "points": [{"ts": p["ts"], "v": p["v"]} for p in items]}
+                "points": [_pt(p) for p in items]}
 
     # ── snapshot ─────────────────────────────────────────────────────
     def snapshot(self) -> dict:

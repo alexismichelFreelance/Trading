@@ -53,12 +53,14 @@ class ChartWindow {
     this.gamma = null;
     this.roster = [];           // [{label, enabled, qty, entry, target, stop}]
     this.strategyOn = {};       // label -> bool
+    this.strategySolo = null;
     this.zones = [];            // [{id, tf, top, bot, direction, virgin, touches}]
     this.positions = [];        // [{sleeve, qty, entry, target, stop}]
     this.fillMarkers = [];
     this._logCount = 0;
     this._reconnectDelay = 1500;
     this._initialLoadDone = false;
+    this._autoScroll = true;
 
     // series / line registries
     this.indSeries = {};        // id -> line series (vwap family line series)
@@ -397,6 +399,8 @@ class ChartWindow {
       cur.points = this.snapToGrid(cur.points);
     }
 
+    this.renderIndicatorsList();
+    if (this.indicatorOn[cur.id] === false) return;
     if (cur.id === "vwap" || this.bandSeries[cur.id]) {
       const ser = cur.id === "vwap" ? this.vwapSeries : this.bandSeries[cur.id];
       if (!ser) return;
@@ -411,15 +415,15 @@ class ChartWindow {
       this.syncBandAreas(cur.id, append, tail);
       return;
     }
-    // pivots and gamma walls are static price LEVELS (the engine stamps all
-    // their points with the session ts — duplicates that would crash LWC's
-    // series renderer) — draw one bounded level per distinct price.
+    // pivots are static price LEVELS (the engine stamps all their points with
+    // the session ts). Render them as labelled price lines so the level name
+    // (D-PP, W-R1, ...) shows on the axis. Gamma walls are handled by
+    // renderGamma() (multi-wall, labelled) and must not be re-drawn here.
     if ((cur.producer || "").includes("pivot")) {
-      this.drawStaticLines(cur, "#a78bfa");
+      this.drawPivotLines(cur);
       return;
     }
     if ((cur.producer || "").includes("gamma_levels")) {
-      this.drawStaticLines(cur, "#e6a9ff");
       return;
     }
     // unknown non-pivot, non-vwap series: draw as a generic line
@@ -571,6 +575,31 @@ class ChartWindow {
     }
   }
 
+  /* Labelled pivot price lines (D/W/M). Each distinct level gets a price line
+   * on the axis so its name (D-PP, W-R1, ...) is visible. Re-rendered on
+   * every pivot delta. */
+  drawPivotLines(ind) {
+    if (!this.pivotPriceLines) this.pivotPriceLines = [];
+    for (const pl of this.pivotPriceLines) {
+      try { this.candleSeries.removePriceLine(pl); } catch {}
+    }
+    this.pivotPriceLines = [];
+    const seen = new Set();
+    for (const p of (ind && ind.points) || []) {
+      const key = (p.label || "") + "|" + Number(p.v).toFixed(4);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const price = this.priceSanity(p.v);
+      if (price == null) continue;
+      const title = p.label ? `${p.label} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}`;
+      const pl = this.candleSeries.createPriceLine({
+        price, color: "#a78bfa", lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title,
+      });
+      if (pl) this.pivotPriceLines.push(pl);
+    }
+  }
+
   /* ── dealer-gamma: multi-wall price lines + regime in header ───────── */
   renderGamma(g) {
     this.gamma = g;
@@ -585,7 +614,7 @@ class ChartWindow {
       if (px == null) continue;
       this.gammaLines.push(this.candleSeries.createPriceLine({
         price: px, color: "#e6a9ff", lineWidth: 1, lineStyle: 0,
-        axisLabelVisible: true, title: "flip" }));
+        axisLabelVisible: true, title: `flip ${px.toFixed(2)}` }));
     }
     for (const w of (g.call_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
@@ -594,7 +623,7 @@ class ChartWindow {
       if (px == null) continue;
       this.gammaLines.push(this.candleSeries.createPriceLine({
         price: px, color: "#ffa500", lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: "call wall" }));
+        axisLabelVisible: true, title: `call wall ${px.toFixed(2)}` }));
     }
     for (const w of (g.put_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
@@ -603,7 +632,7 @@ class ChartWindow {
       if (px == null) continue;
       this.gammaLines.push(this.candleSeries.createPriceLine({
         price: px, color: "#1e90ff", lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: "put wall" }));
+        axisLabelVisible: true, title: `put wall ${px.toFixed(2)}` }));
     }
     this.setRegime(g.local_sign);
     renderGammaDrawerFor(this);   // refresh the shared drawer if it's open
@@ -630,9 +659,11 @@ class ChartWindow {
     if (!host) return;
     host.innerHTML = this.roster.map((s, i) => {
       const on = this.strategyOn[s.label];
+      const solo = this.strategySolo === s.label;
       return `<div class="rosterRow ${on ? "" : "off"}">
         <span class="sw ${on ? "on" : ""}" data-i="${i}"></span>
         <span class="name">${escapeHtml(s.label)}</span>
+        <button class="iconBtn soloBtn" data-i="${i}" title="show only this strategy">${solo ? "*" : "1"}</button>
         ${(s.qty||0) ? `<span class="posTag">${s.qty} @ ${fmtPx(s.entry_px)}</span>` : ""}
         ${s.entry || s.target || s.stop
           ? `<span class="dim">${[s.entry?s.entry:"",s.target?"T"+s.target:"",s.stop?"S"+s.stop:""].filter(Boolean).join(" ")}</span>` : ""}
@@ -648,11 +679,29 @@ class ChartWindow {
         this.applyStrategyMarks();
       });
     });
+    host.querySelectorAll(".soloBtn").forEach(el => {
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const i = +el.dataset.i;
+        const s = this.roster[i];
+        if (!s) return;
+        if (this.strategySolo === s.label) {
+          this.strategySolo = null;
+          for (const r of this.roster) this.strategyOn[r.label] = true;
+        } else {
+          this.strategySolo = s.label;
+          // show only this one
+          for (const r of this.roster) this.strategyOn[r.label] = (r.label === s.label);
+        }
+        this.renderRoster();
+        this.applyStrategyMarks();
+      });
+    });
   }
 
   applyStrategyMarks() {
     // strategy marks are bounded line SEGMENTS (drawBoundedLevel line series),
-    // not price lines — remove them as series
+    // not price lines - remove them as series
     for (const lbl in this.strategyLines)
       this.strategyLines[lbl].forEach(ser => {
         try { this.chart.removeSeries(ser); } catch {}
@@ -661,6 +710,34 @@ class ChartWindow {
     for (const s of this.roster) {
       if (this.strategyOn[s.label] !== false) this.drawStrategy(s);
     }
+  }
+
+  /* Indicator show/hide. Client-side only: data is still stored, toggling
+   * just re-renders (or removes) the corresponding series/lines. */
+  renderIndicatorsList() {
+    const host = document.getElementById("indicators");
+    if (!host) return;
+    const ids = Object.keys(this.indicators);
+    host.innerHTML = ids.map(id => {
+      const on = this.indicatorOn[id] !== false;
+      const lbl = (this.indicators[id].label || id);
+      return `<div class="rosterRow ${on ? "" : "off"}">
+        <span class="sw ${on ? "on" : ""}" data-id="${escapeHtml(id)}"></span>
+        <span class="name">${escapeHtml(lbl)}</span>
+      </div>`;
+    }).join("");
+    host.querySelectorAll(".sw").forEach(el => {
+      el.addEventListener("click", () => {
+        const id = el.dataset.id;
+        this.indicatorOn[id] = !(this.indicatorOn[id] !== false);
+        this.renderIndicatorsList();
+        const ind = this.indicators[id];
+        if (ind) {
+          // remove then re-add
+          this.upsertIndicator(ind, false);
+        }
+      });
+    });
   }
 
   drawStrategy(s) {
@@ -690,12 +767,15 @@ class ChartWindow {
     this.zoneLines = [];
     const now = this.nowTs();
     for (const z of this.zones) {
-      const color = (z.direction || 0) > 0 ? "#089981" : "#f23645";
+      let color = (z.direction || 0) > 0 ? "#089981" : "#f23645";
+      let style = 1;   // dashed for edges
+      if (z.broken) { color = "#6b7280"; style = 2; }
+      if (z.flipped_from != null) { color = "#f59e0b"; }
       const startSec = z.formed_ts != null ? sec(z.formed_ts) : (now - 86400);
       const endSec = z.end_ts != null ? sec(z.end_ts) : now;
       for (const pr of [z.top, z.bot]) {
         if (pr == null) continue;
-        const ser = this.drawBoundedLevel(pr, startSec, endSec, color, 1, 1);
+        const ser = this.drawBoundedLevel(pr, startSec, endSec, color, style, 1);
         if (ser) this.zoneLines.push(ser);
       }
     }
@@ -861,6 +941,7 @@ class ChartWindow {
    * alone — we only re-anchor when the view is still parked at the right edge.
    */
   followEnd() {
+    if (this._autoScroll === false) return;
     const ts = this.chart.timeScale();
     const c = this.candles;
     if (!c.length) return;
@@ -872,11 +953,35 @@ class ChartWindow {
     try { vr = ts.getVisibleRange(); } catch { return; }
     if (!vr) return;
     // the user scrolled away from the right edge -> stop following
-    if (vr.to < lastT - step * 2) { this._following = false; return; }
+    if (vr.to < lastT - step * 2) { this._autoScroll = false; this.updateAutoScrollBtn(); return; }
     this._following = true;
     const span = Math.max(step, vr.to - vr.from);
     const to = lastT + step * 3;             // rightOffset worth of padding
     try { ts.setVisibleRange({ from: to - span, to }); } catch {}
+  }
+
+  goToLatest() {
+    this._autoScroll = true;
+    this.updateAutoScrollBtn();
+    const ts = this.chart.timeScale();
+    const c = this.candles;
+    if (!c.length) return;
+    const last = c[c.length - 1];
+    const prev = c.length > 1 ? c[c.length - 2] : last;
+    const step = Math.max(1, (last.ts - prev.ts) / 1e9);
+    const lastT = sec(last.ts);
+    let vr = null;
+    try { vr = ts.getVisibleRange(); } catch { return; }
+    const span = vr ? Math.max(step, vr.to - vr.from) : step * 60;
+    const to = lastT + step * 3;
+    try { ts.setVisibleRange({ from: to - span, to }); } catch {}
+  }
+
+  updateAutoScrollBtn() {
+    const btn = document.getElementById("latestBtn");
+    if (!btn) return;
+    btn.textContent = this._autoScroll ? "auto" : "latest";
+    btn.style.color = this._autoScroll ? "" : "#e2a03f";
   }
 
   /* Full state reconciliation for a fresh snapshot (first connect, or a
@@ -900,6 +1005,7 @@ class ChartWindow {
       for (const ser of arr) { try { this.chart.removeSeries(ser); } catch {} }
     };
     clearPriceLines(this.gammaLines); this.gammaLines = [];
+    clearPriceLines(this.pivotPriceLines); this.pivotPriceLines = [];
     clearSeries(this.staticLines);    this.staticLines = [];
     clearSeries(this.zoneLines);      this.zoneLines = [];
     for (const lbl in this.strategyLines)
@@ -1107,6 +1213,10 @@ $("popBtn").addEventListener("click", () => {
   if (w) openWindowTab(w.symbol, w.tf);
 });
 $("gridBtn").addEventListener("click", toggleGrid);
+$("latestBtn").addEventListener("click", () => {
+  const w = [...windows.values()][0];
+  if (w) w.goToLatest();
+});
 $("stratBtn").addEventListener("click", () => {
   toggleDrawer("stratDrawer");
   const w = [...windows.values()][0]; if (w) w.renderRoster();
@@ -1114,6 +1224,10 @@ $("stratBtn").addEventListener("click", () => {
 $("gammaBtn").addEventListener("click", () => {
   toggleDrawer("gammaDrawer");
   const w = [...windows.values()][0]; if (w) renderGammaDrawerFor(w);
+});
+$("indBtn").addEventListener("click", () => {
+  toggleDrawer("indDrawer");
+  const w = [...windows.values()][0]; if (w) w.renderIndicatorsList();
 });
 $("laneSel").addEventListener("change", (ev) => {
   const w = [...windows.values()][0];

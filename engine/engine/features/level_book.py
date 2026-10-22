@@ -29,15 +29,19 @@ opinion", never as "enter here".
 from __future__ import annotations
 
 from ..core.events import Bar
+from ..core.timeutil import et_globex_session_date
 from .avwap import AnchoredVWAP
 from .bars import BarAggregator
-from .pivots import SessionLevels
+from .pivots import MultiPivots, SessionLevels
 from .zones import ZoneBook, ZoneDetector
 
 
 class LevelBook:
     def __init__(self, round_step: float = 50.0) -> None:
         self.piv = SessionLevels(round_step=round_step)
+        # Multi-period floor pivots (D/W/M) - published separately so the
+        # chart can show daily/weekly/monthly pivot grids with labels.
+        self.mpiv = MultiPivots()
         # ZONES ARE A 30-MINUTE OBJECT. zones.py detects "30-minute
         # institutional supply/demand zones"; this book fed the detector RAW 1m
         # bars, so a 2-4 minute base-and-departure counted as structure and 19
@@ -49,6 +53,7 @@ class LevelBook:
         self.zdet = ZoneDetector()
         self.zbook = ZoneBook()
         self.vwap = AnchoredVWAP()
+        self._vwap_session: str | None = None   # Globex session key the vwap is anchored to
         self.gamma: dict | None = None          # injected per session; may be None
         self.extra: list = []                   # anything a caller wants counted
         self.last: float | None = None
@@ -58,7 +63,17 @@ class LevelBook:
         if b.tf != "1m":
             return
         self.last = b.c
+        # VWAP is per Globex session: reset the accumulator when the session
+        # rolls at 18:00 ET so the line is a session VWAP, not a cumulative
+        # one since process start.
+        gkey = et_globex_session_date(b.ts)
+        if gkey != self._vwap_session:
+            self.vwap.reset(b.ts)
+            self._vwap_session = gkey
         self.piv.update_bar(b)
+        # Multi-period pivots track H/L/C for D/W/M (all bars, not RTH-only,
+        # per MultiPivots contract).
+        self.mpiv.update(b.ts, b.h, b.l, b.c)
         self.vwap.add(b.c, float(b.v))
         # detection and BREAKS happen on the 30m bar (a 30m close through a zone
         # is what invalidates it); TOUCHES tick with every 1m close, because a

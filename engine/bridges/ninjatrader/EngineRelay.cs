@@ -298,6 +298,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                                : m.Get("otype") == "STOP" ? OrderType.StopMarket : OrderType.Market;
                 double limit = type == OrderType.Limit ? m.Num("limit") : 0;
                 double stop = type == OrderType.StopMarket ? m.Num("stop") : 0;
+                RLog("place " + m.Get("order_id") + " on instrument " + Instrument.FullName
+                     + " (master " + Instrument.MasterInstrument.Name + ")");
                 Order o = Account.CreateOrder(Instrument, action, type, OrderEntry.Manual,
                     TimeInForce.Day, (int)m.Num("qty"), limit, stop, string.Empty,
                     m.Get("order_id"), Core.Globals.MaxDate, null);

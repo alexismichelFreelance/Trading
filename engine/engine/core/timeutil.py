@@ -86,7 +86,21 @@ def is_rth(ns: int) -> bool:
     return RTH_START_MIN <= m < RTH_END_MIN
 
 
+def et_globex_session_date(ns: int) -> str:
+    """Globex futures session key 'YYYY-MM-DD' - the date the session OPENED
+    at 18:00 ET. A session runs 18:00 ET -> 17:00 ET the next day, so bars
+    before 18:00 ET belong to the previous day's session. Used to anchor
+    per-session VWAP (and any other session-reset accumulator)."""
+    t = et(ns)
+    if t.hour >= 18:
+        d = t
+    else:
+        d = t - pd.Timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
 __all__ = [
     "NY", "NS", "RTH_START_MIN", "RTH_END_MIN",
     "to_ns", "ns_to_utc", "et", "et_session_date", "et_minute_of_day", "is_rth",
+    "et_globex_session_date",
 ]

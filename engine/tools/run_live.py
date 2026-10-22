@@ -1561,6 +1561,13 @@ async def main() -> None:
                 _eng_lb = levelbooks.get(_sym)
                 if _eng_lb is not None and getattr(_eng_lb, "gamma", None):
                     _lb.set_gamma(_eng_lb.gamma)
+                # refresh the multi-wall gamma curve on rollover
+                for _s in (sleeves_dict.get(_sym) or []):
+                    _pc = getattr(_s, "pocket", None)
+                    if _pc is not None and getattr(_pc, "ok", False):
+                        if getattr(pub.lanes.get(_sym), "gamma_curve", None) is not _pc:
+                            pub.lanes[_sym].gamma_curve = _pc
+                        break
 
             if dash_books:
                 from engine.adapters.state_publish import _combine

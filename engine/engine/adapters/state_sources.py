@@ -57,10 +57,10 @@ def zones_from_view(zoneview, bar_ts: int, tfs: tuple = ("30m", "1h", "4h", "1d"
         if book is None:
             continue
         for z in getattr(book, "zones", []) or []:
-            if getattr(z, "broken", False):
-                continue                      # current zones only; broken ones
-            out.append({                       # are a lifecycle record, not a
-                "id": f"{tf}:{z.formed_ts}:{z.direction}",  # live level
+            # Keep broken zones too (marked broken) so the chart can show
+            # lifecycle transitions; only the client decides how to style them.
+            out.append({
+                "id": f"{tf}:{z.formed_ts}:{z.direction}",
                 "tf": tf,
                 "top": round(float(z.top), 4),
                 "bot": round(float(z.bot), 4),
@@ -72,6 +72,7 @@ def zones_from_view(zoneview, bar_ts: int, tfs: tuple = ("30m", "1h", "4h", "1d"
                 "formed_ts": int(z.formed_ts),
                 "proximal": round(float(z.proximal()), 4),
                 "distal": round(float(z.distal()), 4),
+                "flipped_from": getattr(z, "flipped_from", None),
             })
     return out
 
@@ -131,14 +132,31 @@ def indicators_from_levelbook(levelbook, bar_ts: int) -> list:
     # VWAP — a real time series (one point per bar close): the line + bands.
     out += _vwap_bands(getattr(levelbook, "vwap", None), bar_ts)
 
-    # Floor pivots — static intraday grid, stamped at the session.
+    # Floor pivots - static intraday grid, stamped at the session.
     piv = getattr(getattr(levelbook, "piv", None), "pivots", None)
     if piv:
         out.append({"id": "pivots", "producer": "levelbook:pivots",
-                    "label": "floor pivots", "unit": "price",
-                    "points": [{"ts": sess, "v": float(px)} for px in piv]})
+                    "label": "floor pivots (daily)", "unit": "price",
+                    "points": [{"ts": sess, "v": float(px), "label": "pivot"}
+                               for px in piv]})
 
-    # Gamma walls — static per session.
+    # Multi-period floor pivots (D/W/M) - labelled grid, stamped at session.
+    mpiv = getattr(levelbook, "mpiv", None)
+    grid = getattr(mpiv, "grid", None)
+    if callable(grid):
+        try:
+            g = grid() or {}
+        except Exception:                       # noqa: BLE001
+            g = {}
+        if g:
+            pts = [{"ts": sess, "v": float(px), "label": str(name),
+                    "key": f"mpivot-{name}-{round(float(px), 2)}"}
+                   for px, name in g.items()]
+            out.append({"id": "mpivots", "producer": "levelbook:mpivots",
+                        "label": "floor pivots (D/W/M)", "unit": "price",
+                        "points": pts})
+
+    # Gamma walls - static per session, one labelled point per level.
     g = getattr(levelbook, "gamma", None)
     if isinstance(g, dict):
         pts = []
@@ -146,7 +164,8 @@ def indicators_from_levelbook(levelbook, bar_ts: int) -> list:
                          ("flip", "gamma flip")):
             x = _round(g.get(k))
             if x is not None:
-                pts.append({"ts": sess, "v": x})
+                pts.append({"ts": sess, "v": x, "label": label,
+                            "key": f"gamma-{k}"})
         if pts:
             out.append({"id": "gamma", "producer": "levelbook:gamma_levels",
                         "label": "dealer gamma", "unit": "price", "points": pts})
