@@ -210,6 +210,46 @@ def minute_bars_for(sym: str, sessions: int = 60) -> list:
     return bars
 
 
+def seed_dashboard_lane(store, sym: str, rows: list, tfs):
+    """Seed one lane's chart state from REAL bars: the candle series AND the
+    indicator series, both stamped AS OF each bar.
+
+    AS OF MATTERS. The VWAP line and its sigma bands are TIME SERIES: every
+    point is the book's value AT THAT BAR. Publishing the seeded bars against
+    the book's FINAL values instead draws one flat line at today's VWAP across
+    four days of history -- a chart that looks alive and says nothing.
+
+    THE GRID. The candles are built with the ENGINE's own BarAggregator, so a
+    seeded 5m candle carries the same timestamp as the engine's own 5m bar.
+    One bucket stamped a minute off would interleave with the live bars
+    instead of merging with them, and the chart's time axis would show two
+    candles per period.
+
+    READ PATH ONLY: a fresh LevelBook for the dashboard. The engine's own
+    book -- the one the strategies trade off -- is never fed from here.
+    """
+    from engine.adapters.state_publish import _bar_dict
+    from engine.adapters.state_sources import indicators_from_levelbook
+    from engine.features.bars import BarAggregator
+    from engine.features.level_book import LevelBook
+
+    lb = LevelBook()
+    for b in rows:
+        lb.on_bar(b)
+        for ind in indicators_from_levelbook(lb, b.ts):
+            store.apply_indicator(sym, ind)
+        store.apply_bar(_bar_dict(b))
+    for tf in tfs:
+        agg = BarAggregator((tf,), input_tf="1m")
+        out = []
+        for b in rows:
+            out.extend(agg.update(b))
+        out.extend(agg.flush())
+        for ab in out:
+            store.apply_agg_bar(_bar_dict(ab))
+    return lb
+
+
 def daily_bars_for(sym: str) -> list:
     """~320 daily bars for `sym` (Yahoo continuous), fetched once and cached —
     used to seed both the 1d zone view and the pivot sleeve's D/W/M grid."""
@@ -961,6 +1001,10 @@ async def main() -> None:
     ap.add_argument("--dashboard-tf", action="append", default=[],
                     help="aggregate candle timeframe(s) for the dashboard "
                          "(default 5m; raw 1m is always served)")
+    ap.add_argument("--dashboard-seed-sessions", type=int, default=4,
+                    help="sessions of real 1m history the DASHBOARD's chart lane is "
+                         "seeded with (0 = off; the chart then starts from whatever "
+                         "the NT8 relay replays, which can lag the live edge by days)")
     ap.add_argument("--draw-port", type=int, default=36004,
                     help="EngineOverlay INDICATOR's draw socket (drawing lives in an "
                          "indicator, on the chart, so it never hides your orders)")
@@ -1444,17 +1488,84 @@ async def main() -> None:
             _spec.loader.exec_module(_dashmod)
             Dashboard = _dashmod.Dashboard
             tfs = tuple(a.dashboard_tf) or ("5m",)
+
+            # ── the DASHBOARD's own chart lane ───────────────────────────
+            # The NT8 relay replays the CHART's history on connect, and that
+            # history can lag the live edge by DAYS: the chart then ends days
+            # before the live edge, with a hole where the feed went quiet. Our
+            # own recorder table (claude_bars_live) holds the SAME feed's 1m
+            # bars -- the same rows the live 5m bars aggregate from, verified
+            # bar for bar -- so the chart's candle series and its VWAP bands
+            # are seeded from THERE: real, same-source bars that reach the
+            # live edge.
+            #
+            # READ PATH ONLY. The engine's own LevelBook (the one the
+            # strategies trade off) is never fed from here, so no trading
+            # behaviour changes; the dashboard gets its own book, exactly as
+            # the demo server does.
+            dash_books: dict = {}
+            seed_rows: dict = {}
+            if a.dashboard_seed_sessions > 0:
+                for _sym in lane_meta:
+                    _rows = minute_bars_for(_sym,
+                                            sessions=a.dashboard_seed_sessions)
+                    if not _rows:
+                        continue
+                    seed_rows[_sym] = _rows
+                    print(f"  dashboard seed [{_sym}]: {len(_rows)} real 1m bars "
+                          f"-> {a.dashboard_seed_sessions} sessions")
+
             srcs = []
             for _sym, meta in lane_meta.items():
                 srcs.append(LaneSource(
                     _sym,
                     zoneview=zoneviews.get(_sym),
+                    # the engine's book until the seed replaces it below; a
+                    # cold start is better than no bands
                     levelbook=levelbooks.get(_sym),
                     gamma_curve=gammacurves.get(_sym),
                     strategies=[_s for _label, _s in meta["roster"]],
                     color=""))
-            
+
             pub = StatePublisher(srcs, agg_timeframes=tfs)
+
+            # THE SEED: the real 1m tape, the engine's aggregated views, and
+            # the indicator series stamped AS OF each bar. The book it builds
+            # IS the dashboard's book -- the engine's own book belongs to the
+            # strategies and is never fed from here.
+            for _sym, _rows in seed_rows.items():
+                _lb = seed_dashboard_lane(pub.store, _sym, _rows, tfs)
+                dash_books[_sym] = _lb
+                pub.lanes[_sym].levelbook = _lb
+                _inds = pub.store.snapshot().get("lanes", {}).get(
+                    _sym, {}).get("indicators", [])
+                print(f"  dashboard lane [{_sym}]: candles + "
+                      f"{len(_inds)} indicator series seeded "
+                      f"({', '.join(i['id'] for i in _inds)})")
+
+            # the live bars continue the dashboard's book -- but only the ones
+            # NEWER than the seed, which already covers the rest. Installed
+            # BEFORE pub.attach() so the book is updated before the publisher
+            # reads the indicators out of it.
+            _seed_end = {s: r[-1].ts for s, r in seed_rows.items()}
+
+            async def _feed_dashboard_book(bar, live, backfill):
+                _sym = getattr(bar, "symbol", "") or ""
+                _lb = dash_books.get(_sym)
+                if _lb is None or getattr(bar, "tf", "") != "1m":
+                    return
+                if bar.ts <= _seed_end.get(_sym, 0):
+                    return
+                _lb.on_bar(bar)
+                # keep the session's gamma walls in step with the engine's
+                _eng_lb = levelbooks.get(_sym)
+                if _eng_lb is not None and getattr(_eng_lb, "gamma", None):
+                    _lb.set_gamma(_eng_lb.gamma)
+
+            if dash_books:
+                from engine.adapters.state_publish import _combine
+                eng.on_bar_hook = _combine(eng.on_bar_hook, _feed_dashboard_book)
+
             pub.attach(eng)                       # chains the painter's sinks
             print(f"  StatePublisher attached lanes={list(pub.lanes.keys())}")
             for sym, src in pub.lanes.items():

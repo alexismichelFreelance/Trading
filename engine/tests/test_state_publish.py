@@ -128,6 +128,67 @@ def test_store_indicator_delta_carries_only_new_points():
     assert [p["ts"] for p in inds["vwap"]["points"]] == [1 * NS, 2 * NS]
 
 
+def test_store_indicator_window_is_kept_by_time_not_arrival():
+    """The retained indicator window is the NEWEST points by TIME.
+
+    The NT8 relay replays its startup backfill AFTER the dashboard lane was
+    seeded with real history, so the replay's points arrive later but are
+    OLDER. A FIFO trim keeps the replay and evicts the seed: the chart then
+    shows the relay's three-day hole while the four real days it was given
+    sit in the trash. The bar windows are trimmed by time (_trim_oldest); the
+    indicator windows have to be trimmed the same way.
+    """
+    from engine.features.state_store import SNAPSHOT_MAX_INDICATOR_POINTS
+    store = StateStore()
+    # the seed first: the NEWEST points, published at startup
+    for i in range(1000, 2000):
+        store.apply_indicator("ES", {"id": "vwap",
+                                     "points": [{"ts": i * NS, "v": 7000.0}]})
+    # then the relay's replay: OLDER points, published later
+    for i in range(0, 1000):
+        store.apply_indicator("ES", {"id": "vwap",
+                                     "points": [{"ts": i * NS, "v": 6900.0}]})
+    pts = {s["id"]: s for s in store.snapshot()["lanes"]["ES"]["indicators"]}["vwap"]["points"]
+    assert len(pts) == SNAPSHOT_MAX_INDICATOR_POINTS
+    assert pts[-1]["ts"] == 1999 * NS             # the newest survives
+    assert pts[0]["ts"] == 200 * NS               # and the window starts there
+
+
+def test_publish_lane_does_not_stamp_replayed_bars():
+    """A bar OLDER than the lane's own indicator history is a replay.
+
+    The values a book holds NOW are the values at the LIVE edge, so stamping
+    them at the replay's timestamps draws today's VWAP over last week's chart
+    -- and where the seeded history and the replay cover the same minute, two
+    different values at one timestamp, which the chart library rejects
+    outright (a blank series).
+    """
+    async def go():
+        pub = StatePublisher([], agg_timeframes=("5m",))
+        lb = LevelBook()
+        pub.lanes["ES"] = LaneSource("ES", zoneview=None, levelbook=lb)
+        # the lane's history reaches 10:00
+        lb.on_bar(bar(10 * 60 * NS, 7000, 7002, 6999, 7000.5, 100, "ES"))
+        await pub._publish_lane("ES",
+                                _bar_dict(bar(10 * 60 * NS, 7000, 7002, 6999,
+                                              7000.5, 100, "ES")))
+
+        def vwap_pts():
+            return [p for s in pub.store.snapshot()["lanes"]["ES"]["indicators"]
+                    if s["id"] == "vwap" for p in s["points"]]
+
+        seeded = vwap_pts()
+        assert seeded, "the live bar must publish its indicators"
+        # a REPLAYED bar from 09:00 -- older than the lane's own history
+        await pub._publish_lane("ES",
+                                _bar_dict(bar(9 * 60 * NS, 7000, 7002, 6999,
+                                              7000.5, 100, "ES")))
+        after = vwap_pts()
+        assert len(after) == len(seeded), "a replayed bar must add no points"
+        assert all(p["ts"] >= 10 * 60 * NS for p in after)
+    asyncio.run(go())
+
+
 def test_publish_lane_skips_empty_indicator_deltas():
     """REG-RESSION: after the append-only change, a static indicator (pivots)
     with no new points returns None from the store and must NOT enqueue a None

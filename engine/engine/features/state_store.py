@@ -51,6 +51,7 @@ TRIGGERS (when each kind is published):
 """
 from __future__ import annotations
 
+import heapq
 from collections import OrderedDict, deque
 from typing import Any
 
@@ -96,6 +97,7 @@ class StateStore:
                 "bars": {},                        # tf -> {ts -> BarDict}
                 "indicators": {},                 # id -> {"id","producer","label",
                                                   #        "unit","points": deque}
+                "ind_max_ts": 0,                  # newest ts in the lane's indicator series
                 "gamma": None,                    # GammaMap (structured, per lane)
                 "strategies_roster": [],          # [RosterEntry]
                 "zones": {},                      # id -> ZoneDict
@@ -143,27 +145,46 @@ class StateStore:
         bar" flow."""
         l = self._lane(lane)
         sid = series["id"]
-        entry = l["indicators"].setdefault(sid, {"id": sid, "producer": "", "label": "", "unit": "", "points": OrderedDict()})
+        entry = l["indicators"].setdefault(sid, {
+            "id": sid, "producer": "", "label": "", "unit": "",
+            "points": OrderedDict(), "_heap": []})
         # overwrite metadata
         entry["producer"] = series.get("producer", entry["producer"])
         entry["label"] = series.get("label", entry["label"])
         entry["unit"] = series.get("unit", entry["unit"])
         points = entry["points"]
+        heap = entry["_heap"]
         new_points = []
         for p in series.get("points", []):
             key = str(p.get("key", f"{p['ts']}-{p['v']}"))
+            ts = int(p["ts"])
             if key not in points:
-                new_points.append({"ts": int(p["ts"]), "v": p["v"], "key": key})
-            points[key] = {"ts": int(p["ts"]), "v": p["v"], "key": key}
+                new_points.append({"ts": ts, "v": p["v"], "key": key})
+                # one heap entry per point, not per publication: a static
+                # series (the pivot grid) republishes the same keys on every
+                # bar, and a heap that grew with every republication would
+                # dwarf the series it guards.
+                heapq.heappush(heap, (ts, key))
+            points[key] = {"ts": ts, "v": p["v"], "key": key}
+            heapq.heappush(heap, (ts, key))
+            if ts > l["ind_max_ts"]:
+                l["ind_max_ts"] = ts
         if not new_points:
             return None
-        # enforce max size
+        # Enforce max size, dropping the OLDEST BY TIME.
+        #
+        # NOT BY ARRIVAL ORDER. The NT8 relay replays its startup backfill
+        # AFTER the dashboard lane was seeded with real history, so the
+        # replay's points arrive later but are OLDER. A FIFO trim keeps the
+        # replay and evicts the seed: the chart then shows the relay's
+        # three-day hole while the real four days of history it was given
+        # sit in the trash. The window is bounded by TIME, exactly as the
+        # bar windows are (see _trim_oldest).
         max_len = SNAPSHOT_MAX_INDICATOR_POINTS
-        if len(points) > max_len:
-            # remove oldest entries
-            excess = len(points) - max_len
-            for _ in range(excess):
-                points.popitem(last=False)
+        while len(points) > max_len and heap:
+            _ts, k = heapq.heappop(heap)
+            if k in points:
+                points.pop(k, None)
         payload = {
             "id": sid,
             "producer": entry["producer"],
@@ -177,6 +198,20 @@ class StateStore:
             "points": [{"ts": p["ts"], "v": p["v"]} for p in new_points],
         }
         return self._next("indicator", lane, payload)
+
+    def indicator_floor(self, lane: str) -> int:
+        """The newest timestamp this lane's indicator series reaches.
+
+        A bar OLDER than this has already been passed by the lane's indicator
+        history: it is a replay, and the values a book holds NOW are the
+        values at the LIVE edge. Stamping them at the replay's timestamps
+        draws today's VWAP over last week's chart -- and where a seeded
+        history and the replay cover the same minute, two different values
+        at one timestamp, which the chart library rejects outright.
+        """
+        l = self._lanes.get(lane)
+        return int(l["ind_max_ts"]) if l else 0
+
     def apply_gamma(self, lane: str, gamma_map: dict | None) -> dict | None:
         """Replace the lane's structured dealer-gamma map. The map carries the
         regime AT A PRICE, so it is refreshed per bar (the publisher recomputes
@@ -254,11 +289,14 @@ class StateStore:
     @staticmethod
     def _series_dict(sid: str, v: dict, limit: int = None) -> dict:
         pts = v["points"]
+        # ASCENDING BY TIME, and the window's newest points last. The store
+        # keeps the newest points by ts, but the dict's ORDER is the order
+        # they arrived in: a feed that replays history after the live edge
+        # leaves the dict with the newest points FIRST. A client that draws
+        # the series in the order it was handed would draw it backwards.
+        items = sorted(pts.values(), key=lambda p: int(p["ts"]))
         if limit is not None:
-            # Take the last `limit` points (most recent) for the snapshot
-            items = list(pts.values())[-limit:]
-        else:
-            items = list(pts.values())
+            items = items[-limit:]
         return {"id": sid, "producer": v["producer"], "label": v["label"],
                 "unit": v["unit"],
                 "points": [{"ts": p["ts"], "v": p["v"]} for p in items]}

@@ -226,10 +226,19 @@ class StatePublisher:
         if src is None:
             return
         bar_ts = bar["ts"]
-        for ind in indicators_from_levelbook(src.levelbook, bar_ts):
-            d = self.store.apply_indicator(sym, ind)
-            if d is not None:
-                self.broadcast(d)
+        # REPLAY GUARD. A bar OLDER than the lane's own indicator history is
+        # a replay, not new history: the NT8 relay re-sends its startup
+        # backfill after the dashboard lane was seeded with real history, and
+        # the values a book holds NOW are the values at the LIVE edge.
+        # Stamping them at the replay's timestamps draws today's VWAP over
+        # last week's chart -- and where the seeded history and the replay
+        # cover the same minute, two different values at one timestamp, which
+        # is exactly what the chart library rejects (blank series).
+        if bar_ts >= self.store.indicator_floor(sym):
+            for ind in indicators_from_levelbook(src.levelbook, bar_ts):
+                d = self.store.apply_indicator(sym, ind)
+                if d is not None:
+                    self.broadcast(d)
         price = bar["c"]
         gm = gamma_map_from(src.gamma_curve, src.levelbook, price)
         d = self.store.apply_gamma(sym, gm)
