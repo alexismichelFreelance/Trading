@@ -399,11 +399,11 @@ class ChartWindow {
         if (ser) try { ser.setData([]); } catch {}
         if (cur.id === "vwap") for (const a of this.bandAreas) try { a.ser.setData([]); } catch {}
       } else if ((cur.producer || "").includes("pivot")) {
-        for (const ser of (this.pivotLines || [])) try { this.chart.removeSeries(ser); } catch {}
-        this.pivotLines = [];
-        this.pivotMarkers = [];
-        if ((cur.id || "").includes("mpivots")) this.pivotLabelsMulti = [];
-        else this.pivotLabelsDaily = [];
+        const isMulti = (cur.id || "").includes("mpivots");
+        const arr = isMulti ? this.pivotLinesMulti : this.pivotLinesDaily;
+        for (const ser of (arr || [])) try { this.chart.removeSeries(ser); } catch {}
+        if (isMulti) { this.pivotLinesMulti = []; this.pivotLabelsMulti = []; }
+        else { this.pivotLinesDaily = []; this.pivotLabelsDaily = []; }
         this.applyMarkers();
         this.renderLevelLabels();
       } else if ((cur.producer || "").includes("gamma_levels")) {
@@ -593,11 +593,18 @@ class ChartWindow {
    * on the axis so its name (D-PP, W-R1, ...) is visible. Re-rendered on
    * every pivot delta. */
   drawPivotLines(ind) {
-    if (!this.pivotLines) this.pivotLines = [];
-    for (const ser of this.pivotLines) { try { this.chart.removeSeries(ser); } catch {} }
-    this.pivotLines = [];
     const isMulti = (ind && (ind.producer || "")).includes("mpivots");
-    if (isMulti) this.pivotLabelsMulti = []; else this.pivotLabelsDaily = [];
+    if (isMulti) {
+      if (!this.pivotLinesMulti) this.pivotLinesMulti = [];
+      for (const ser of this.pivotLinesMulti) { try { this.chart.removeSeries(ser); } catch {} }
+      this.pivotLinesMulti = [];
+      this.pivotLabelsMulti = [];
+    } else {
+      if (!this.pivotLinesDaily) this.pivotLinesDaily = [];
+      for (const ser of this.pivotLinesDaily) { try { this.chart.removeSeries(ser); } catch {} }
+      this.pivotLinesDaily = [];
+      this.pivotLabelsDaily = [];
+    }
     const rng = this.lastSessionRange();
     const rightEdge = this.rightEdgeSec();
     const seen = new Set();
@@ -615,9 +622,10 @@ class ChartWindow {
       const startSec = rng ? rng.from : null;
       const endSec = rightEdge;
       const ser = this.drawBoundedLevel(price, startSec, endSec, color, 2, 1);
-      if (ser) this.pivotLines.push(ser);
-      const arr = isMulti ? (this.pivotLabelsMulti = this.pivotLabelsMulti || []) : (this.pivotLabelsDaily = this.pivotLabelsDaily || []);
-      arr.push({ price, color, text: lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}` });
+      const arr = isMulti ? this.pivotLinesMulti : this.pivotLinesDaily;
+      if (ser) arr.push(ser);
+      const labArr = isMulti ? (this.pivotLabelsMulti = this.pivotLabelsMulti || []) : (this.pivotLabelsDaily = this.pivotLabelsDaily || []);
+      labArr.push({ price, color, text: lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}` });
     }
     this.pivotMarkers = [];
     this.applyMarkers();
@@ -1187,7 +1195,10 @@ class ChartWindow {
       for (const ser of arr) { try { this.chart.removeSeries(ser); } catch {} }
     };
     clearSeries(this.gammaLines);    this.gammaLines = [];
-    clearSeries(this.pivotLines);    this.pivotLines = [];
+    for (const ser of (this.pivotLinesMulti || [])) try { this.chart.removeSeries(ser); } catch {}
+    for (const ser of (this.pivotLinesDaily || [])) try { this.chart.removeSeries(ser); } catch {}
+    this.pivotLinesMulti = [];
+    this.pivotLinesDaily = [];
     clearSeries(this.staticLines);    this.staticLines = [];
     clearSeries(this.zoneLines);      this.zoneLines = [];
     this.drawZoneRects();
