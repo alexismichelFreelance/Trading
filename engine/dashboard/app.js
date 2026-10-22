@@ -275,6 +275,7 @@ class ChartWindow {
       color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)"
     }));
     this.volSeries.setData(vd);
+    this.computeSessionMarkers();
     this.applyMarkers();
 
     if (!this._initialLoadDone) {
@@ -821,7 +822,29 @@ class ChartWindow {
     this.applyMarkers();
   }
   applyMarkers() {
-    this.candleSeries.setMarkers(this.fillMarkers.slice(-100));
+    const markers = this.fillMarkers.slice(-100);
+    // session-open markers (lightweight RTH indicator, no full shading)
+    if (this.sessionMarkers) markers.push(...this.sessionMarkers);
+    markers.sort((a, b) => a.time - b.time);
+    this.candleSeries.setMarkers(markers.slice(-200));
+  }
+
+  computeSessionMarkers() {
+    const out = [];
+    const seen = new Set();
+    for (const c of this.candles) {
+      const d = new Date(c.ts / 1e6);
+      // RTH open ~ 09:30 ET; approximate with UTC-4 (EDT). Good enough for a marker.
+      const etHour = (d.getUTCHours() + 20) % 24; // rough
+      const etMin = d.getUTCMinutes();
+      const dayKey = d.toISOString().slice(0, 10);
+      if (etHour === 9 && etMin === 30 && !seen.has(dayKey)) {
+        seen.add(dayKey);
+        out.push({ time: sec(c.ts), position: "aboveBar",
+          color: "#4f9cf9", shape: "arrowDown", text: "RTH" });
+      }
+    }
+    this.sessionMarkers = out;
   }
 
   /* ── WebSocket: this window's own socket (origin + tf scoped server-side) */

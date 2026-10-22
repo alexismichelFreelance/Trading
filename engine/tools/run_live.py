@@ -234,7 +234,22 @@ def seed_dashboard_lane(store, sym: str, rows: list, tfs):
     from engine.features.level_book import LevelBook
 
     lb = LevelBook()
+    # Gamma is published per session (levels_prev of the prior day). The
+    # dashboard's LevelBook only holds ONE gamma set, so feed it per Globex
+    # session during the seed so the indicator series accumulates a distinct
+    # wall set for each day instead of one set stamped at the latest day.
+    from engine.core.timeutil import et_globex_session_date
+    _cur_gday = None
     for b in rows:
+        gday = et_globex_session_date(b.ts)
+        if gday != _cur_gday:
+            _cur_gday = gday
+            try:
+                lv, _und, _basis = lane_gamma_levels(sym, gday)
+                if lv:
+                    lb.set_gamma(lv)
+            except Exception:                      # noqa: BLE001
+                pass
         lb.on_bar(b)
         for ind in indicators_from_levelbook(lb, b.ts):
             store.apply_indicator(sym, ind)

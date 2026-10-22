@@ -750,23 +750,24 @@ class Dashboard:
                 "v": float(r.vol),
             } for r in df.iloc[::-1].itertuples()]
 
-            # compute VWAP indicator series
-            vol_sum = 0.0
-            tpv_sum = 0.0
+            # compute VWAP indicator series using the engine's AnchoredVWAP,
+            # reset per Globex session (matches the live lane's VWAP).
+            from engine.features.level_book import LevelBook
+            lb = LevelBook()
             vwap_points = []
             for b in bars_raw:
-                tp = (b["h"] + b["l"] + b["c"]) / 3.0
-                vol_sum += b["v"]
-                tpv_sum += tp * b["v"]
-                vwap = tpv_sum / vol_sum if vol_sum != 0 else 0.0
-                vwap_points.append({"ts": b["ts"], "v": vwap})
-
+                bar = Bar(b["ts"], "1m", b["o"], b["h"], b["l"], b["c"],
+                          int(b["v"]), symbol)
+                lb.on_bar(bar)
+                v = lb.vwap.value
+                if v == v:                      # not NaN
+                    vwap_points.append({"ts": b["ts"], "v": round(float(v), 4)})
             indicators = [{
                 "id": "VWAP",
-                "producer": "engine",
-                "label": "VWAP",
-                "unit": "",
-                "points": vwap_points
+                "producer": "levelbook:avwap",
+                "label": "anchored VWAP",
+                "unit": "price",
+                "points": vwap_points,
             }]
 
             # aggregate to requested tf if not 1m (engine's own BarAggregator,
