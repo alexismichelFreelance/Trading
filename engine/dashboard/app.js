@@ -834,7 +834,7 @@ class ChartWindow {
     ctx.clearRect(0, 0, rect.width, rect.height);
     if (this.indicatorOn["__zones__"] === false) return;
     const ts = this.chart.timeScale();
-    const ps = this.chart.priceScale("right");
+    const ps = this.candleSeries;
     const rng = this.lastSessionRange();
     for (const z of (this.zones || [])) {
       if (z.top == null || z.bot == null) continue;
