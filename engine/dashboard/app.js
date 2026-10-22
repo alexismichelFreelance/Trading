@@ -402,7 +402,24 @@ class ChartWindow {
     }
 
     this.renderIndicatorsList();
-    if (this.indicatorOn[cur.id] === false) return;
+    if (this.indicatorOn[cur.id] === false) {
+      // remove the rendered output for this indicator (data stays stored)
+      if (cur.id === "vwap" || this.bandSeries[cur.id]) {
+        const ser = cur.id === "vwap" ? this.vwapSeries : this.bandSeries[cur.id];
+        if (ser) try { ser.setData([]); } catch {}
+        if (cur.id === "vwap") for (const a of this.bandAreas) try { a.ser.setData([]); } catch {}
+      } else if ((cur.producer || "").includes("pivot")) {
+        for (const pl of (this.pivotPriceLines || [])) try { this.candleSeries.removePriceLine(pl); } catch {}
+        this.pivotPriceLines = [];
+      } else if ((cur.producer || "").includes("gamma_levels")) {
+        for (const pl of (this.gammaLines || [])) try { this.candleSeries.removePriceLine(pl); } catch {}
+        this.gammaLines = [];
+      } else {
+        const ser = this.indSeries[cur.id];
+        if (ser) try { this.chart.removeSeries(ser); delete this.indSeries[cur.id]; } catch {}
+      }
+      return;
+    }
     if (cur.id === "vwap" || this.bandSeries[cur.id]) {
       const ser = cur.id === "vwap" ? this.vwapSeries : this.bandSeries[cur.id];
       if (!ser) return;
@@ -593,9 +610,14 @@ class ChartWindow {
       seen.add(key);
       const price = this.priceSanity(p.v);
       if (price == null) continue;
-      const title = p.label ? `${p.label} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}`;
+      const lbl = p.label || "";
+      let color = "#a78bfa";
+      if (/\bPP\b/i.test(lbl)) color = "#eab308";        // yellow
+      else if (/\bS\d/i.test(lbl)) color = "#22c55e";   // green
+      else if (/\bR\d/i.test(lbl)) color = "#ef4444";    // red
+      const title = lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}`;
       const pl = this.candleSeries.createPriceLine({
-        price, color: "#a78bfa", lineWidth: 1, lineStyle: 2,
+        price, color, lineWidth: 1, lineStyle: 2,
         axisLabelVisible: true, title,
       });
       if (pl) this.pivotPriceLines.push(pl);
