@@ -607,6 +607,12 @@ class ChartWindow {
       const endSec = rightEdge;
       const ser = this.drawBoundedLevel(price, startSec, endSec, color, 2, 1);
       if (ser) this.pivotLines.push(ser);
+      // invisible price line for the right-side axis label
+      const lab = this.candleSeries.createPriceLine({
+        price, color: "#0b0e14", lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title: lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}`,
+      });
+      if (lab) this.pivotLines.push(lab);
     }
     this.pivotMarkers = [];
     this.applyMarkers();
@@ -637,6 +643,14 @@ class ChartWindow {
 
   renderGamma(g) {
     this.gamma = g;
+    // remove previous
+    for (const ser of (this.gammaLines || [])) { try { this.chart.removeSeries(ser); } catch {} }
+    this.gammaLines = [];
+    if (this.indicatorOn["__gamma__"] === false) {
+      this.applyMarkers();
+      renderGammaDrawerFor(this);
+      return;
+    }
     // remove previous bounded series
     for (const ser of (this.gammaLines || [])) { try { this.chart.removeSeries(ser); } catch {} }
     this.gammaLines = [];
@@ -652,6 +666,11 @@ class ChartWindow {
       if (px == null) continue;
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#e6a9ff", 0, 1);
       if (ser) this.gammaLines.push(ser);
+      const lab = this.candleSeries.createPriceLine({
+        price: px, color: "#0b0e14", lineWidth: 1, lineStyle: 0,
+        axisLabelVisible: true, title: `flip ${px.toFixed(2)}`,
+      });
+      if (lab) this.gammaLines.push(lab);
     }
     for (const w of (g.call_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
@@ -660,6 +679,11 @@ class ChartWindow {
       if (px == null) continue;
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#ffa500", 2, 1);
       if (ser) this.gammaLines.push(ser);
+      const lab = this.candleSeries.createPriceLine({
+        price: px, color: "#0b0e14", lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title: `call wall ${px.toFixed(2)}`,
+      });
+      if (lab) this.gammaLines.push(lab);
     }
     for (const w of (g.put_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
@@ -668,6 +692,11 @@ class ChartWindow {
       if (px == null) continue;
       const ser = this.drawBoundedLevel(px, startSec, endSec, "#1e90ff", 2, 1);
       if (ser) this.gammaLines.push(ser);
+      const lab = this.candleSeries.createPriceLine({
+        price: px, color: "#0b0e14", lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title: `put wall ${px.toFixed(2)}`,
+      });
+      if (lab) this.gammaLines.push(lab);
     }
     this.gammaMarkers = [];
     this.applyMarkers();
@@ -811,6 +840,10 @@ class ChartWindow {
 
   setZones(list) {
     this.zones = list || [];
+    if (this.indicatorOn["__zones__"] === false) {
+      this.drawZoneRects();
+      return;
+    }
     this.drawZones();
   }
   drawZones() {
@@ -924,6 +957,12 @@ class ChartWindow {
         seen.add(key(3,0,"LON"));
         out.push({ time: sec(c.ts), position: "aboveBar",
           color: "#22c55e", shape: "text", text: "LON" });
+      }
+      // Paris open 03:00 ET (approx, CET; same slot, distinct color)
+      if (etHour === 3 && etMin === 0 && !seen.has(key(3,0,"PAR"))) {
+        seen.add(key(3,0,"PAR"));
+        out.push({ time: sec(c.ts), position: "aboveBar",
+          color: "#f59e0b", shape: "text", text: "PAR" });
       }
       // RTH open 09:30 ET
       if (etHour === 9 && etMin === 30 && !seen.has(key(9,30,"RTH"))) {
