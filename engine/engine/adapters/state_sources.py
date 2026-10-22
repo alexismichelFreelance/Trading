@@ -70,6 +70,7 @@ def zones_from_view(zoneview, bar_ts: int, tfs: tuple = ("30m", "1h", "4h", "1d"
                 "touches": int(z.touches),
                 "composite": int(z.composite),
                 "formed_ts": int(z.formed_ts),
+                "broken_ts": getattr(z, "broken_ts", None),
                 "proximal": round(float(z.proximal()), 4),
                 "distal": round(float(z.distal()), 4),
                 "flipped_from": getattr(z, "flipped_from", None),
