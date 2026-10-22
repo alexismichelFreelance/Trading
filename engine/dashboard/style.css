@@ -194,6 +194,17 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
 .chartBox > div {
   position: relative; z-index: 1;
 }
+.levelLabels {
+  position: absolute !important;
+  right: 4px !important;
+  top: 0 !important;
+  bottom: 0 !important;
+  width: 90px !important;
+  height: 100% !important;
+  pointer-events: none !important;
+  z-index: 10 !important;
+  overflow: hidden !important;
+}
 .winTitle .regime { margin-left: 8px; }
 .winTitle .vwapPx { color: var(--orange); font-variant-numeric: tabular-nums; font-weight: 600; }
 

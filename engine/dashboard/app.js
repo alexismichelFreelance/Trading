@@ -108,7 +108,7 @@ class ChartWindow {
     this.chartBox.appendChild(this.zoneCanvas);
     // floating right-side label panel (pinned labels, not overlaying price)
     this.levelLabels = document.createElement("div");
-    this.levelLabels.style.cssText = "position:absolute;right:4px;top:0;bottom:0;width:90px;pointer-events:none;z-index:3;overflow:hidden;";
+    this.levelLabels.className = "levelLabels";
     this.chartBox.appendChild(this.levelLabels);
     this.winTitle = this.wrapper.querySelector(".winTitle");
     this.closeBtn = this.wrapper.querySelector(".closeBtn");
@@ -254,6 +254,7 @@ class ChartWindow {
     const ch = Math.max(120, Math.floor(r(this.chartBox).height));
     this.chart.resize(cw, ch);
     this.drawZoneRects();
+    this.renderLevelLabels();
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
