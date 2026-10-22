@@ -75,7 +75,14 @@ def _trim_oldest(win: dict, limit: int) -> None:
         win.pop(old, None)
 MAX_LOG = 200               # log records retained
 MAX_ERRORS = 60             # error/warning records retained
-SNAPSHOT_MAX_INDICATOR_POINTS = 1800  # snapshot truncation to keep frame small
+# Indicator points are stamped at the BAR's resolution (1m) while the chart
+# draws one candle per 5 minutes: 600 candles is 3,000 minutes of chart, so a
+# 1,800-point window stopped the bands 40% short of the left edge -- they
+# VANISHED when the view was zoomed out, which reads as "no data" rather than
+# "no history". 3,600 points cover 60 hours: the whole candle window plus a
+# margin. The frame stays small because the payload is snapped to the candle
+# grid before it is sent (see tools/run_dashboard.py).
+SNAPSHOT_MAX_INDICATOR_POINTS = 3600
 
 
 class StateStore:

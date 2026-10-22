@@ -140,18 +140,20 @@ def test_store_indicator_window_is_kept_by_time_not_arrival():
     """
     from engine.features.state_store import SNAPSHOT_MAX_INDICATOR_POINTS
     store = StateStore()
+    cap = SNAPSHOT_MAX_INDICATOR_POINTS
+    n = cap + 100                     # points on each side of the window
     # the seed first: the NEWEST points, published at startup
-    for i in range(1000, 2000):
+    for i in range(n, 2 * n):
         store.apply_indicator("ES", {"id": "vwap",
                                      "points": [{"ts": i * NS, "v": 7000.0}]})
     # then the relay's replay: OLDER points, published later
-    for i in range(0, 1000):
+    for i in range(0, n):
         store.apply_indicator("ES", {"id": "vwap",
                                      "points": [{"ts": i * NS, "v": 6900.0}]})
     pts = {s["id"]: s for s in store.snapshot()["lanes"]["ES"]["indicators"]}["vwap"]["points"]
-    assert len(pts) == SNAPSHOT_MAX_INDICATOR_POINTS
-    assert pts[-1]["ts"] == 1999 * NS             # the newest survives
-    assert pts[0]["ts"] == 200 * NS               # and the window starts there
+    assert len(pts) == cap
+    assert pts[-1]["ts"] == (2 * n - 1) * NS      # the newest survives
+    assert pts[0]["ts"] == (2 * n - cap) * NS     # and the window starts there
 
 
 def test_publish_lane_does_not_stamp_replayed_bars():

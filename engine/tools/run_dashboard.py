@@ -425,6 +425,46 @@ class RosterSleeve:
         self.chart_marks = self._marks
 
 
+def _snap_series_to_grid(series: dict, grid_ts: list,
+                         tol_ns: int = 200 * 10 ** 9) -> dict:
+    """Snap one indicator series onto the candle grid, keeping the LATEST
+    value per grid slot.
+
+    The engine's indicator series is stamped at the BAR's resolution (1m);
+    the chart draws one candle per 5 minutes. Shipping 1m points for a 5m
+    chart is five times the payload for the same picture -- and the client's
+    own snap (snapToGrid) collapses them again on arrival.
+
+    This is a PAYLOAD saving, not a behaviour change: the client snaps
+    anyway, and snapping an already-snapped point is a no-op.
+
+    The STATIC level series (the pivot grid, the dealer gamma) are NOT
+    snapped: they carry several levels at ONE timestamp, and collapsing
+    those onto one candle would merge nine levels into one.
+    """
+    pts = series.get("points") or []
+    if not pts or not grid_ts:
+        return series
+    out = []
+    gi = 0
+    for p in pts:
+        t = int(p["ts"])
+        # both lists ascend: one forward scan finds the nearest candle
+        while (gi < len(grid_ts) - 1
+               and abs(grid_ts[gi + 1] - t) <= abs(grid_ts[gi] - t)):
+            gi += 1
+        g = grid_ts[gi]
+        if abs(g - t) > tol_ns:
+            continue                       # no candle near this point
+        if out and out[-1]["ts"] == g:
+            out[-1]["v"] = p["v"]          # the latest value wins the slot
+        else:
+            out.append({"ts": g, "v": p["v"]})
+    return {"id": series.get("id"), "producer": series.get("producer", ""),
+            "label": series.get("label", ""), "unit": series.get("unit", ""),
+            "points": out}
+
+
 class Dashboard:
     """Embedded server: HTTP static + one WebSocket carrying engine state."""
 
@@ -475,9 +515,25 @@ class Dashboard:
             candles = lane.get("bars_raw", [])
         else:
             candles = bars_for = bars.get(tf, [])
+        # The indicator series is stamped at the BAR's resolution; the chart
+        # draws one candle per bar of THIS timeframe. Snap the time series
+        # onto the grid the client is about to draw on -- the payload is
+        # five times smaller for a 5m chart, and the bands keep covering
+        # the whole window instead of stopping where the series was
+        # truncated. The static level series (pivot grid, dealer gamma)
+        # keep their own timestamps: several levels share one timestamp
+        # there, and collapsing them would merge them.
+        grid_ts = [int(b["ts"]) for b in candles]
+        indicators = []
+        for ind in lane.get("indicators", []):
+            producer = ind.get("producer", "") or ""
+            if "pivot" in producer or "gamma_levels" in producer:
+                indicators.append(ind)
+            else:
+                indicators.append(_snap_series_to_grid(ind, grid_ts))
         return {
             "bars": candles,
-            "indicators": lane.get("indicators", []),
+            "indicators": indicators,
             "gamma": lane.get("gamma"),
             "strategies_roster": lane.get("strategies_roster", []),
             "zones": lane.get("zones", []),
