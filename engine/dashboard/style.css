@@ -160,6 +160,12 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
 .rosterRow .name { color: var(--text); }
 .rosterRow .posTag { color: var(--accent); font-variant-numeric: tabular-nums; }
 .rosterRow .dim { color: var(--muted); font-size: 11px; }
+.rosterRow .modeTag {
+  font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 4px;
+  letter-spacing: .04em; flex: 0 0 auto;
+}
+.rosterRow .modeTag.live { background: rgba(239,83,80,.2); color: #ef5350; border: 1px solid #ef5350; }
+.rosterRow .modeTag.paper { background: rgba(79,156,249,.15); color: #4f9cf9; border: 1px solid #4f9cf9; }
 .rosterRow.off .name { color: var(--muted); }
 
 /* ── gamma panel ──────────────────────────────────────────────────── */

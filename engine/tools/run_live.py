@@ -1532,6 +1532,12 @@ async def main() -> None:
 
             srcs = []
             for _sym, meta in lane_meta.items():
+                _lane_strats = [_s for _label, _s in meta["roster"]]
+                for _s in _lane_strats:
+                    try:
+                        _s.mode = "live" if id(_s) in live_owners else "paper"
+                    except Exception:                 # noqa: BLE001
+                        pass
                 srcs.append(LaneSource(
                     _sym,
                     zoneview=zoneviews.get(_sym),
@@ -1539,7 +1545,7 @@ async def main() -> None:
                     # cold start is better than no bands
                     levelbook=levelbooks.get(_sym),
                     gamma_curve=gammacurves.get(_sym),
-                    strategies=[_s for _label, _s in meta["roster"]],
+                    strategies=_lane_strats,
                     color=""))
 
             pub = StatePublisher(srcs, agg_timeframes=tfs)

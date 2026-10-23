@@ -716,6 +716,7 @@ class ChartWindow {
       return `<div class="rosterRow ${on ? "" : "off"}">
         <span class="sw ${on ? "on" : ""}" data-i="${i}"></span>
         <span class="name">${escapeHtml(s.label)}</span>
+        <span class="modeTag ${s.mode === 'live' ? 'live' : 'paper'}">${s.mode === 'live' ? 'LIVE' : 'PAPER'}</span>
         <button class="iconBtn soloBtn" data-i="${i}" title="show only this strategy">${solo ? "*" : "1"}</button>
         ${(s.qty||0) ? `<span class="posTag">${s.qty} @ ${fmtPx(s.entry_px)}</span>` : ""}
         ${s.entry || s.target || s.stop

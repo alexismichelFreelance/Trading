@@ -332,6 +332,7 @@ def strategies_roster_from(strategies, bar_ts: int = 0) -> list:
         out.append({
             "label": getattr(s, "label", "") or type(s).__name__,
             "enabled": bool(getattr(s, "enabled", True)),
+            "mode": getattr(s, "mode", "paper"),
             "qty": int(qty),
             "entry_px": _round(getattr(s, "entry_px", None)),
             "entry": _round(marks.get("entry")),
