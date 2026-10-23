@@ -966,8 +966,17 @@ class ChartWindow {
     this.disconnect();
     const url = `ws://${location.host}/ws?symbol=${encodeURIComponent(this.symbol)}&tf=${encodeURIComponent(this.tf)}`;
     this.ws = new WebSocket(url);
+    const self = this;
+    // reconnect if no message arrives within 8s (handles connections made during server seeding)
+    this._msgTimer = setTimeout(() => {
+      if (self.candles.length === 0) {
+        console.warn('no data received, reconnecting...');
+        self.connect();
+      }
+    }, 8000);
     this.ws.onopen = () => { this._reconnectDelay = 1500; setStatus("ok", "connected"); };
     this.ws.onmessage = (ev) => {
+      if (this._msgTimer) { clearTimeout(this._msgTimer); this._msgTimer = null; }
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
       try {
         self.handleMessage(msg);
