@@ -538,6 +538,7 @@ class Dashboard:
             "strategies_roster": lane.get("strategies_roster", []),
             "zones": lane.get("zones", []),
             "positions": lane.get("positions", []),
+            "signals": snap.get("signals", []),
         }
 
     async def _ws(self, request):
@@ -654,6 +655,7 @@ class Dashboard:
                                "strategies_roster": lane.get("strategies_roster", []),
                                "zones": lane.get("zones", []),
                                "positions": lane.get("positions", []),
+                               "signals": snap.get("signals", []),
                            },
                            "log": snap.get("log", []),
                            "errors": snap.get("errors", [])}
@@ -671,7 +673,7 @@ class Dashboard:
                     out = {"type": "delta", "symbol": symbol,
                            "kind": "bar", "payload": {"bar": bar}}
                 elif kind in ("indicator", "gamma", "roster", "zone",
-                              "position", "fill"):
+                              "position", "fill", "signal"):
                     if m.get("lane") != symbol:
                         continue
                     if kind == "indicator":
@@ -724,9 +726,19 @@ class Dashboard:
             if not _re.fullmatch(r'[A-Z]{1,6}(\.[A-Z]{1,3})?', symbol):
                 raise ValueError("Invalid symbol")
             limit = min(limit, 5000)
+            # DB ts is epoch nanoseconds; start/end arrive as epoch seconds.
+            NS = 1_000_000_000
+            _reverse = True
             if start is not None and end is not None:
-                # DB ts is microsecond precision; start/end arrive as epoch ms
-                sql = f"SELECT ts, o, h, l, c, vol FROM claude_bars_live WHERE symbol = '{symbol}' AND ts >= {int(start)} * 1000 AND ts <= {int(end)} * 1000 ORDER BY ts"
+                sql = (f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
+                       f"WHERE symbol = '{symbol}' AND ts >= {int(start)} * {NS} "
+                       f"AND ts <= {int(end)} * {NS} ORDER BY ts")
+                _reverse = False
+            elif end is not None:
+                # scroll-back: bars OLDER than `end`
+                sql = (f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
+                       f"WHERE symbol = '{symbol}' AND ts < {int(end)} * {NS} "
+                       f"ORDER BY ts DESC LIMIT {limit}")
             else:
                 sql = f"SELECT ts, o, h, l, c, vol FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {limit}"
             df = qdb.df(sql)
@@ -748,7 +760,7 @@ class Dashboard:
                 "l": float(r.l),
                 "c": float(r.c),
                 "v": float(r.vol),
-            } for r in df.iloc[::-1].itertuples()]
+            } for r in (df.iloc[::-1].itertuples() if _reverse else df.itertuples())]
 
             # compute VWAP indicator series using the engine's AnchoredVWAP,
             # reset per Globex session (matches the live lane's VWAP).

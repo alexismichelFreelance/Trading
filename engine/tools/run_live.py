@@ -1260,13 +1260,18 @@ async def main() -> None:
         print(f"DEBUG: After adding instrument to blotter for {sym}", flush=True)
         roster += lane_roster
         print(f"DEBUG: After adding to roster for {sym}", flush=True)
-        lane_live = {sym} if lc.get("live") else set()
-        live_names |= lane_live
-        print(f"DEBUG: After adding to live_names for {sym}", flush=True)
         lane_meta[sym] = {"draw_port": int(lc.get("draw_port", 36004)),
                           "roster": lane_roster, "lc": lc}
     strategies = [s for sym in sleeves_dict for s in sleeves_dict[sym]]
-    live_owners = {id(s) for sym in live_names for s in sleeves_dict.get(sym, [])}
+    live_owners = set()
+    for _sym, _meta in lane_meta.items():
+        _lc = _meta["lc"]
+        _live_labels = set(x.strip() for x in str(_lc.get("live", "")).split(",") if x.strip())
+        if "all" in _live_labels:
+            _live_labels = set(lb.split(":")[-1] for lb, _ in _meta["roster"])
+        for _lb, _s in _meta["roster"]:
+            if _lb.split(":")[-1] in _live_labels:
+                live_owners.add(id(_s))
     point_usd = {sym: INSTRUMENTS[sym].point_usd for sym in lanes_cfg}
     if a.no_risk:
         risk = RiskSupervisor(RiskConfig(point_usd=point_usd))
