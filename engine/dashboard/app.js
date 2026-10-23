@@ -112,6 +112,11 @@ class ChartWindow {
     this.zoneCanvas = document.createElement("canvas");
     this.zoneCanvas.style.cssText = "position:absolute;inset:0;pointer-events:none;z-index:2;";
     this.chartBox.appendChild(this.zoneCanvas);
+    // session shading canvas (behind zones)
+    this.sessionCanvas = document.createElement("canvas");
+    this.sessionCanvas.style.cssText = "position:absolute;inset:0;pointer-events:none;z-index:1;";
+    this.chartBox.appendChild(this.sessionCanvas);
+    this.sessionCanvas.style.zIndex = "1";
     // floating right-side label panel (pinned labels, not overlaying price)
     this.levelLabels = document.createElement("div");
     this.levelLabels.className = "levelLabels";
@@ -264,6 +269,7 @@ class ChartWindow {
     const ch = Math.max(120, Math.floor(r(this.chartBox).height));
     this.chart.resize(cw, ch);
     this.drawZoneRects();
+    this.drawSessionShading();
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
@@ -790,7 +796,8 @@ class ChartWindow {
     if (!host) return;
     const ids = Object.keys(this.indicators).concat(
       this.gamma ? ["__gamma__"] : [],
-      (this.zones && this.zones.length) ? ["__zones__"] : []
+      (this.zones && this.zones.length) ? ["__zones__"] : [],
+      ["__sessions__"]
     );
     host.innerHTML = ids.map(id => {
       const on = this.indicatorOn[id] !== false;
@@ -798,6 +805,7 @@ class ChartWindow {
       if (this.indicators[id]) lbl = this.indicators[id].label || id;
       else if (id === "__gamma__") lbl = "gamma walls";
       else if (id === "__zones__") lbl = "zones";
+      else if (id === "__sessions__") lbl = "session shading";
       return `<div class="rosterRow ${on ? "" : "off"}">
         <span class="sw ${on ? "on" : ""}" data-id="${escapeHtml(id)}"></span>
         <span class="name">${escapeHtml(lbl)}</span>
@@ -820,6 +828,8 @@ class ChartWindow {
           if (this.indicatorOn[id] === false) {
             this.drawZoneRects();
           } else this.drawZones();
+        } else if (id === "__sessions__") {
+          this.drawSessionShading();
         } else {
           const ind = this.indicators[id];
           if (ind) this.upsertIndicator(ind, false);
@@ -913,6 +923,64 @@ class ChartWindow {
     }
   }
 
+
+  drawSessionShading() {
+    const canvas = this.sessionCanvas;
+    if (!canvas) return;
+    const rect = this.chartBox.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(rect.width * dpr);
+    canvas.height = Math.floor(rect.height * dpr);
+    canvas.style.width = rect.width + "px";
+    canvas.style.height = rect.height + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+    if (this.indicatorOn["__sessions__"] === false) return;
+    const ts = this.chart.timeScale();
+    const c = this.candles;
+    if (!c.length) return;
+    // session windows in ET (approx, UTC-4 EDT)
+    const sessions = [
+      {name: "LON", startH: 3, startM: 0, endH: 11, endM: 30, color: "rgba(34,197,94,0.06)"},
+      {name: "RTH", startH: 9, startM: 30, endH: 16, endM: 0, color: "rgba(79,156,249,0.08)"},
+    ];
+    // iterate over visible candles and shade
+    for (const s of sessions) {
+      // find contiguous ranges of candles within this session
+      let inSession = false;
+      let startX = null;
+      for (let i = 0; i < c.length; i++) {
+        const d = new Date(c[i].ts / 1e6);
+        const etH = (d.getUTCHours() + 20) % 24;
+        const etM = d.getUTCMinutes();
+        const mins = etH * 60 + etM;
+        const startMins = s.startH * 60 + s.startM;
+        const endMins = s.endH * 60 + s.endM;
+        const inSess = mins >= startMins && mins < endMins;
+        const x = ts.timeToCoordinate(sec(c[i].ts));
+        if (x == null) continue;
+        if (inSess && !inSession) {
+          inSession = true;
+          startX = x;
+        } else if (!inSess && inSession) {
+          inSession = false;
+          if (startX != null) {
+            ctx.fillStyle = s.color;
+            ctx.fillRect(startX, 0, x - startX, rect.height);
+          }
+          startX = null;
+        }
+      }
+      if (inSession && startX != null) {
+        const lastX = ts.timeToCoordinate(sec(c[c.length-1].ts));
+        if (lastX != null) {
+          ctx.fillStyle = s.color;
+          ctx.fillRect(startX, 0, lastX - startX + 10, rect.height);
+        }
+      }
+    }
+  }
 
   _indicatorOn(id) {
     return this.indicatorOn[id] !== false;
@@ -1311,6 +1379,7 @@ class ChartWindow {
     this.setRoster(p.strategies_roster || []);
     this.setZones(p.zones || []);
     this.setPositions(p.positions || []);
+    this.drawSessionShading();
     this.renderLevelLabels();
     const self = this;
     setTimeout(() => self.renderLevelLabels(), 500);
