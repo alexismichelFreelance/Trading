@@ -58,6 +58,7 @@ class ChartWindow {
     this.zones = [];            // [{id, tf, top, bot, direction, virgin, touches}]
     this.positions = [];        // [{sleeve, qty, entry, target, stop}]
     this.fillMarkers = [];
+    this.signalMarkers = [];
     this._logCount = 0;
     this._reconnectDelay = 1500;
     this._initialLoadDone = false;
@@ -929,8 +930,22 @@ class ChartWindow {
       text: (side ? "B " : "S ") + (f.tag || "") });
     this.applyMarkers();
   }
+  addSignalMarker(s) {
+    if (!s) return;
+    const side = (s.side || 0) > 0;
+    const ts = s.ts || Date.now() * 1e6;
+    this.signalMarkers.push({
+      time: sec(ts),
+      position: side ? "belowBar" : "aboveBar",
+      color: side ? "#22c55e" : "#ef5350",
+      shape: side ? "arrowUp" : "arrowDown",
+      text: (s.tag || (side ? "BUY" : "SELL")),
+    });
+    this.applyMarkers();
+  }
+
   applyMarkers() {
-    const markers = this.fillMarkers.slice(-100);
+    const markers = this.fillMarkers.slice(-100).concat(this.signalMarkers.slice(-100));
     if (this.sessionMarkers) markers.push(...this.sessionMarkers);
     if (this.pivotMarkers) markers.push(...this.pivotMarkers);
     if (this.gammaMarkers) markers.push(...this.gammaMarkers);
@@ -1079,6 +1094,7 @@ class ChartWindow {
         case "zone": this.setZones(zonesFromDelta(this.zones, pl)); break;
         case "position": this.applyPositionDelta(pl.position); break;
         case "fill": this.addFillMarker(pl); sawFill = true; break;
+        case "signal": this.addSignalMarker(pl); sawFill = true; break;
         case "log": appendLog(pl, false); break;
         case "error": appendLog(pl, true); break;
       }
@@ -1273,6 +1289,7 @@ class ChartWindow {
     this.setRoster(p.strategies_roster || []);
     this.setZones(p.zones || []);
     this.setPositions(p.positions || []);
+    for (const s of (p.signals || [])) this.addSignalMarker(s);
     for (const rec of (msg.log || [])) appendLog(rec, false);
     for (const rec of (msg.errors || [])) appendLog(rec, true);
     this.updateHeader();
@@ -1316,6 +1333,7 @@ class ChartWindow {
       case "zone": this.setZones(zonesFromDelta(this.zones, pl)); break;
       case "position": this.applyPositionDelta(pl.position); break;
       case "fill": this.addFillMarker(pl); break;
+      case "signal": this.addSignalMarker(pl); break;
       case "log": appendLog(pl, false); break;
       case "error": appendLog(pl, true); break;
     }

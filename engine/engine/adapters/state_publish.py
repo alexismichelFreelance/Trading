@@ -170,6 +170,10 @@ class StatePublisher:
         engine.on_bar_hook = _combine(engine.on_bar_hook, self._on_bar)
         engine.on_live_fill = _combine(engine.on_live_fill, self._on_fill)
         engine.on_paper_fill = _combine(engine.on_paper_fill, self._on_fill)
+        engine.on_live_order = _combine(getattr(engine, "on_live_order", None),
+                                        self._on_signal)
+        engine.on_warmup_signal = _combine(getattr(engine, "on_warmup_signal", None),
+                                           self._on_warmup_signal)
         engine.on_session_rollover = _combine(engine.on_session_rollover,
                                               self._on_session)
         engine.on_feed_disconnect = _combine(engine.on_feed_disconnect,
@@ -203,6 +207,25 @@ class StatePublisher:
         sym = f.symbol or ""
         self.broadcast(self.store.apply_fill(_fill_dict(f)))
         await self._publish_positions(sym)
+
+    async def _on_signal(self, ts: int, side: int, qty: int, tag: str, px: float) -> None:
+        sym = getattr(self._engine, "symbol", "") if self._engine else ""
+        # best-effort symbol from the engine's lanes
+        if not sym and self.lanes:
+            sym = next(iter(self.lanes))
+        rec = {"ts": int(ts), "symbol": sym, "side": int(side),
+               "qty": int(qty), "tag": str(tag), "px": float(px) if px else None,
+               "source": "live", "reduce_only": False}
+        self.broadcast(self.store.apply_signal(rec))
+
+    async def _on_warmup_signal(self, ts: int, symbol: str, source: str, side: int,
+                                 qty: int, tag: str, price: float,
+                                 reduce_only: bool = False) -> None:
+        sym = symbol or (next(iter(self.lanes)) if self.lanes else "")
+        rec = {"ts": int(ts), "symbol": sym, "side": int(side),
+               "qty": int(qty), "tag": str(tag), "px": float(price) if price else None,
+               "source": str(source), "reduce_only": bool(reduce_only)}
+        self.broadcast(self.store.apply_signal(rec))
 
     async def _on_session(self, day: str) -> None:
         self.broadcast(self.store.apply_session(day))

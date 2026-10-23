@@ -1533,11 +1533,15 @@ async def main() -> None:
             srcs = []
             for _sym, meta in lane_meta.items():
                 _lane_strats = [_s for _label, _s in meta["roster"]]
+                try:
+                    _live = live_owners
+                except NameError:
+                    _live = set()
                 for _s in _lane_strats:
                     try:
-                        _s.mode = "live" if id(_s) in live_owners else "paper"
+                        _s.mode = "live" if id(_s) in _live else "paper"
                     except Exception:                 # noqa: BLE001
-                        pass
+                        _s.mode = "paper"
                 srcs.append(LaneSource(
                     _sym,
                     zoneview=zoneviews.get(_sym),

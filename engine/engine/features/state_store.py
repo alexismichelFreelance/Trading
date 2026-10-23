@@ -75,6 +75,7 @@ def _trim_oldest(win: dict, limit: int) -> None:
         win.pop(old, None)
 MAX_LOG = 200               # log records retained
 MAX_ERRORS = 60             # error/warning records retained
+MAX_SIGNALS = 100           # signal markers retained
 # Indicator points are stamped at the BAR's resolution (1m) while the chart
 # draws one candle per 5 minutes: 600 candles is 3,000 minutes of chart, so a
 # 1,800-point window stopped the bands 40% short of the left edge -- they
@@ -94,6 +95,7 @@ class StateStore:
         self._lanes: dict[str, dict] = {}   # sym -> lane state (OrderedDicts)
         self._log: deque[dict] = deque(maxlen=MAX_LOG)
         self._errors: deque[dict] = deque(maxlen=MAX_ERRORS)
+        self._signals: deque[dict] = deque(maxlen=MAX_SIGNALS)
 
     # ── lane helpers ─────────────────────────────────────────────────────
     def _lane(self, sym: str) -> dict:
@@ -284,6 +286,12 @@ class StateStore:
         self.ts = max(self.ts, f.get("ts", 0))
         return self._next("fill", f.get("symbol", ""), f)
 
+    def apply_signal(self, s: dict) -> dict:
+        """A strategy SIGNAL (intent) marker: ts/side/qty/tag/px. One-off."""
+        self.ts = max(self.ts, s.get("ts", 0))
+        self._signals.append(s)
+        return self._next("signal", s.get("symbol", ""), s)
+
     def apply_log(self, record: dict) -> dict:
         """Record one engine log line (already dictified: ts, level, message,
         logger). ERROR/WARNING are surfaced in the errors ring too."""
@@ -351,6 +359,7 @@ class StateStore:
             "lanes": lanes,
             "log": list(self._log),
             "errors": list(self._errors),
+            "signals": list(self._signals),
         }
 
 
