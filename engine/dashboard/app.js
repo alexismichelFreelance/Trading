@@ -1249,6 +1249,8 @@ class ChartWindow {
     this.updateHeader();
     this.reflow();
     this.renderLevelLabels();
+    const self = this;
+    setTimeout(() => self.renderLevelLabels(), 500);
     // initial zoom based ONLY on candles (never on indicators/levels)
     if (!this._initialLoadDone) {
       this._initialLoadDone = true;
