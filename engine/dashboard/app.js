@@ -1247,6 +1247,7 @@ class ChartWindow {
     for (const rec of (msg.log || [])) appendLog(rec, false);
     for (const rec of (msg.errors || [])) appendLog(rec, true);
     this.updateHeader();
+    this.renderLevelLabels();
     // initial zoom based ONLY on candles (never on indicators/levels)
     if (!this._initialLoadDone) {
       this._initialLoadDone = true;
