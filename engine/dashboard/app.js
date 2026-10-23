@@ -62,6 +62,8 @@ class ChartWindow {
     this._reconnectDelay = 1500;
     this._initialLoadDone = false;
     this._autoScroll = true;
+    this._loadingHistory = false;
+    this._noMoreHistory = false;
 
     // series / line registries
     this.indSeries = {};        // id -> line series (vwap family line series)
@@ -78,7 +80,10 @@ class ChartWindow {
     this.reflow();
     // redraw zone rectangles on pan/zoom
     try {
-      this.chart.timeScale().subscribeVisibleTimeRangeChange(() => { this.drawZoneRects(); });
+      this.chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+        this.drawZoneRects();
+        this.maybeLoadOlder();
+      });
     } catch (e) {}
   }
 
@@ -1098,6 +1103,74 @@ class ChartWindow {
     const span = Math.max(step, vr.to - vr.from);
     const to = lastT + step * 3;             // rightOffset worth of padding
     try { ts.setVisibleRange({ from: to - span, to }); } catch {}
+  }
+
+  /* Scroll-back: load older bars when the view reaches the left edge. */
+  maybeLoadOlder() {
+    if (this._loadingHistory || this._noMoreHistory) return;
+    if (!this.candles.length) return;
+    const ts = this.chart.timeScale();
+    let vr = null;
+    try { vr = ts.getVisibleRange(); } catch { return; }
+    if (!vr) return;
+    const firstCandleSec = sec(this.candles[0].ts);
+    // trigger when view's left edge is within 2 bar-spans of the first candle
+    const step = this.gridStep();
+    if (vr.from > firstCandleSec + step * 2) return;
+    this.loadOlder();
+  }
+
+  async loadOlder() {
+    if (this._loadingHistory) return;
+    this._loadingHistory = true;
+    const firstTs = this.candles.length ? this.candles[0].ts : null;
+    if (!firstTs) { this._loadingHistory = false; return; }
+    const symbol = this.symbol;
+    const tf = this.tf;
+    const endSec = Math.floor(firstTs / 1e9);
+    const url = `/history?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&end=${endSec}&limit=2000`;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) { this._loadingHistory = false; return; }
+      const data = await resp.json();
+      const newBars = (data.bars && (data.bars[tf] || data.bars)) || [];
+      if (!Array.isArray(newBars) || !newBars.length) { this._noMoreHistory = true; this._loadingHistory = false; return; }
+      // merge: prepend older bars, dedup by ts
+      const seen = new Set(this.candles.map(c => c.ts));
+      const older = newBars.filter(b => !seen.has(b.ts));
+      if (!older.length) { this._noMoreHistory = true; this._loadingHistory = false; return; }
+      // sort older ascending
+      older.sort((a, b) => a.ts - b.ts);
+      this.candles = older.concat(this.candles);
+      // re-render candles
+      const cd = this.candles.map(b => ({ time: sec(b.ts), open: b.o, high: b.h, low: b.l, close: b.c }));
+      this.candleSeries.setData(cd);
+      const vd = this.candles.map(b => ({ time: sec(b.ts), value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0, color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)" }));
+      this.volSeries.setData(vd);
+      // merge VWAP points from history (snap to candle grid)
+      const newInds = data.indicators || [];
+      for (const ind of newInds) {
+        if (ind.id === 'vwap' || ind.id === 'VWAP') {
+          const pts = this.snapToGrid(ind.points || []);
+          const cur = this.indicators['vwap'];
+          if (cur) {
+            const idx = new Map(cur.points.map((p, i) => [p.ts, i]));
+            for (const p of pts) {
+              const i = idx.get(p.ts);
+              if (i >= 0) cur.points[i] = p;
+              else { cur.points.push(p); idx.set(p.ts, cur.points.length - 1); }
+            }
+            cur.points.sort((a, b) => a.ts - b.ts);
+            this.vwapSeries.setData(cur.points.filter(p => typeof p.v === 'number' && !isNaN(p.v)).map(p => ({ time: sec(p.ts), value: p.v })));
+            // also update band series if present (skip for now - bands not in /history)
+          }
+        }
+      }
+      this._loadingHistory = false;
+    } catch (e) {
+      console.error('loadOlder failed', e);
+      this._loadingHistory = false;
+    }
   }
 
   goToLatest() {
