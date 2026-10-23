@@ -883,6 +883,14 @@ class ChartWindow {
       ctx.strokeStyle = stroke;
       ctx.lineWidth = 1;
       ctx.strokeRect(x, y, w, h);
+      // zone tf label
+      if (z.tf && w > 30 && h > 12) {
+        ctx.fillStyle = stroke;
+        ctx.font = "9px sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "top";
+        ctx.fillText(z.tf, x + 2, y + 2);
+      }
     }
   }
 
