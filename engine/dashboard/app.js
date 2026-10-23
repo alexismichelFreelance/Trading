@@ -110,10 +110,6 @@ class ChartWindow {
     this.levelLabels = document.createElement("div");
     this.levelLabels.className = "levelLabels";
     this.chartBox.appendChild(this.levelLabels);
-    // floating right-side label panel (pinned labels, not overlaying price)
-    this.levelLabels = document.createElement("div");
-    this.levelLabels.className = "levelLabels";
-    this.chartBox.appendChild(this.levelLabels);
     this.winTitle = this.wrapper.querySelector(".winTitle");
     this.closeBtn = this.wrapper.querySelector(".closeBtn");
     this.popBtn = this.wrapper.querySelector(".popBtn");
@@ -258,7 +254,6 @@ class ChartWindow {
     const ch = Math.max(120, Math.floor(r(this.chartBox).height));
     this.chart.resize(cw, ch);
     this.drawZoneRects();
-    this.renderLevelLabels();
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
@@ -405,13 +400,10 @@ class ChartWindow {
         if (cur.id === "vwap") for (const a of this.bandAreas) try { a.ser.setData([]); } catch {}
       } else if ((cur.producer || "").includes("pivot")) {
         const isMulti = (cur.id || "").includes("mpivots");
-        const arr = isMulti ? this.pivotLinesMulti : this.pivotLinesDaily;
-        for (const ser of (arr || [])) try { this.chart.removeSeries(ser); } catch {}
         const plArr = isMulti ? this.pivotPriceLinesMulti : this.pivotPriceLinesDaily;
         for (const pl of (plArr || [])) try { this.candleSeries.removePriceLine(pl); } catch {}
-        if (isMulti) { this.pivotLinesMulti = []; this.pivotPriceLinesMulti = []; }
-        else { this.pivotLinesDaily = []; this.pivotPriceLinesDaily = []; }
-        this.applyMarkers();
+        if (isMulti) this.pivotPriceLinesMulti = [];
+        else this.pivotPriceLinesDaily = [];
       } else if ((cur.producer || "").includes("gamma_levels")) {
         for (const pl of (this.gammaLines || [])) try { this.candleSeries.removePriceLine(pl); } catch {}
         this.gammaLines = [];
@@ -600,23 +592,10 @@ class ChartWindow {
    * every pivot delta. */
   drawPivotLines(ind) {
     const isMulti = (ind && (ind.producer || "")).includes("mpivots");
-    if (isMulti) {
-      if (!this.pivotLinesMulti) this.pivotLinesMulti = [];
-      for (const ser of this.pivotLinesMulti) { try { this.chart.removeSeries(ser); } catch {} }
-      this.pivotLinesMulti = [];
-      if (!this.pivotPriceLinesMulti) this.pivotPriceLinesMulti = [];
-      for (const pl of this.pivotPriceLinesMulti) { try { this.candleSeries.removePriceLine(pl); } catch {} }
-      this.pivotPriceLinesMulti = [];
-    } else {
-      if (!this.pivotLinesDaily) this.pivotLinesDaily = [];
-      for (const ser of this.pivotLinesDaily) { try { this.chart.removeSeries(ser); } catch {} }
-      this.pivotLinesDaily = [];
-      if (!this.pivotPriceLinesDaily) this.pivotPriceLinesDaily = [];
-      for (const pl of this.pivotPriceLinesDaily) { try { this.candleSeries.removePriceLine(pl); } catch {} }
-      this.pivotPriceLinesDaily = [];
-    }
-    const rng = this.lastSessionRange();
-    const rightEdge = this.rightEdgeSec();
+    const arr = isMulti ? (this.pivotPriceLinesMulti = this.pivotPriceLinesMulti || []) : (this.pivotPriceLinesDaily = this.pivotPriceLinesDaily || []);
+    // remove previous
+    for (const pl of arr) { try { this.candleSeries.removePriceLine(pl); } catch {} }
+    arr.length = 0;
     const seen = new Set();
     for (const p of (ind && ind.points) || []) {
       const lbl = p.label || "";
@@ -629,38 +608,14 @@ class ChartWindow {
       if (/\bPP\b/i.test(lbl)) color = "#eab308";
       else if (/\bS\d/i.test(lbl)) color = "#22c55e";
       else if (/\bR\d/i.test(lbl)) color = "#ef4444";
-      const startSec = rng ? rng.from : null;
-      const endSec = rightEdge;
-      const ser = this.drawBoundedLevel(price, startSec, endSec, color, 2, 1);
-      const arr = isMulti ? this.pivotLinesMulti : this.pivotLinesDaily;
-      if (ser) arr.push(ser);
-      const labArr = isMulti ? (this.pivotLabelsMulti = this.pivotLabelsMulti || []) : (this.pivotLabelsDaily = this.pivotLabelsDaily || []);
-      labArr.push({ price, color, text: lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}` });
+      const pl = this.candleSeries.createPriceLine({
+        price, color, lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title: lbl ? `${lbl} ${price.toFixed(2)}` : `pivot ${price.toFixed(2)}`,
+      });
+      if (pl) arr.push(pl);
     }
-    this.renderLevelLabels();
-    this.pivotMarkers = [];
-    this.applyMarkers();
   }
 
-  renderLevelLabels() {
-    const host = this.levelLabels;
-    if (!host) return;
-    host.innerHTML = "";
-    const labels = [];
-    if (this.indicatorOn["__gamma__"] !== false && this.gammaLabels) labels.push(...this.gammaLabels);
-    if (this.indicatorOn["mpivots"] !== false && this.pivotLabelsMulti) labels.push(...this.pivotLabelsMulti);
-    if (this.indicatorOn["pivots"] !== false && this.pivotLabelsDaily) labels.push(...this.pivotLabelsDaily);
-    const ps = this.candleSeries;
-    const chartRect = this.chartBox.getBoundingClientRect();
-    for (const lab of labels) {
-      const y = ps.priceToCoordinate(lab.price);
-      if (y == null || y < 0 || y > chartRect.height) continue;
-      const div = document.createElement("div");
-      div.style.cssText = `position:absolute;right:0;top:${y - 8}px;font-size:10px;color:${lab.color};white-space:nowrap;pointer-events:none;`;
-      div.textContent = lab.text;
-      host.appendChild(div);
-    }
-  }
 
   rightEdgeSec() {
     const c = this.candles;
@@ -687,53 +642,47 @@ class ChartWindow {
 
   renderGamma(g) {
     this.gamma = g;
-    // remove previous
-    for (const ser of (this.gammaLines || [])) { try { this.chart.removeSeries(ser); } catch {} }
-    this.gammaLines = [];
-    this.gammaLabels = [];
+    if (!this.gammaPriceLines) this.gammaPriceLines = [];
+    for (const pl of this.gammaPriceLines) { try { this.candleSeries.removePriceLine(pl); } catch {} }
+    this.gammaPriceLines = [];
     if (this.indicatorOn["__gamma__"] === false) {
       renderGammaDrawerFor(this);
       return;
     }
-    // remove previous bounded series
-    for (const ser of (this.gammaLines || [])) { try { this.chart.removeSeries(ser); } catch {} }
-    this.gammaLines = [];
-    if (!this.gammaMarkers) this.gammaMarkers = [];
-    this.gammaMarkers = [];
     if (!g || !g.ok) { this.setRegime(g && g.local_sign); renderGammaDrawerFor(this); return; }
-    const rng = this.lastSessionRange();
-    const startSec = rng ? rng.from : null;
-    const endSec = this.rightEdgeSec();
     const flips = g.flips || [];
     for (const f of flips) {
       const px = this.priceSanity(f);
       if (px == null) continue;
-      const ser = this.drawBoundedLevel(px, startSec, endSec, "#e6a9ff", 0, 1);
-      if (ser) this.gammaLines.push(ser);
-      this.gammaLabels.push({ price: px, color: "#e6a9ff", text: `flip ${px.toFixed(2)}` });
+      const pl = this.candleSeries.createPriceLine({
+        price: px, color: "#e6a9ff", lineWidth: 1, lineStyle: 0,
+        axisLabelVisible: true, title: `flip ${px.toFixed(2)}`,
+      });
+      if (pl) this.gammaPriceLines.push(pl);
     }
     for (const w of (g.call_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
       if (k == null) continue;
       const px = this.priceSanity(k);
       if (px == null) continue;
-      const ser = this.drawBoundedLevel(px, startSec, endSec, "#ffa500", 2, 1);
-      if (ser) this.gammaLines.push(ser);
-      this.gammaLabels.push({ price: px, color: "#ffa500", text: `call wall ${px.toFixed(2)}` });
+      const pl = this.candleSeries.createPriceLine({
+        price: px, color: "#ffa500", lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title: `call wall ${px.toFixed(2)}`,
+      });
+      if (pl) this.gammaPriceLines.push(pl);
     }
     for (const w of (g.put_walls || [])) {
       const k = Array.isArray(w) ? w[0] : w;
       if (k == null) continue;
       const px = this.priceSanity(k);
       if (px == null) continue;
-      const ser = this.drawBoundedLevel(px, startSec, endSec, "#1e90ff", 2, 1);
-      if (ser) this.gammaLines.push(ser);
-      this.gammaLabels.push({ price: px, color: "#1e90ff", text: `put wall ${px.toFixed(2)}` });
+      const pl = this.candleSeries.createPriceLine({
+        price: px, color: "#1e90ff", lineWidth: 1, lineStyle: 2,
+        axisLabelVisible: true, title: `put wall ${px.toFixed(2)}`,
+      });
+      if (pl) this.gammaPriceLines.push(pl);
     }
-    this.gammaMarkers = [];
-    this.applyMarkers();
-    this.renderLevelLabels();
-    this.setRegime(g.local_sign);
+    this.setRegime(g && g.local_sign);
     renderGammaDrawerFor(this);
   }
 
@@ -838,13 +787,9 @@ class ChartWindow {
         this.renderIndicatorsList();
         if (id === "__gamma__") {
           if (this.indicatorOn[id] === false) {
-            for (const ser of (this.gammaLines || [])) try { this.chart.removeSeries(ser); } catch {}
-            this.gammaLines = [];
             for (const pl of (this.gammaPriceLines || [])) try { this.candleSeries.removePriceLine(pl); } catch {}
             this.gammaPriceLines = [];
-            this.gammaMarkers = [];
             this.applyMarkers();
-            this.renderLevelLabels();
           } else if (this.gamma) this.renderGamma(this.gamma);
         } else if (id === "__zones__") {
           if (this.indicatorOn[id] === false) {
@@ -853,7 +798,6 @@ class ChartWindow {
         } else {
           const ind = this.indicators[id];
           if (ind) this.upsertIndicator(ind, false);
-          this.renderLevelLabels();
         }
       });
     });
@@ -1017,7 +961,6 @@ class ChartWindow {
     this.disconnect();
     const url = `ws://${location.host}/ws?symbol=${encodeURIComponent(this.symbol)}&tf=${encodeURIComponent(this.tf)}`;
     this.ws = new WebSocket(url);
-    const self = this;
     this.ws.onopen = () => { this._reconnectDelay = 1500; setStatus("ok", "connected"); };
     this.ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
@@ -1201,17 +1144,12 @@ class ChartWindow {
       if (!arr) return;
       for (const ser of arr) { try { this.chart.removeSeries(ser); } catch {} }
     };
-    clearSeries(this.gammaLines);    this.gammaLines = [];
     for (const pl of (this.gammaPriceLines || [])) try { this.candleSeries.removePriceLine(pl); } catch {}
     this.gammaPriceLines = [];
-    for (const ser of (this.pivotLinesMulti || [])) try { this.chart.removeSeries(ser); } catch {}
-    for (const ser of (this.pivotLinesDaily || [])) try { this.chart.removeSeries(ser); } catch {}
-    this.pivotLinesMulti = [];
-    this.pivotLinesDaily = [];
+    // (pivotLines arrays no longer used; price lines tracked separately)
     clearSeries(this.staticLines);    this.staticLines = [];
     clearSeries(this.zoneLines);      this.zoneLines = [];
     this.drawZoneRects();
-    this.renderLevelLabels();
     for (const lbl in this.strategyLines)
       clearSeries(this.strategyLines[lbl]);
     this.strategyLines = {};
@@ -1248,9 +1186,6 @@ class ChartWindow {
     for (const rec of (msg.errors || [])) appendLog(rec, true);
     this.updateHeader();
     this.reflow();
-    this.renderLevelLabels();
-    const self = this;
-    setTimeout(() => self.renderLevelLabels(), 500);
     // initial zoom based ONLY on candles (never on indicators/levels)
     if (!this._initialLoadDone) {
       this._initialLoadDone = true;
