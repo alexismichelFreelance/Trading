@@ -218,13 +218,12 @@ class StatePublisher:
                "source": "live", "reduce_only": False}
         self.broadcast(self.store.apply_signal(rec))
 
-    async def _on_warmup_signal(self, ts: int, symbol: str, source: str, side: int,
-                                 qty: int, tag: str, price: float,
-                                 reduce_only: bool = False) -> None:
+    async def _on_warmup_signal(self, ts: int, side: int, qty: int, tag: str,
+                                 px: float, symbol: str = "") -> None:
         sym = symbol or (next(iter(self.lanes)) if self.lanes else "")
         rec = {"ts": int(ts), "symbol": sym, "side": int(side),
-               "qty": int(qty), "tag": str(tag), "px": float(price) if price else None,
-               "source": str(source), "reduce_only": bool(reduce_only)}
+               "qty": int(qty), "tag": str(tag), "px": float(px) if px else None,
+               "source": "warmup", "reduce_only": False}
         self.broadcast(self.store.apply_signal(rec))
 
     async def _on_session(self, day: str) -> None:

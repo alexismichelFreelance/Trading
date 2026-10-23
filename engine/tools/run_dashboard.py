@@ -726,8 +726,8 @@ class Dashboard:
             if not _re.fullmatch(r'[A-Z]{1,6}(\.[A-Z]{1,3})?', symbol):
                 raise ValueError("Invalid symbol")
             limit = min(limit, 5000)
-            # DB ts is epoch nanoseconds; start/end arrive as epoch seconds.
-            NS = 1_000_000_000
+            # DB ts is epoch MICROSECONDS; start/end arrive as epoch seconds.
+            NS = 1_000_000
             _reverse = True
             if start is not None and end is not None:
                 sql = (f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
@@ -741,6 +741,7 @@ class Dashboard:
                        f"ORDER BY ts DESC LIMIT {limit}")
             else:
                 sql = f"SELECT ts, o, h, l, c, vol FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {limit}"
+            import sys; print('DEBUG END:', end, 'SQL:', sql, flush=True); sys.stdout.flush()
             df = qdb.df(sql)
             if df.empty:
                 return web.json_response({"bars": {tf: []}, "indicators": [], "zones": [], "positions": []})
