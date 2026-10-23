@@ -482,10 +482,12 @@ class Dashboard:
 
     def _add_routes(self):
         self.app.router.add_get("/", self._index)
+        self.app.router.add_get("/performance", self._performance_page)
         self.app.router.add_get("/ws", self._ws)
         self.app.router.add_get("/history", self._history)
+        self.app.router.add_get("/api/performance", self._performance)
         # serve the vendored lib + app + styles verbatim
-        for name in ("app.js", "style.css",
+        for name in ("app.js", "performance.js", "style.css",
                      "vendor/lightweight-charts.standalone.production.js"):
             self.app.router.add_get(f"/{name}", self._static_file(name))
         self.app.router.add_get("/vendor/{f}", self._vendor)
@@ -504,6 +506,10 @@ class Dashboard:
 
     async def _index(self, request):
         html = (self.static / "index.html").read_text(encoding="utf-8")
+        return web.Response(text=html, content_type="text/html")
+
+    async def _performance_page(self, request):
+        html = (self.static / "performance.html").read_text(encoding="utf-8")
         return web.Response(text=html, content_type="text/html")
 
     @staticmethod
@@ -813,6 +819,150 @@ class Dashboard:
         except Exception as e:
             log.exception("History endpoint error")
             return web.json_response({"error": "internal server error"}, status=500)
+
+    async def _performance(self, request):
+        """Compute strategy performance from claude_paper_fills.
+
+        Query params: symbol (optional, default 'ES'), from (YYYY-MM-DD, optional),
+        to (YYYY-MM-DD, optional). Returns per-sleeve metrics + equity curves +
+        aggregate."""
+        try:
+            params = request.rel_url.query
+            symbol = params.get("symbol", "ES")
+            from_str = params.get("from")
+            to_str = params.get("to")
+            # point_usd lookup
+            point_usd = {"ES": 50.0, "NQ": 20.0, "GC": 100.0}.get(symbol, 50.0)
+            import pandas as pd
+            qdb = QuestDB()
+            sql = f"SELECT ts, sleeve, side, qty, price, tag FROM claude_paper_fills WHERE symbol = '{symbol}' ORDER BY ts"
+            df = qdb.df(sql)
+            if df.empty:
+                return web.json_response({"symbol": symbol, "strategies": [],
+                                          "aggregate": {}})
+            df["ts"] = pd.to_datetime(df["ts"], utc=True)
+            if from_str:
+                df = df[df["ts"] >= pd.Timestamp(from_str, tz="UTC")]
+            if to_str:
+                df = df[df["ts"] <= pd.Timestamp(to_str, tz="UTC") + pd.Timedelta(days=1)]
+            # position tracking P&L per sleeve
+            strategies = []
+            for sleeve, g in df.groupby("sleeve"):
+                g = g.sort_values("ts").reset_index(drop=True)
+                pos = 0          # signed position
+                avg = 0.0        # avg entry price
+                trades = []      # list of completed trades
+                equity = []      # [{ts, pnl}]
+                cum_pnl = 0.0
+                cur_entry_ts = None
+                cur_entry_side = 0
+                for _, r in g.iterrows():
+                    side = int(r["side"])
+                    qty = int(r["qty"])
+                    price = float(r["price"])
+                    ts = r["ts"]
+                    if pos == 0:
+                        pos = side * qty
+                        avg = price
+                        cur_entry_ts = ts
+                        cur_entry_side = side
+                    elif (pos > 0 and side > 0) or (pos < 0 and side < 0):
+                        # adding to position
+                        new_pos = pos + side * qty
+                        avg = (avg * abs(pos) + price * qty) / abs(new_pos)
+                        pos = new_pos
+                    else:
+                        # closing (partially or fully)
+                        close_qty = min(qty, abs(pos))
+                        if pos > 0:
+                            pnl = (price - avg) * close_qty * point_usd
+                        else:
+                            pnl = (avg - price) * close_qty * point_usd
+                        cum_pnl += pnl
+                        trades.append({
+                            "entry_ts": str(cur_entry_ts),
+                            "exit_ts": str(ts),
+                            "side": "long" if cur_entry_side > 0 else "short",
+                            "qty": close_qty,
+                            "entry_px": round(avg, 4),
+                            "exit_px": round(price, 4),
+                            "pnl": round(pnl, 2),
+                            "tag": str(r["tag"]),
+                        })
+                        equity.append({"ts": str(ts), "pnl": round(cum_pnl, 2)})
+                        pos += side * qty
+                        if pos == 0:
+                            avg = 0.0
+                            cur_entry_ts = None
+                        elif abs(pos) < abs(pos - side * qty):
+                            # partial close, avg unchanged
+                            pass
+                        else:
+                            # flipped
+                            avg = price
+                            cur_entry_ts = ts
+                            cur_entry_side = side if pos > 0 else -1
+                    # if position flipped, handle remainder
+                # max drawdown
+                peak = 0.0
+                max_dd = 0.0
+                for e in equity:
+                    if e["pnl"] > peak:
+                        peak = e["pnl"]
+                    dd = peak - e["pnl"]
+                    if dd > max_dd:
+                        max_dd = dd
+                wins = [t for t in trades if t["pnl"] > 0]
+                losses = [t for t in trades if t["pnl"] <= 0]
+                total_pnl = round(cum_pnl, 2)
+                strategies.append({
+                    "sleeve": sleeve,
+                    "trades": len(trades),
+                    "wins": len(wins),
+                    "losses": len(losses),
+                    "win_rate": round(len(wins) / len(trades) * 100, 1) if trades else 0.0,
+                    "total_pnl": total_pnl,
+                    "avg_win": round(sum(t["pnl"] for t in wins) / len(wins), 2) if wins else 0.0,
+                    "avg_loss": round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0.0,
+                    "max_drawdown": round(max_dd, 2),
+                    "profit_factor": round(sum(t["pnl"] for t in wins) / abs(sum(t["pnl"] for t in losses)), 2) if losses and sum(t["pnl"] for t in losses) != 0 else 0.0,
+                    "equity": equity,
+                    "trade_log": trades[-50:],  # last 50 trades
+                })
+            # aggregate
+            all_trades = [t for s in strategies for t in s["trade_log"]]
+            agg_equity = []
+            # build aggregate equity by merging all sleeves' equity points
+            agg_pnl = {}
+            for s in strategies:
+                for e in s["equity"]:
+                    agg_pnl[e["ts"]] = agg_pnl.get(e["ts"], 0) + e["pnl"]
+            # cumulative
+            cum = 0.0
+            agg_points = []
+            for ts in sorted(agg_pnl.keys()):
+                cum += agg_pnl[ts]
+                agg_points.append({"ts": ts, "pnl": round(cum, 2)})
+            agg_peak = 0.0
+            agg_dd = 0.0
+            for e in agg_points:
+                if e["pnl"] > agg_peak:
+                    agg_peak = e["pnl"]
+                dd = agg_peak - e["pnl"]
+                if dd > agg_dd:
+                    agg_dd = dd
+            aggregate = {
+                "strategies": len(strategies),
+                "total_trades": sum(s["trades"] for s in strategies),
+                "total_pnl": round(sum(s["total_pnl"] for s in strategies), 2),
+                "max_drawdown": round(agg_dd, 2),
+                "equity": agg_points,
+            }
+            return web.json_response({"symbol": symbol, "strategies": strategies,
+                                      "aggregate": aggregate})
+        except Exception as e:
+            log.exception("performance endpoint error")
+            return web.json_response({"error": str(e)}, status=500)
 
     async def run(self):
         runner = web.AppRunner(self.app)
