@@ -236,7 +236,8 @@ function renderAllView(data) {
   // strategy table
   const strats = getFilteredStrategies();
   const stratCols = [
-    { key: "sleeve", render: r => `<input type="checkbox" class="stratCb" data-sleeve="${escapeHtml(r.sleeve)}" ${selectedStrats.has(r.sleeve) ? 'checked' : ''}> ${escapeHtml(r.sleeve)}` },
+    { key: "sleeve", render: r => `<input type="checkbox" class="stratCb" data-sleeve="${escapeHtml(r.sleeve)}" ${selectedStrats.has(r.sleeve) ? 'checked' : ''}>` },
+    { key: "sleeve", render: r => escapeHtml(r.sleeve) },
     { key: "mode", render: r => `<span class="modeTag ${r.mode === 'live' ? 'live' : 'paper'}">${r.mode === 'live' ? 'LIVE' : 'PAPER'}</span>` },
     { key: "trades" },
     { key: "wins" },
