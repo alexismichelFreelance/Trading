@@ -879,6 +879,15 @@ class Dashboard:
             if to_str:
                 df = df[df["ts"] <= pd.Timestamp(to_str, tz="UTC") + pd.Timedelta(days=1)]
             # position tracking P&L per sleeve
+            # mode lookup from engine roster
+            mode_map = {}
+            try:
+                for sym, src in getattr(self.pub, "lanes", {}).items():
+                    for s in getattr(src, "strategies", []) or []:
+                        lbl = getattr(s, "label", "") or type(s).__name__
+                        mode_map[lbl] = getattr(s, "mode", "paper")
+            except Exception:
+                pass
             strategies = []
             for sleeve, g in df.groupby("sleeve"):
                 g = g.sort_values("ts").reset_index(drop=True)
@@ -950,6 +959,7 @@ class Dashboard:
                 total_pnl = round(cum_pnl, 2)
                 strategies.append({
                     "sleeve": sleeve,
+                    "mode": mode_map.get(sleeve, "paper"),
                     "trades": len(trades),
                     "wins": len(wins),
                     "losses": len(losses),
@@ -964,18 +974,24 @@ class Dashboard:
                 })
             # aggregate
             all_trades = [t for s in strategies for t in s["trade_log"]]
-            agg_equity = []
-            # build aggregate equity by merging all sleeves' equity points
-            agg_pnl = {}
+            # Build aggregate equity: at each timestamp, sum each strategy's
+            # latest cumulative PnL (forward-filled). NOT a cumulative sum.
+            strat_eq = {}
             for s in strategies:
+                d = {}
                 for e in s["equity"]:
-                    agg_pnl[e["ts"]] = agg_pnl.get(e["ts"], 0) + e["pnl"]
-            # cumulative
-            cum = 0.0
+                    d[e["ts"]] = e["pnl"]
+                strat_eq[s["sleeve"]] = d
+            all_ts = sorted(set(
+                ts for d in strat_eq.values() for ts in d.keys()))
+            latest = {s: 0.0 for s in strat_eq}
             agg_points = []
-            for ts in sorted(agg_pnl.keys()):
-                cum += agg_pnl[ts]
-                agg_points.append({"ts": ts, "pnl": round(cum, 2)})
+            for ts in all_ts:
+                for sleeve, d in strat_eq.items():
+                    if ts in d:
+                        latest[sleeve] = d[ts]
+                total = sum(latest.values())
+                agg_points.append({"ts": ts, "pnl": round(total, 2)})
             agg_peak = 0.0
             agg_dd = 0.0
             for e in agg_points:

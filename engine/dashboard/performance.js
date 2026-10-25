@@ -7,7 +7,7 @@ let chartBar = null;
 let perfData = null;
 let currentPeriod = "day";
 let barPeriod = "day";
-let selectedStrats = new Set(); // empty = all
+let selectedStrats = new Set();
 
 // ---------- helpers ----------
 function fmtPnl(v) { return (v >= 0 ? "+" : "") + Number(v).toFixed(2); }
@@ -61,6 +61,15 @@ function renderSortedTable(tableId, tbodyId, data, columns) {
     tr._rowData = row;
     tbody.appendChild(tr);
   }
+  // wire up checkboxes after render
+  tbody.querySelectorAll(".stratCb").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const sleeve = cb.dataset.sleeve;
+      if (cb.checked) selectedStrats.add(sleeve);
+      else selectedStrats.delete(sleeve);
+      renderBarChart();
+    });
+  });
 }
 
 function updateSortArrows(tableId) {
@@ -102,7 +111,6 @@ function aggregateByPeriod(trades, period) {
 }
 
 function periodToTs(period, periodType) {
-  // convert period string to unix timestamp (seconds)
   if (periodType === "day" || periodType === "week") {
     return Math.floor(new Date(period + "T00:00:00Z").getTime() / 1000);
   } else if (periodType === "month") {
@@ -128,8 +136,9 @@ async function loadPerformance() {
     const data = await resp.json();
     if (data.error) { $("loading").textContent = "Error: " + data.error; return; }
     perfData = data;
+    // select all strategies by default
+    selectedStrats = new Set((data.strategies || []).map(s => s.sleeve));
     populateStratSelector(data);
-    populateStratFilter(data);
     renderAllView(data);
     renderBarChart();
     $("loading").style.display = "none";
@@ -149,48 +158,21 @@ function populateStratSelector(data) {
   }
 }
 
-function populateStratFilter(data) {
-  const host = $("stratFilter");
-  host.innerHTML = "";
-  // "All" checkbox
-  const allLbl = document.createElement("label");
-  allLbl.innerHTML = `<input type="checkbox" value="__ALL__" checked> All strategies`;
-  host.appendChild(allLbl);
-  for (const s of (data.strategies || [])) {
-    const lbl = document.createElement("label");
-    lbl.innerHTML = `<input type="checkbox" value="${escapeHtml(s.sleeve)}" checked> ${escapeHtml(s.sleeve)}`;
-    host.appendChild(lbl);
-  }
-  host.querySelectorAll("input").forEach(cb => {
-    cb.addEventListener("change", () => {
-      if (cb.value === "__ALL__") {
-        const checked = cb.checked;
-        host.querySelectorAll("input").forEach(c => c.checked = checked);
-      }
-      updateSelectedStrats();
-      renderBarChart();
-    });
-  });
-  updateSelectedStrats();
-}
-
-function updateSelectedStrats() {
-  const host = $("stratFilter");
-  const allCb = host.querySelector('input[value="__ALL__"]');
-  const cbs = [...host.querySelectorAll('input')].filter(c => c.value !== "__ALL__");
-  if (allCb && allCb.checked) {
-    selectedStrats = new Set(cbs.map(c => c.value));
-  } else {
-    selectedStrats = new Set(cbs.filter(c => c.checked).map(c => c.value));
-  }
-}
-
 function updateViewVisibility() {
   const view = $("viewSel").value;
   $("stratLabel").style.display = view === "single" ? "" : "none";
   $("allView").style.display = view === "all" ? "block" : "none";
   $("singleView").style.display = view === "single" ? "block" : "none";
   if (view === "single") renderSingleView();
+}
+
+function getFilteredStrategies() {
+  if (!perfData) return [];
+  const modeFilter = $("modeFilterSel") ? $("modeFilterSel").value : "all";
+  let strats = perfData.strategies || [];
+  if (modeFilter === "live") strats = strats.filter(s => s.mode === "live");
+  if (modeFilter === "paper") strats = strats.filter(s => s.mode === "paper");
+  return strats;
 }
 
 // ---------- all view ----------
@@ -208,10 +190,17 @@ function renderAllView(data) {
     autoSize: true,
   });
   const series = chartAgg.addLineSeries({ color: "#4f9cf9", lineWidth: 2, priceLineVisible: false, lastValueVisible: true });
+  // dedup timestamps
+  const seen = new Set();
   const pts = (agg.equity || []).map(e => {
     const d = parseTs(e.ts);
-    return d ? { time: Math.floor(d.getTime() / 1000), value: e.pnl } : null;
-  }).filter(Boolean);
+    if (!d) return null;
+    const t = Math.floor(d.getTime() / 1000);
+    if (seen.has(t)) return null;
+    seen.add(t);
+    return { time: t, value: e.pnl };
+  }).filter(Boolean).sort((a, b) => a.time - b.time);
+  // equity curve rendered
   if (pts.length) series.setData(pts);
 
   // agg metrics
@@ -230,9 +219,25 @@ function renderAllView(data) {
     host.appendChild(box);
   }
 
+  // select all checkbox
+  const selectAll = $("selectAllStrats");
+  if (selectAll) {
+    selectAll.checked = true;
+    selectAll.addEventListener("change", () => {
+      document.querySelectorAll(".stratCb").forEach(cb => cb.checked = selectAll.checked);
+      selectedStrats = new Set();
+      if (selectAll.checked) {
+        getFilteredStrategies().forEach(s => selectedStrats.add(s.sleeve));
+      }
+      renderBarChart();
+    });
+  }
+
   // strategy table
+  const strats = getFilteredStrategies();
   const stratCols = [
-    { key: "sleeve", render: r => escapeHtml(r.sleeve) },
+    { key: "sleeve", render: r => `<input type="checkbox" class="stratCb" data-sleeve="${escapeHtml(r.sleeve)}" ${selectedStrats.has(r.sleeve) ? 'checked' : ''}> ${escapeHtml(r.sleeve)}` },
+    { key: "mode", render: r => `<span class="modeTag ${r.mode === 'live' ? 'live' : 'paper'}">${r.mode === 'live' ? 'LIVE' : 'PAPER'}</span>` },
     { key: "trades" },
     { key: "wins" },
     { key: "win_rate", render: r => (r.win_rate || 0).toFixed(1) + "%" },
@@ -242,17 +247,29 @@ function renderAllView(data) {
     { key: "max_drawdown", render: r => "-" + (r.max_drawdown || 0).toFixed(2) },
     { key: "profit_factor", render: r => (r.profit_factor || 0).toFixed(2) },
   ];
-  makeSortable("stratTable", "stratBody", data.strategies || [], stratCols);
+  makeSortable("stratTable", "stratBody", strats, stratCols);
 
+  // click row to drill down (on sleeve name, not checkbox)
   const tbody = $("stratBody");
   tbody.querySelectorAll("tr").forEach(tr => {
     tr.style.cursor = "pointer";
-    tr.addEventListener("click", () => {
+    tr.addEventListener("click", (e) => {
+      if (e.target.classList.contains("stratCb")) return;
+      const sleeve = tr._rowData.sleeve;
       $("viewSel").value = "single";
-      $("stratSel").value = tr._rowData.sleeve;
+      $("stratSel").value = sleeve;
       updateViewVisibility();
     });
   });
+
+  // mode filter
+  const modeSel = $("modeFilterSel");
+  if (modeSel) {
+    modeSel.addEventListener("change", () => {
+      renderAllView(data);
+      renderBarChart();
+    });
+  }
 
   // trade log
   const allTrades = [];
@@ -289,7 +306,6 @@ function renderBarChart() {
   });
   const series = chartBar.addHistogramSeries({ priceFormat: { type: "price", precision: 2 }, base: 0 });
 
-  // collect trades from selected strategies
   let trades = [];
   if (perfData) {
     for (const s of (perfData.strategies || [])) {
@@ -329,6 +345,7 @@ function renderSingleView() {
     ["Avg Loss", (strat.avg_loss || 0).toFixed(2), "neg"],
     ["Max DD", "-" + (strat.max_drawdown || 0).toFixed(2), "neg"],
     ["Profit Factor", (strat.profit_factor || 0).toFixed(2)],
+    ["Mode", strat.mode === "live" ? "LIVE" : "PAPER"],
   ];
   for (const m of metrics) {
     const box = document.createElement("div");
@@ -348,10 +365,16 @@ function renderSingleView() {
     autoSize: true,
   });
   const series = chartDrill.addLineSeries({ color: "#4f9cf9", lineWidth: 2, priceLineVisible: false, lastValueVisible: true });
+  const seen = new Set();
   const pts = (strat.equity || []).map(e => {
     const d = parseTs(e.ts);
-    return d ? { time: Math.floor(d.getTime() / 1000), value: e.pnl } : null;
-  }).filter(Boolean);
+    if (!d) return null;
+    const t = Math.floor(d.getTime() / 1000);
+    if (seen.has(t)) return null;
+    seen.add(t);
+    return { time: t, value: e.pnl };
+  }).filter(Boolean).sort((a, b) => a.time - b.time);
+  // equity curve rendered
   if (pts.length) series.setData(pts);
 
   renderPeriodTable(strat.trade_log || []);
@@ -407,10 +430,23 @@ async function init() {
     });
   });
 
-  $("barPeriodSel").addEventListener("change", (e) => {
-    barPeriod = e.target.value;
-    renderBarChart();
-  });
+  const barPeriodSel = $("barPeriodSel");
+  if (barPeriodSel) {
+    barPeriodSel.addEventListener("change", (e) => {
+      barPeriod = e.target.value;
+      renderBarChart();
+    });
+  }
+
+  const modeFilterSel = $("modeFilterSel");
+  if (modeFilterSel) {
+    modeFilterSel.addEventListener("change", () => {
+      if (perfData) {
+        renderAllView(perfData);
+        renderBarChart();
+      }
+    });
+  }
 
   await loadPerformance();
 }

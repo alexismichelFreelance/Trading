@@ -40,6 +40,9 @@
   .metricBox .val.pos { color: var(--green); }
   .metricBox .val.neg { color: var(--red); }
   .stratFilter { max-height: 120px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; background: var(--panel2); font-size: 11.5px; }
+  .modeTag { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+  .modeTag.live { background: #1a3a2a; color: #26a69a; }
+  .modeTag.paper { background: #2a2a1a; color: #e2a03f; }
   .stratFilter label { display: block; cursor: pointer; padding: 2px 0; }
   .stratFilter input { margin-right: 6px; }
 </style>
@@ -79,9 +82,15 @@
             <option value="year">Year</option>
           </select>
         </label>
-        <label>strategy filter</label>
-        <div class="stratFilter" id="stratFilter" style="min-width:200px;max-width:300px;"></div>
+        <label>mode filter
+          <select id="modeFilterSel">
+            <option value="all">All</option>
+            <option value="live">Live only</option>
+            <option value="paper">Paper only</option>
+          </select>
+        </label>
       </div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px;">Bar chart shows P&L for strategies checked in the table below. Check/uncheck rows to filter.</div>
       <div id="barChart" class="chartBox"></div>
     </div>
     <!-- All strategies view -->
@@ -99,7 +108,9 @@
         <div class="tableWrap">
           <table class="dataTable" id="stratTable">
             <thead><tr>
+              <th><input type="checkbox" id="selectAllStrats" checked></th>
               <th data-sort="sleeve">Strategy <span class="sortArrow"></span></th>
+              <th data-sort="mode">Mode <span class="sortArrow"></span></th>
               <th data-sort="trades">Trades <span class="sortArrow"></span></th>
               <th data-sort="wins">Wins <span class="sortArrow"></span></th>
               <th data-sort="win_rate">Win Rate <span class="sortArrow"></span></th>
@@ -186,6 +197,6 @@
   </div>
 </main>
 <script src="/vendor/lightweight-charts.standalone.production.js"></script>
-<script src="/performance.js?v=3"></script>
+<script src="/performance.js?v=9"></script>
 </body>
 </html>
