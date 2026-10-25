@@ -1374,11 +1374,11 @@ class ChartWindow {
     const p = msg.payload || {};
     this.resetForSnapshot();
     this.setCandles(p.bars || []);
-    for (const ind of p.indicators || []) this.upsertIndicatorSnapshot(ind);
-    this.renderGamma(p.gamma);
-    this.setRoster(p.strategies_roster || []);
-    this.setZones(p.zones || []);
-    this.setPositions(p.positions || []);
+    for (const ind of p.indicators || []) { try { this.upsertIndicatorSnapshot(ind); } catch (e) { console.error("upsertIndicator failed", ind.id, e); } }
+    try { this.renderGamma(p.gamma); } catch (e) { console.error("renderGamma failed", e); }
+    try { this.setRoster(p.strategies_roster || []); } catch (e) { console.error("setRoster failed", e); }
+    try { this.setZones(p.zones || []); } catch (e) { console.error("setZones failed", e); }
+    try { this.setPositions(p.positions || []); } catch (e) { console.error("setPositions failed", e); }
     this.drawSessionShading();
     this.renderLevelLabels();
     const self = this;
