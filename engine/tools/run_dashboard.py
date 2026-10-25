@@ -927,7 +927,7 @@ class Dashboard:
                     "max_drawdown": round(max_dd, 2),
                     "profit_factor": round(sum(t["pnl"] for t in wins) / abs(sum(t["pnl"] for t in losses)), 2) if losses and sum(t["pnl"] for t in losses) != 0 else 0.0,
                     "equity": equity,
-                    "trade_log": trades[-50:],  # last 50 trades
+                    "trade_log": trades,  # all completed trades
                 })
             # aggregate
             all_trades = [t for s in strategies for t in s["trade_log"]]

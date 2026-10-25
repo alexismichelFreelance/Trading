@@ -12,26 +12,33 @@
   .perfControls select, .perfControls input { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
   .perfControls button { background: var(--panel2); color: var(--accent); border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
   .perfControls button:hover { border-color: var(--accent); }
-  .metricsGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-bottom: 14px; }
-  .metricCard { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
-  .metricCard h4 { margin: 0 0 6px; font-size: 12px; color: var(--accent); }
-  .metricRow { display: flex; justify-content: space-between; font-size: 11.5px; padding: 2px 0; }
-  .metricRow .lbl { color: var(--muted); }
-  .metricRow .val { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
-  .metricRow .val.pos { color: var(--green); }
-  .metricRow .val.neg { color: var(--red); }
   .chartBox { height: 300px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
-  .tradeTable { width: 100%; border-collapse: collapse; font-size: 11.5px; }
-  .tradeTable th { text-align: left; color: var(--muted); padding: 4px 8px; border-bottom: 1px solid var(--border); font-weight: 600; }
-  .tradeTable td { padding: 3px 8px; border-bottom: 1px solid var(--panel2); color: var(--text); font-variant-numeric: tabular-nums; }
-  .tradeTable tr:hover { background: var(--panel2); }
-  .tradeTable .pos { color: var(--green); }
-  .tradeTable .neg { color: var(--red); }
+  .tableWrap { max-height: 420px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
+  .dataTable { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .dataTable th { text-align: left; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border); font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel); }
+  .dataTable th:hover { color: var(--accent); }
+  .dataTable th .sortArrow { font-size: 9px; margin-left: 4px; }
+  .dataTable td { padding: 4px 8px; border-bottom: 1px solid var(--panel2); color: var(--text); font-variant-numeric: tabular-nums; }
+  .dataTable tr:hover { background: var(--panel2); }
+  .dataTable tr.selected { background: #1a2535; }
+  .dataTable .pos { color: var(--green); }
+  .dataTable .neg { color: var(--red); }
   .section { margin-bottom: 20px; }
   .section h3 { font-size: 13px; color: var(--text); margin: 0 0 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
   .backLink { color: var(--accent); text-decoration: none; font-size: 12px; }
   .backLink:hover { text-decoration: underline; }
   .loading { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
+  .drillPanel { display: none; }
+  .drillPanel.active { display: block; }
+  .periodTabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .periodTabs button { background: var(--panel2); color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 3px 10px; cursor: pointer; font-size: 11px; }
+  .periodTabs button.active { color: var(--accent); border-color: var(--accent); }
+  .metricsRow { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+  .metricBox { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 11.5px; }
+  .metricBox .lbl { color: var(--muted); }
+  .metricBox .val { color: var(--text); font-weight: 600; margin-left: 6px; }
+  .metricBox .val.pos { color: var(--green); }
+  .metricBox .val.neg { color: var(--red); }
 </style>
 </head>
 <body>
@@ -51,34 +58,113 @@
     <label>symbol <select id="symSel"></select></label>
     <label>from <input type="date" id="fromDate"></label>
     <label>to <input type="date" id="toDate"></label>
+    <label>view <select id="viewSel"><option value="all">All Strategies</option><option value="single">Single Strategy</option></select></label>
+    <label id="stratLabel" style="display:none;">strategy <select id="stratSel"></select></label>
     <button id="loadBtn">load</button>
   </div>
   <div id="loading" class="loading">Loading performance data...</div>
   <div id="content" style="display:none;">
-    <div class="section">
-      <h3>equity curve (aggregate)</h3>
-      <div id="aggChart" class="chartBox"></div>
+    <!-- Aggregate / All strategies view -->
+    <div id="allView">
+      <div class="section">
+        <h3>equity curve (aggregate)</h3>
+        <div id="aggChart" class="chartBox"></div>
+      </div>
+      <div class="section">
+        <h3>aggregate metrics</h3>
+        <div class="metricsRow" id="aggMetrics"></div>
+      </div>
+      <div class="section">
+        <h3>strategy list (click row to drill down)</h3>
+        <div class="tableWrap">
+          <table class="dataTable" id="stratTable">
+            <thead><tr>
+              <th data-sort="sleeve">Strategy <span class="sortArrow"></span></th>
+              <th data-sort="trades">Trades <span class="sortArrow"></span></th>
+              <th data-sort="wins">Wins <span class="sortArrow"></span></th>
+              <th data-sort="win_rate">Win Rate <span class="sortArrow"></span></th>
+              <th data-sort="total_pnl">Total P&L <span class="sortArrow"></span></th>
+              <th data-sort="avg_win">Avg Win <span class="sortArrow"></span></th>
+              <th data-sort="avg_loss">Avg Loss <span class="sortArrow"></span></th>
+              <th data-sort="max_drawdown">Max DD <span class="sortArrow"></span></th>
+              <th data-sort="profit_factor">Profit Factor <span class="sortArrow"></span></th>
+            </tr></thead>
+            <tbody id="stratBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="section">
+        <h3>trade log (all)</h3>
+        <div class="tableWrap">
+          <table class="dataTable" id="tradeTable">
+            <thead><tr>
+              <th data-sort="sleeve">Strategy <span class="sortArrow"></span></th>
+              <th data-sort="side">Side <span class="sortArrow"></span></th>
+              <th data-sort="entry_ts">Entry <span class="sortArrow"></span></th>
+              <th data-sort="exit_ts">Exit <span class="sortArrow"></span></th>
+              <th data-sort="entry_px">Entry Px <span class="sortArrow"></span></th>
+              <th data-sort="exit_px">Exit Px <span class="sortArrow"></span></th>
+              <th data-sort="qty">Qty <span class="sortArrow"></span></th>
+              <th data-sort="pnl">P&L <span class="sortArrow"></span></th>
+              <th data-sort="tag">Tag <span class="sortArrow"></span></th>
+            </tr></thead>
+            <tbody id="tradeBody"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
-    <div class="section">
-      <h3>aggregate metrics</h3>
-      <div id="aggMetrics" class="metricsGrid"></div>
-    </div>
-    <div class="section">
-      <h3>per-strategy metrics</h3>
-      <div id="stratMetrics" class="metricsGrid"></div>
-    </div>
-    <div class="section">
-      <h3>trade log (last 50 per strategy)</h3>
-      <div style="max-height:400px;overflow-y:auto;">
-        <table class="tradeTable">
-          <thead><tr><th>strategy</th><th>side</th><th>entry ts</th><th>exit ts</th><th>entry</th><th>exit</th><th>qty</th><th>pnl</th><th>tag</th></tr></thead>
-          <tbody id="tradeBody"></tbody>
-        </table>
+    <!-- Single strategy drill-down -->
+    <div id="singleView" class="drillPanel">
+      <div class="section">
+        <h3 id="drillTitle">strategy detail</h3>
+        <div class="metricsRow" id="drillMetrics"></div>
+      </div>
+      <div class="section">
+        <h3>equity curve</h3>
+        <div id="drillChart" class="chartBox"></div>
+      </div>
+      <div class="section">
+        <h3>P&L by period</h3>
+        <div class="periodTabs">
+          <button data-period="day" class="active">Day</button>
+          <button data-period="week">Week</button>
+          <button data-period="month">Month</button>
+        </div>
+        <div class="tableWrap">
+          <table class="dataTable" id="periodTable">
+            <thead><tr>
+              <th data-sort="period">Period <span class="sortArrow"></span></th>
+              <th data-sort="trades">Trades <span class="sortArrow"></span></th>
+              <th data-sort="wins">Wins <span class="sortArrow"></span></th>
+              <th data-sort="pnl">P&L <span class="sortArrow"></span></th>
+              <th data-sort="cumulative">Cumulative <span class="sortArrow"></span></th>
+            </tr></thead>
+            <tbody id="periodBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="section">
+        <h3>trade log</h3>
+        <div class="tableWrap">
+          <table class="dataTable" id="drillTradeTable">
+            <thead><tr>
+              <th data-sort="side">Side <span class="sortArrow"></span></th>
+              <th data-sort="entry_ts">Entry <span class="sortArrow"></span></th>
+              <th data-sort="exit_ts">Exit <span class="sortArrow"></span></th>
+              <th data-sort="entry_px">Entry Px <span class="sortArrow"></span></th>
+              <th data-sort="exit_px">Exit Px <span class="sortArrow"></span></th>
+              <th data-sort="qty">Qty <span class="sortArrow"></span></th>
+              <th data-sort="pnl">P&L <span class="sortArrow"></span></th>
+              <th data-sort="tag">Tag <span class="sortArrow"></span></th>
+            </tr></thead>
+            <tbody id="drillTradeBody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
 </main>
 <script src="/vendor/lightweight-charts.standalone.production.js"></script>
-<script src="/performance.js?v=1"></script>
+<script src="/performance.js?v=2"></script>
 </body>
 </html>
