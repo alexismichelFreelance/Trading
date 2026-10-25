@@ -121,10 +121,6 @@ class ChartWindow {
     this.levelLabels = document.createElement("div");
     this.levelLabels.className = "levelLabels";
     this.chartBox.appendChild(this.levelLabels);
-    // floating right-side label panel (pinned labels, not overlaying price)
-    this.levelLabels = document.createElement("div");
-    this.levelLabels.className = "levelLabels";
-    this.chartBox.appendChild(this.levelLabels);
     this.winTitle = this.wrapper.querySelector(".winTitle");
     this.closeBtn = this.wrapper.querySelector(".closeBtn");
     this.popBtn = this.wrapper.querySelector(".popBtn");
@@ -604,6 +600,34 @@ class ChartWindow {
     }
   }
 
+  /* Render floating labels on the right side for all bounded levels (gamma,
+   * pivots). Labels are positioned by priceToCoordinate so they track the
+   * price axis without overlaying the candle series. */
+  renderLevelLabels() {
+    if (!this.levelLabels) return;
+    const ps = this.candleSeries;
+    if (!ps) return;
+    const labels = []
+      .concat(this.gammaLabels || [])
+      .concat(this.pivotLabelsMulti || [])
+      .concat(this.pivotLabelsDaily || [])
+      .concat(this.strategyLabels || [])
+      .concat(this.positionLabels || []);
+    // dedupe by text
+    const seen = new Set();
+    const uniq = [];
+    for (const l of labels) {
+      if (seen.has(l.text)) continue;
+      seen.add(l.text);
+      uniq.push(l);
+    }
+    this.levelLabels.innerHTML = uniq.map(l => {
+      const y = ps.priceToCoordinate(l.price);
+      if (y == null) return "";
+      return `<div class="levelLabel" style="position:absolute;right:2px;top:${Math.max(0, y - 8)}px;color:${l.color};font-size:10px;white-space:nowrap;">${escapeHtml(l.text)}</div>`;
+    }).join("");
+  }
+
   /* Labelled pivot price lines (D/W/M). Each distinct level gets a price line
    * on the axis so its name (D-PP, W-R1, ...) is visible. Re-rendered on
    * every pivot delta. */
@@ -784,9 +808,11 @@ class ChartWindow {
         try { this.chart.removeSeries(ser); } catch {}
       });
     this.strategyLines = {};
+    this.strategyLabels = [];
     for (const s of this.roster) {
       if (this.strategyOn[s.label] !== false) this.drawStrategy(s);
     }
+    this.renderLevelLabels();
   }
 
   /* Indicator show/hide. Client-side only: data is still stored, toggling
@@ -797,6 +823,8 @@ class ChartWindow {
     const ids = Object.keys(this.indicators).concat(
       this.gamma ? ["__gamma__"] : [],
       (this.zones && this.zones.length) ? ["__zones__"] : [],
+      (this.strategyLabels && this.strategyLabels.length) ? ["__strategies__"] : [],
+      (this.positionLabels && this.positionLabels.length) ? ["__positions__"] : [],
       ["__sessions__"]
     );
     host.innerHTML = ids.map(id => {
@@ -805,6 +833,8 @@ class ChartWindow {
       if (this.indicators[id]) lbl = this.indicators[id].label || id;
       else if (id === "__gamma__") lbl = "gamma walls";
       else if (id === "__zones__") lbl = "zones";
+      else if (id === "__strategies__") lbl = "strategy levels";
+      else if (id === "__positions__") lbl = "position levels";
       else if (id === "__sessions__") lbl = "session shading";
       return `<div class="rosterRow ${on ? "" : "off"}">
         <span class="sw ${on ? "on" : ""}" data-id="${escapeHtml(id)}"></span>
@@ -830,6 +860,28 @@ class ChartWindow {
           } else this.drawZones();
         } else if (id === "__sessions__") {
           this.drawSessionShading();
+        } else if (id === "__strategies__") {
+          if (this.indicatorOn[id] === false) {
+            for (const lbl of (this.strategyLabels || [])) {} // keep data
+            // remove strategy lines
+            for (const k in this.strategyLines) {
+              for (const ser of (this.strategyLines[k] || [])) try { this.chart.removeSeries(ser); } catch {}
+            }
+            this.strategyLines = {};
+            this.strategyLabels = [];
+            this.renderLevelLabels();
+          } else {
+            this.applyStrategyMarks();
+          }
+        } else if (id === "__positions__") {
+          if (this.indicatorOn[id] === false) {
+            for (const ser of (this.positionLines || [])) try { this.chart.removeSeries(ser); } catch {}
+            this.positionLines = [];
+            this.positionLabels = [];
+            this.renderLevelLabels();
+          } else {
+            this.drawPositions();
+          }
         } else {
           const ind = this.indicators[id];
           if (ind) this.upsertIndicator(ind, false);
@@ -840,6 +892,7 @@ class ChartWindow {
 
   drawStrategy(s) {
     const lines = [];
+    const labels = [];
     // engine timestamps are epoch-NANOSECONDS -> convert once, here
     const st = s.start_ts != null ? sec(s.start_ts) : null;
     const et = s.end_ts != null ? sec(s.end_ts) : null;
@@ -847,11 +900,13 @@ class ChartWindow {
       if (price == null) return;
       const ser = this.drawBoundedLevel(price, st, et, color, style, 1);
       if (ser) lines.push(ser);
+      labels.push({ price, color, text: label });
     };
     if (s.entry) add(s.entry, "#4f9cf9", 0, s.label + " entry");
     if (s.target) add(s.target, "#26a69a", 2, s.label + " target");
     if (s.stop) add(s.stop, "#ef5350", 2, s.label + " stop");
     this.strategyLines[s.label] = lines;
+    this.strategyLabels = (this.strategyLabels || []).concat(labels);
   }
 
   setZones(list) {
@@ -993,17 +1048,21 @@ class ChartWindow {
   drawPositions() {
     for (const ser of this.positionLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.positionLines = [];
+    this.positionLabels = [];
     for (const p of this.positions) {
       const st = p.start_ts != null ? sec(p.start_ts) : null;
       const et = p.end_ts != null ? sec(p.end_ts) : null;
-      for (const [pr, color, style] of [[p.entry, "#4f9cf9", 0],
-                                        [p.target, "#089981", 2],
-                                        [p.stop, "#f23645", 2]]) {
-        if (pr == null) continue;
+      const add = (pr, color, style, label) => {
+        if (pr == null) return;
         const ser = this.drawBoundedLevel(pr, st, et, color, style, 1);
         if (ser) this.positionLines.push(ser);
-      }
+        this.positionLabels.push({ price: pr, color, text: label });
+      };
+      if (p.entry != null) add(p.entry, "#4f9cf9", 0, (p.sleeve || "pos") + " entry");
+      if (p.target != null) add(p.target, "#089981", 2, (p.sleeve || "pos") + " target");
+      if (p.stop != null) add(p.stop, "#f23645", 2, (p.sleeve || "pos") + " stop");
     }
+    this.renderLevelLabels();
   }
 
   addFillMarker(f) {
@@ -1363,6 +1422,8 @@ class ChartWindow {
     for (const ser of (this.gammaLines || [])) try { this.chart.removeSeries(ser); } catch {}
     this.gammaLines = [];
     this.gammaLabels = [];
+    this.strategyLabels = [];
+    this.positionLabels = [];
     for (const ser of (this.pivotLinesMulti || [])) try { this.chart.removeSeries(ser); } catch {}
     for (const ser of (this.pivotLinesDaily || [])) try { this.chart.removeSeries(ser); } catch {}
     this.pivotLinesMulti = [];
