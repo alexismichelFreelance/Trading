@@ -12,7 +12,7 @@
   .perfControls select, .perfControls input { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
   .perfControls button { background: var(--panel2); color: var(--accent); border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
   .perfControls button:hover { border-color: var(--accent); }
-  .chartBox { height: 300px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
+  .chartBox { height: 320px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
   .tableWrap { max-height: 420px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
   .dataTable { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   .dataTable th { text-align: left; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border); font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel); }
@@ -39,6 +39,9 @@
   .metricBox .val { color: var(--text); font-weight: 600; margin-left: 6px; }
   .metricBox .val.pos { color: var(--green); }
   .metricBox .val.neg { color: var(--red); }
+  .stratFilter { max-height: 120px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; background: var(--panel2); font-size: 11.5px; }
+  .stratFilter label { display: block; cursor: pointer; padding: 2px 0; }
+  .stratFilter input { margin-right: 6px; }
 </style>
 </head>
 <body>
@@ -64,7 +67,24 @@
   </div>
   <div id="loading" class="loading">Loading performance data...</div>
   <div id="content" style="display:none;">
-    <!-- Aggregate / All strategies view -->
+    <!-- PnL bar chart section -->
+    <div class="section">
+      <h3>P&L by period (bar chart)</h3>
+      <div class="perfControls" style="margin-bottom:8px;">
+        <label>period
+          <select id="barPeriodSel">
+            <option value="day">Day</option>
+            <option value="week">Week</option>
+            <option value="month">Month</option>
+            <option value="year">Year</option>
+          </select>
+        </label>
+        <label>strategy filter</label>
+        <div class="stratFilter" id="stratFilter" style="min-width:200px;max-width:300px;"></div>
+      </div>
+      <div id="barChart" class="chartBox"></div>
+    </div>
+    <!-- All strategies view -->
     <div id="allView">
       <div class="section">
         <h3>equity curve (aggregate)</h3>
@@ -166,6 +186,6 @@
   </div>
 </main>
 <script src="/vendor/lightweight-charts.standalone.production.js"></script>
-<script src="/performance.js?v=2"></script>
+<script src="/performance.js?v=3"></script>
 </body>
 </html>

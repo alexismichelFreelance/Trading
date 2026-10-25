@@ -1016,6 +1016,29 @@ class ChartWindow {
       text: (side ? "B " : "S ") + (f.tag || "") });
     this.applyMarkers();
   }
+  async loadFills() {
+    try {
+      const resp = await fetch(`/api/fills?symbol=${encodeURIComponent(this.symbol)}`);
+      const data = await resp.json();
+      if (!data.fills) return;
+      // clear old fill markers
+      this.fillMarkers = [];
+      for (const f of data.fills) {
+        const side = f.side > 0;
+        this.fillMarkers.push({
+          time: Math.floor(f.ts / 1e9),
+          position: side ? "belowBar" : "aboveBar",
+          color: side ? "#26a69a" : "#ef5350",
+          shape: side ? "arrowUp" : "arrowDown",
+          text: (side ? "B " : "S ") + (f.tag || "").slice(0, 12),
+        });
+      }
+      this.applyMarkers();
+    } catch (e) {
+      console.error("loadFills failed", e);
+    }
+  }
+
   addSignalMarker(s) {
     if (!s) return;
     const side = (s.side || 0) > 0;
@@ -1379,11 +1402,12 @@ class ChartWindow {
     try { this.setRoster(p.strategies_roster || []); } catch (e) { console.error("setRoster failed", e); }
     try { this.setZones(p.zones || []); } catch (e) { console.error("setZones failed", e); }
     try { this.setPositions(p.positions || []); } catch (e) { console.error("setPositions failed", e); }
-    this.drawSessionShading();
-    this.renderLevelLabels();
     const self = this;
+    try { this.drawSessionShading(); } catch(e) { console.error("drawSessionShading failed", e); }
+    try { this.renderLevelLabels(); } catch(e) { console.error("renderLevelLabels failed", e); }
     setTimeout(() => self.renderLevelLabels(), 500);
-    for (const s of (p.signals || [])) this.addSignalMarker(s);
+    for (const s of (p.signals || [])) { try { this.addSignalMarker(s); } catch(e) {} }
+    this.loadFills();
     for (const rec of (msg.log || [])) appendLog(rec, false);
     for (const rec of (msg.errors || [])) appendLog(rec, true);
     this.updateHeader();

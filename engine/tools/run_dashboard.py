@@ -486,6 +486,7 @@ class Dashboard:
         self.app.router.add_get("/ws", self._ws)
         self.app.router.add_get("/history", self._history)
         self.app.router.add_get("/api/performance", self._performance)
+        self.app.router.add_get("/api/fills", self._fills)
         # serve the vendored lib + app + styles verbatim
         for name in ("app.js", "performance.js", "style.css",
                      "vendor/lightweight-charts.standalone.production.js"):
@@ -819,6 +820,38 @@ class Dashboard:
         except Exception as e:
             log.exception("History endpoint error")
             return web.json_response({"error": "internal server error"}, status=500)
+
+    async def _fills(self, request):
+        try:
+            params = request.rel_url.query
+            symbol = params.get("symbol", "ES")
+            from_str = params.get("from")
+            to_str = params.get("to")
+            import pandas as pd
+            qdb = QuestDB()
+            sql = "SELECT ts, sleeve, side, qty, price, tag FROM claude_paper_fills WHERE symbol = '%s' ORDER BY ts" % symbol
+            df = qdb.df(sql)
+            if df.empty:
+                return web.json_response({"fills": []})
+            df["ts"] = pd.to_datetime(df["ts"], utc=True)
+            if from_str:
+                df = df[df["ts"] >= pd.Timestamp(from_str, tz="UTC")]
+            if to_str:
+                df = df[df["ts"] <= pd.Timestamp(to_str, tz="UTC") + pd.Timedelta(days=1)]
+            fills = []
+            for _, r in df.iterrows():
+                fills.append({
+                    "ts": int(pd.Timestamp(r["ts"]).timestamp() * 1e9),
+                    "sleeve": str(r["sleeve"]),
+                    "side": int(r["side"]),
+                    "qty": int(r["qty"]),
+                    "price": float(r["price"]),
+                    "tag": str(r["tag"]),
+                })
+            return web.json_response({"fills": fills})
+        except Exception as e:
+            log.exception("fills endpoint error")
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _performance(self, request):
         """Compute strategy performance from claude_paper_fills.
