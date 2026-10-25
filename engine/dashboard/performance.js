@@ -87,6 +87,8 @@ function aggregateByPeriod(trades, period) {
       key = fmtDate(monday);
     } else if (period === "month") {
       key = d.toISOString().slice(0, 7);
+    } else if (period === "year") {
+      key = d.toISOString().slice(0, 4);
     }
     if (!buckets[key]) buckets[key] = { period: key, trades: 0, wins: 0, pnl: 0 };
     buckets[key].trades++;
