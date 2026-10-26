@@ -262,6 +262,7 @@ class ChartWindow {
     const mapped = ok.map(p => ({ time: sec(p.ts), value: p.v }));
     for (const a of this.bandAreas) {
       if (a.src !== id) continue;
+      a.ser.applyOptions({ visible: true });
       if (append) for (const p of mapped) a.ser.update(p);
       else a.ser.setData(mapped);
     }
@@ -416,8 +417,8 @@ class ChartWindow {
       // remove the rendered output for this indicator (data stays stored)
       if (cur.id === "vwap" || this.bandSeries[cur.id]) {
         const ser = cur.id === "vwap" ? this.vwapSeries : this.bandSeries[cur.id];
-        if (ser) try { ser.setData([]); } catch {}
-        if (cur.id === "vwap") for (const a of this.bandAreas) try { a.ser.setData([]); } catch {}
+        if (ser) try { ser.applyOptions({ visible: false }); } catch {}
+        if (cur.id === "vwap") for (const a of this.bandAreas) try { a.ser.applyOptions({ visible: false }); } catch {}
       } else if ((cur.producer || "").includes("pivot")) {
         const isMulti = (cur.id || "").includes("mpivots");
         const arr = isMulti ? this.pivotLinesMulti : this.pivotLinesDaily;
@@ -442,6 +443,7 @@ class ChartWindow {
           ser.update({ time: sec(p.ts), value: p.v });
       } else {
         const pts = cur.points.filter(validPt);
+        ser.applyOptions({ visible: true });
         ser.setData(pts.map(p => ({ time: sec(p.ts), value: p.v })));
       }
       // band areas are native series now — no canvas overlay to repaint
