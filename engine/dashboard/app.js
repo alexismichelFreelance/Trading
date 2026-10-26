@@ -1483,6 +1483,7 @@ class ChartWindow {
     try { this.renderLevelLabels(); } catch(e) { console.error("renderLevelLabels failed", e); }
     setTimeout(() => self.renderLevelLabels(), 500);
     for (const s of (p.signals || [])) { try { this.addSignalMarker(s); } catch(e) {} }
+    this.renderIndicatorsList();
     this.loadFills();
     for (const rec of (msg.log || [])) appendLog(rec, false);
     for (const rec of (msg.errors || [])) appendLog(rec, true);
