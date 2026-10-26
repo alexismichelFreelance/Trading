@@ -149,6 +149,14 @@ class ChartWindow {
     });
     const lwcContainer = this.chartBox.querySelector("div");
     if (lwcContainer) lwcContainer.style.cssText += ";position:relative;z-index:1;";
+    // re-render floating labels on zoom/scroll/resize
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      this.renderLevelLabels();
+    });
+    this.chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+      this.renderLevelLabels();
+    });
+
   }
 
   buildSeries() {
@@ -519,7 +527,7 @@ class ChartWindow {
     if (!c.length) return tSec;
     const g0 = sec(c[0].ts), g1 = sec(c[c.length - 1].ts);
     if (tSec <= g0) return g0;
-    if (tSec >= g1) return g1;
+    if (tSec >= g1) return tSec;   // allow extending beyond last bar (right edge)
     let lo = 0, hi = c.length - 1;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
@@ -674,7 +682,14 @@ class ChartWindow {
     const c = this.candles;
     if (!c.length) return null;
     const step = this.gridStep();
-    return sec(c[c.length - 1].ts) + Math.round(step * 3);
+    // extend well beyond the last bar so lines reach the right edge of the chart
+    const ts = this.chart.timeScale();
+    let vr = null;
+    try { vr = ts.getVisibleRange(); } catch {}
+    if (vr && vr.to) {
+      return Math.round(vr.to + step * 5);
+    }
+    return sec(c[c.length - 1].ts) + Math.round(step * 20);
   }
 
   /* ── dealer-gamma: multi-wall price lines + regime in header ───────── */
