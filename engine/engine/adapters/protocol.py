@@ -77,6 +77,17 @@ def decode_broker(m: dict) -> BrokerEvent | None:
         return PositionUpdate(ts, m["symbol"], int(m["qty"]), float(m["avg_px"]))
     if t == "account":
         return AccountUpdate(ts, float(m["equity"]), float(m["realized"]), float(m["unrealized"]))
+    if t == "order_status":
+        # NT8 relay reports order rejection (e.g. no risk profile for instrument).
+        # Logged but not a standard BrokerEvent; return None to avoid breaking the
+        # event pump. The relay also writes the same info to engine_relay.log.
+        import logging
+        logging.getLogger("engine.nt8_relay").error(
+            "NT8 order %s on %s: %s %s",
+            m.get("order_id"), m.get("instrument"), m.get("state"),
+            m.get("error", ""),
+        )
+        return None
     return None
 
 

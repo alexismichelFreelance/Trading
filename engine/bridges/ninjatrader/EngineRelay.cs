@@ -118,6 +118,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // submitted via Account.Submit, so subscribe to the account itself.
                 Account.ExecutionUpdate += OnAccountExecution;
                 Account.PositionUpdate += OnAccountPosition;
+                Account.OrderUpdate += OnAccountOrder;   // captures NT8 rejection errors (risk profile, etc.)
                 StartServer(ref marketListener, MarketPort, marketCh, false);
                 StartServer(ref brokerListener, BrokerPort, brokerCh, true);
                 Print("EngineRelay: market:" + MarketPort + " broker:" + BrokerPort);
@@ -132,6 +133,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         Account.ExecutionUpdate -= OnAccountExecution;
                         Account.PositionUpdate -= OnAccountPosition;
+                        Account.OrderUpdate -= OnAccountOrder;
                     }
                     if (marketListener != null) marketListener.Stop();
                     if (brokerListener != null) brokerListener.Stop();
@@ -286,11 +288,56 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ",\"avg_px\":" + J(e.Position.AveragePrice) + "}");
         }
 
+        // ── ACCOUNT order updates → log rejections (risk profile, etc.) ──
+        // NT8 pops a dialog for these ("order could not be submitted because
+        // there is no risk profile for the instrument"), but the engine never
+        // sees it unless we surface it here. Log the exact instrument so the
+        // user can add the right profile.
+        private void OnAccountOrder(object sender, OrderEventArgs e)
+        {
+            if (e == null || e.Order == null || e.Order.Instrument == null
+                || e.Order.Instrument.MasterInstrument.Name != Instrument.MasterInstrument.Name)
+                return;
+            OrderState st = e.Order.OrderState;
+            if (st == OrderState.Rejected || st == OrderState.Cancelled)
+            {
+                RLog("ORDER " + st + ": " + e.Order.Name + " on " + e.Order.Instrument.FullName
+                     + " (master " + e.Order.Instrument.MasterInstrument.Name + ")"
+                     + " qty=" + e.Order.Quantity + " type=" + e.Order.OrderType
+                     + (e.Order.Comment != null && e.Order.Comment.Length > 0 ? " comment=" + e.Order.Comment : ""));
+                // Also publish back to the engine so it knows the order died.
+                try
+                {
+                    brokerCh.Publish(
+                        "{\"t\":\"order_status\",\"ts\":" + ToNs(DateTime.UtcNow) +
+                        ",\"order_id\":\"" + e.Order.Name +
+                        "\",\"state\":\"" + st + "\",\"instrument\":\"" + e.Order.Instrument.FullName + "\"}");
+                }
+                catch { }
+            }
+        }
+
         // ── broker socket: parse order JSON, submit to the account ────────
         private void HandleOrderLine(string line)
         {
             var m = MiniJson.Parse(line);
             string t = m.Get("t");
+            if (t == "sub")
+            {
+                string subSym = m.Get("symbol");
+                RLog("sub received from engine: symbol=" + subSym
+                     + " (chart instrument=" + Instrument.FullName
+                     + " master=" + Instrument.MasterInstrument.Name + ")");
+                if (!string.IsNullOrEmpty(subSym)
+                    && subSym != Instrument.MasterInstrument.Name
+                    && subSym != Instrument.FullName)
+                {
+                    RLog("WARNING: sub symbol '" + subSym + "' does not match chart instrument '"
+                         + Instrument.FullName + "' (master '" + Instrument.MasterInstrument.Name
+                         + "'). Orders will be submitted on the CHART instrument, not the sub symbol.");
+                }
+                return;
+            }
             if (t == "place")
             {
                 OrderAction action = (int)m.Num("side") > 0 ? OrderAction.Buy : OrderAction.Sell;
@@ -299,12 +346,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double limit = type == OrderType.Limit ? m.Num("limit") : 0;
                 double stop = type == OrderType.StopMarket ? m.Num("stop") : 0;
                 RLog("place " + m.Get("order_id") + " on instrument " + Instrument.FullName
-                     + " (master " + Instrument.MasterInstrument.Name + ")");
-                Order o = Account.CreateOrder(Instrument, action, type, OrderEntry.Manual,
-                    TimeInForce.Day, (int)m.Num("qty"), limit, stop, string.Empty,
-                    m.Get("order_id"), Core.Globals.MaxDate, null);
-                live[m.Get("order_id")] = o;
-                Account.Submit(new[] { o });
+                     + " (master " + Instrument.MasterInstrument.Name + ")"
+                     + " action=" + action + " type=" + type + " qty=" + (int)m.Num("qty"));
+                try
+                {
+                    Order o = Account.CreateOrder(Instrument, action, type, OrderEntry.Manual,
+                        TimeInForce.Day, (int)m.Num("qty"), limit, stop, string.Empty,
+                        m.Get("order_id"), Core.Globals.MaxDate, null);
+                    live[m.Get("order_id")] = o;
+                    Account.Submit(new[] { o });
+                    RLog("submitted OK: " + m.Get("order_id"));
+                }
+                catch (Exception ex)
+                {
+                    RLog("SUBMIT FAILED for " + m.Get("order_id") + ": " + ex.GetType().Name
+                         + ": " + ex.Message);
+                    // Publish failure back to engine
+                    try
+                    {
+                        brokerCh.Publish(
+                            "{\"t\":\"order_status\",\"ts\":" + ToNs(DateTime.UtcNow) +
+                            ",\"order_id\":\"" + m.Get("order_id") +
+                            "\",\"state\":\"Rejected\",\"instrument\":\"" + Instrument.FullName +
+                            "\",\"error\":\"" + ex.Message.Replace("\"", "'") + "\"}");
+                    }
+                    catch { }
+                }
             }
             else if (t == "cancel")
             {
