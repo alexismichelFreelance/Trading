@@ -307,6 +307,52 @@ class RiskSupervisor:
         self._pos[sid] = new
 
     # ── supervisor-owned actions (EOD flatten, kill switch) ──────────────
+    def trigger_eod_flatten(self, ts: int,
+                            books: list[tuple[int, str, str, int, bool]]) -> list[tuple[int, Order]]:
+        """Wall-clock backstop for the EOD flatten (live only). Called by
+        LiveEngine on a wall-clock schedule when the market-data feed goes
+        quiet around the close. `ts` is the CURRENT wall-clock timestamp;
+        `books` is [(sid, name, symbol, confirmed_pos, holds_overnight)] — the
+        last element the engine copies from each sleeve (same contract as
+        _flatten_for_session). Returns supervisor flatten orders as (sid, Order)
+        — the engine submits them owned by that strategy. Returns [] if not yet
+        EOD time, already done, or nothing to flatten. Idempotent: sets
+        _eod_done so it cannot double-fire with the event-driven on_market path.
+        (A 4-tuple book is tolerated for legacy callers and treated as
+        intraday.)"""
+        self._roll_day(ts)
+        self._expire_pending()
+        c = self.cfg
+        if self._eod_done:
+            return []
+        if c.eod_flatten_et is None:
+            return []                                        # not configured
+        m = et_minute_of_day(ts)
+        if not (self._flatten_min(ts, c.eod_flatten_et) <= m < EVENING_ET_MIN):
+            return []                                        # not yet / too late
+        self._eod_done = True
+        tag = "risk_eod"
+        log.info("risk: EOD flatten backstop at %s (wall-clock, feed may be "
+                 "quiet)", et_session_date(ts))
+        out: list[tuple[int, Order]] = []
+        for book in books:
+            sid, name, symbol, pos = book[:4]
+            holds_overnight = book[4] if len(book) > 4 else False
+            if pos == 0:
+                continue
+            if holds_overnight or name in c.swing_sleeves:
+                continue                   # holds overnight by design
+            avail = abs(pos) - self._pending_reduces(sid, _sign(pos))
+            if avail <= 0:
+                continue                                   # flatten already working
+            o = Order(symbol, -_sign(pos), avail, tag=tag, reduce_only=True)
+            log.warning("risk: %s flatten %s %+d -> submit %s qty %d",
+                        tag, name, pos, "SELL" if pos > 0 else "BUY", avail)
+            out.append((sid, o))
+        if out:
+            self._last_emit = self._now()
+        return out
+
     def marked_pnl(self, last_px: float | dict[str, float]) -> float:
         """`last_px` may be one price (legacy single-instrument) or a
         {symbol: price} dict. A book with no usable mark is SKIPPED with an
