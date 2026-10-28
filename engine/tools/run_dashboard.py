@@ -748,7 +748,6 @@ class Dashboard:
                        f"ORDER BY ts DESC LIMIT {limit}")
             else:
                 sql = f"SELECT ts, o, h, l, c, vol FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {limit}"
-            import sys; print('DEBUG END:', end, 'SQL:', sql, flush=True); sys.stdout.flush()
             df = qdb.df(sql)
             if df.empty:
                 return web.json_response({"bars": {tf: []}, "indicators": [], "zones": [], "positions": []})
@@ -762,7 +761,7 @@ class Dashboard:
 
             # convert to BarDict list (df ts is epoch ns via the client)
             bars_raw = [{
-                "ts": r.ts.value,
+                "ts": r.ts.value,  # QuestDB returns nanoseconds; client expects nanoseconds
                 "o": float(r.o),
                 "h": float(r.h),
                 "l": float(r.l),
@@ -825,6 +824,9 @@ class Dashboard:
         try:
             params = request.rel_url.query
             symbol = params.get("symbol", "ES")
+            import re as _re
+            if not _re.fullmatch(r'[A-Z]{1,6}(\.[A-Z]{1,3})?', symbol):
+                return web.json_response({"error": "invalid symbol"}, status=400)
             from_str = params.get("from")
             to_str = params.get("to")
             import pandas as pd
@@ -862,6 +864,9 @@ class Dashboard:
         try:
             params = request.rel_url.query
             symbol = params.get("symbol", "ES")
+            import re as _re
+            if not _re.fullmatch(r'[A-Z]{1,6}(\.[A-Z]{1,3})?', symbol):
+                return web.json_response({"error": "invalid symbol"}, status=400)
             from_str = params.get("from")
             to_str = params.get("to")
             # point_usd lookup

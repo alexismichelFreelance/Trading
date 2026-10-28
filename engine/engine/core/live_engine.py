@@ -820,7 +820,10 @@ class LiveEngine:
                  for s in self.strategies]
         fired = 0
         for sid, o in self.risk.trigger_eod_flatten(now, books):
-            owner = next(s for s in self.strategies if id(s) == sid)
+            owner = next((s for s in self.strategies if id(s) == sid), None)
+            if owner is None:
+                log.warning("risk flatten: owner for sid %s not found, skipping", sid)
+                continue
             if self._is_live(owner):
                 await self._submit_owned(owner, o)
             else:
@@ -1025,7 +1028,10 @@ class LiveEngine:
                                   self._spos.get(id(s), 0)) for s in self.strategies
                                  if self._is_live(s)]
                         for sid, o in self.risk.on_market(ev.ts, self._last_px, books):
-                            owner = next(s for s in self.strategies if id(s) == sid)
+                            owner = next((s for s in self.strategies if id(s) == sid), None)
+                            if owner is None:
+                                log.warning("risk flatten: owner for sid %s not found, skipping", sid)
+                                continue
                             await self._submit_owned(owner, o)
                     if isinstance(ev, Bar) and self.on_bar_hook is not None:
                         self._emit_sink(self.on_bar_hook, ev, lane_live,

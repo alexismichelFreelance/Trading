@@ -181,7 +181,6 @@ class StateStore:
                 # dwarf the series it guards.
                 heapq.heappush(heap, (ts, key))
             points[key] = pp_
-            heapq.heappush(heap, (ts, key))
             if ts > l["ind_max_ts"]:
                 l["ind_max_ts"] = ts
         if not new_points:

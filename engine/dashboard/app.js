@@ -1172,7 +1172,12 @@ class ChartWindow {
 
   /* ── WebSocket: this window's own socket (origin + tf scoped server-side) */
   connect() {
-    this.disconnect();
+    this.closed = false;
+    if (this.ws) {
+      try { this.ws.onclose = null; this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    if (this._msgTimer) { clearTimeout(this._msgTimer); this._msgTimer = null; }
     const url = `ws://${location.host}/ws?symbol=${encodeURIComponent(this.symbol)}&tf=${encodeURIComponent(this.tf)}`;
     this.ws = new WebSocket(url);
     const self = this;
@@ -1203,9 +1208,10 @@ class ChartWindow {
   }
 
   disconnect() {
+    this.closed = true;
+    if (this._msgTimer) { clearTimeout(this._msgTimer); this._msgTimer = null; }
     if (this.ws) {
-      this.closed = true;
-      try { this.ws.close(); } catch {}
+      try { this.ws.onclose = null; this.ws.close(); } catch {}
       this.ws = null;
     }
   }

@@ -64,21 +64,24 @@ class SocketBroker:
 
     async def _ensure(self) -> None:
         async with self._lock:
-            if not self._dead():
-                return
-            await self._drop()
-            self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
-            self._opened += 1
-            log.info("%s broker connected %s:%d (%s)%s", self.name, self.host,
-                     self.port, self.account,
-                     f" [reconnect #{self.reconnects}]" if self.reconnects else "")
-            # EngineAddOn subscribes instruments at runtime: tell it which symbol
-            # this lane wants. Nothing to do for legacy relays (they ignore it).
-            # Send inside a fresh connection so a dropped subscription is re-armed
-            # whenever the engine reconnects.
-            payload = encode({"t": "sub", "symbol": self.symbol})
-            self._writer.write(payload)
-            await asyncio.wait_for(self._writer.drain(), self.send_timeout)
+            await self._ensure_unlocked()
+
+    async def _ensure_unlocked(self) -> None:
+        if not self._dead():
+            return
+        await self._drop()
+        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
+        self._opened += 1
+        log.info("%s broker connected %s:%d (%s)%s", self.name, self.host,
+                 self.port, self.account,
+                 f" [reconnect #{self.reconnects}]" if self.reconnects else "")
+        # EngineAddOn subscribes instruments at runtime: tell it which symbol
+        # this lane wants. Nothing to do for legacy relays (they ignore it).
+        # Send inside a fresh connection so a dropped subscription is re-armed
+        # whenever the engine reconnects.
+        payload = encode({"t": "sub", "symbol": self.symbol})
+        self._writer.write(payload)
+        await asyncio.wait_for(self._writer.drain(), self.send_timeout)
 
     @property
     def reconnects(self) -> int:
@@ -93,10 +96,11 @@ class SocketBroker:
         payload = encode(obj)
         for attempt in (1, 2):                        # one retry across a reconnect
             try:
-                await self._ensure()
-                assert self._writer is not None
-                self._writer.write(payload)
-                await asyncio.wait_for(self._writer.drain(), self.send_timeout)
+                async with self._lock:
+                    await self._ensure_unlocked()
+                    assert self._writer is not None
+                    self._writer.write(payload)
+                    await asyncio.wait_for(self._writer.drain(), self.send_timeout)
                 return
             except (OSError, asyncio.TimeoutError, AssertionError) as ex:
                 await self._drop()

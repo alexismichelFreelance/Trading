@@ -234,7 +234,7 @@ namespace NinjaTrader.NinjaScript
             int signed = e.Execution.MarketPosition == MarketPosition.Long ? qty : -qty;
             string name = e.Execution.Order != null ? e.Execution.Order.Name : "";
             brokerCh.Publish("{\"t\":\"fill\",\"ts\":" + ToNs(e.Execution.Time) +
-                ",\"order_id\":\"" + name + "\",\"symbol\":\"" + sym +
+                ",\"order_id\":\"" + Esc(name) + "\",\"symbol\":\"" + Esc(sym) +
                 "\",\"price\":" + J(e.Execution.Price) + ",\"size\":" + signed +
                 ",\"commission\":" + J(e.Execution.Commission) +
                 ",\"tag\":\"" + name + "\"}");
@@ -248,7 +248,7 @@ namespace NinjaTrader.NinjaScript
                        : (e.Position.MarketPosition == MarketPosition.Short ? -e.Position.Quantity : 0);
             if (e.Operation == Operation.Remove) signed = 0;
             brokerCh.Publish("{\"t\":\"position\",\"ts\":" + ToNs(DateTime.UtcNow) +
-                ",\"symbol\":\"" + sym + "\",\"qty\":" + signed +
+                ",\"symbol\":\"" + Esc(sym) + "\",\"qty\":" + signed +
                 ",\"avg_px\":" + J(e.Position.AveragePrice) + "}");
         }
 
@@ -397,12 +397,13 @@ namespace NinjaTrader.NinjaScript
         }
 
         private static string J(double d) { return d.ToString("R", CultureInfo.InvariantCulture); }
+        private static string Esc(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\""); }
 
         private static string Quote(string t, string sym, long ts, params object[] kv)
         {
             var sb = new StringBuilder();
             sb.Append("{\"t\":\"").Append(t).Append("\",\"ts\":").Append(ts)
-              .Append(",\"symbol\":\"").Append(sym).Append("\"");
+              .Append(",\"symbol\":\"").Append(Esc(sym)).Append("\"");
             for (int i = 0; i + 1 < kv.Length; i += 2)
             {
                 sb.Append(",\"").Append((string)kv[i]).Append("\":");
@@ -418,7 +419,7 @@ namespace NinjaTrader.NinjaScript
         {
             return "{\"t\":\"bar\",\"ts\":" + ToNs(time) + ",\"tf\":\"1m\",\"o\":" + J(o) +
                    ",\"h\":" + J(h) + ",\"l\":" + J(l) + ",\"c\":" + J(c) + ",\"v\":" + v +
-                   ",\"symbol\":\"" + sym + "\"}";
+                   ",\"symbol\":\"" + Esc(sym) + "\"}";
         }
 
         public class MiniJson

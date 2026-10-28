@@ -76,14 +76,16 @@ class NinjaTraderFeed:
             self._default_sym = symbol
 
     async def stream(self) -> AsyncIterator[MarketEvent]:
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        log.info("NT feed connected %s:%d (demux symbols=%s)",
-                 self.host, self.port, self.symbols or "auto")
-        # Per-symbol state, keyed by the symbol each parsed event carries.
-        aggs: dict[str, BookFlowAggregator] = {}
-        bars: dict[str, _BarBuilder] = {}
-        sec_hi: dict[str, int] = {}          # last second boundary emitted, per lane
+        reader = None
+        writer = None
         try:
+            reader, writer = await asyncio.open_connection(self.host, self.port)
+            log.info("NT feed connected %s:%d (demux symbols=%s)",
+                     self.host, self.port, self.symbols or "auto")
+            # Per-symbol state, keyed by the symbol each parsed event carries.
+            aggs: dict[str, BookFlowAggregator] = {}
+            bars: dict[str, _BarBuilder] = {}
+            sec_hi: dict[str, int] = {}          # last second boundary emitted, per lane
             while True:
                 raw = await reader.readline()
                 if not raw:
@@ -129,14 +131,12 @@ class NinjaTraderFeed:
                 else:
                     yield ev                          # Quote / Bar / BookFlow
         finally:
-            for sym, agg in aggs.items():             # flush final seconds
-                if sec_hi[sym] >= 0:
-                    yield agg.snapshot(sec_hi[sym], sym)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:                         # noqa: BLE001
-                pass
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:                         # noqa: BLE001
+                    pass
 
 
 __all__ = ["NinjaTraderFeed"]
