@@ -1183,7 +1183,8 @@ class ChartWindow {
     const self = this;
     // reconnect if no message arrives within 8s (handles connections made during server seeding)
     this._msgTimer = setTimeout(() => {
-      if (self.candles.length === 0) {
+      this._msgTimer = null;
+      if (self.candles.length === 0 && !self.closed) {
         console.warn('no data received, reconnecting...');
         self.connect();
       }

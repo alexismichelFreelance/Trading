@@ -500,8 +500,10 @@ class Dashboard:
 
     async def _vendor(self, request):
         f = request.match_info.get("f", "")
-        p = (self.static / "vendor" / f).resolve()
-        if not str(p).startswith(str(self.static.resolve())):
+        try:
+            p = (self.static / "vendor" / f).resolve()
+            p.relative_to(self.static.resolve())
+        except (ValueError, OSError):
             raise web.HTTPForbidden()
         return web.FileResponse(p)
 
@@ -576,7 +578,8 @@ class Dashboard:
                 "log": snap.get("log", [])[-80:],
                 "errors": snap.get("errors", []),
             })
-            write = asyncio.create_task(self._forward(ws, symbol, tf))
+            ctx = {"symbol": symbol, "tf": tf}
+            write = asyncio.create_task(self._forward(ws, ctx))
             self._clients.add(write)
             try:
                 async for msg in ws:
@@ -589,12 +592,14 @@ class Dashboard:
                         if op == "ping":
                             await ws.send_json({"type": "pong"})
                         elif op == "subscribe":
-                            symbol = data.get("symbol", symbol)
-                            tf = data.get("tf", tf)
+                            symbol = data.get("symbol", ctx["symbol"])
+                            tf = data.get("tf", ctx["tf"])
                             if symbol not in self.lanes:
                                 symbol = self.lanes[0]
                             if tf not in self.timeframes:
                                 tf = self.timeframes[0]
+                            ctx["symbol"] = symbol
+                            ctx["tf"] = tf
                             snap = self.pub.snapshot()
                             await ws.send_json({
                                 "type": "snapshot",
@@ -613,7 +618,7 @@ class Dashboard:
             log.warning("ws ended: %s", ex)
         return ws
 
-    async def _forward(self, ws, symbol: str, tf: str):
+    async def _forward(self, ws, ctx: dict):
         """Stream state-publish deltas, delivering each client only the bars for
         its chosen tf (raw 1m under '1m') plus all shared log/errors.
 
@@ -634,13 +639,15 @@ class Dashboard:
             nonlocal buf, bar_count, last_flush
             if not buf:
                 return
-            await ws.send_json({"type": "delta_batch", "symbol": symbol,
+            await ws.send_json({"type": "delta_batch", "symbol": ctx["symbol"],
                                 "deltas": buf})
             buf, bar_count = [], 0
             last_flush = time.monotonic()
 
         try:
             async for m in self.pub.subscribe():
+                symbol = ctx["symbol"]
+                tf = ctx["tf"]
                 kind = m["type"]
                 if kind in ("__snapshot__", "__post_seed__"):
                     # The subscriber yields the initial snapshot as
