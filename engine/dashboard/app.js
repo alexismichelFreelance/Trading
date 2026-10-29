@@ -617,24 +617,44 @@ class ChartWindow {
     if (!this.levelLabels) return;
     const ps = this.candleSeries;
     if (!ps) return;
+    // Keep the label gutter OFF the price axis: the axis owns the rightmost
+    // pixels, so sit labels just to its left instead of on top of its ticks.
+    let axisW = 0;
+    try { axisW = this.chart.priceScale("right").width() || 0; } catch {}
+    this.levelLabels.style.setProperty("right", (axisW + 6) + "px", "important");
+
+    const withPrio = (arr, prio) => (arr || []).map(l => ({ ...l, _prio: prio }));
     const labels = []
-      .concat(this.gammaLabels || [])
-      .concat(this.pivotLabelsMulti || [])
-      .concat(this.pivotLabelsDaily || [])
-      .concat(this.strategyLabels || [])
-      .concat(this.positionLabels || []);
-    // dedupe by text
+      .concat(withPrio(this.gammaLabels, 1))
+      .concat(withPrio(this.pivotLabelsDaily, 2))
+      .concat(withPrio(this.pivotLabelsMulti, 3))
+      .concat(withPrio(this.strategyLabels, 4))
+      .concat(withPrio(this.positionLabels, 5));
+
+    // Dedupe by text, then place greedily by priority. Two labels landing
+    // within a line-height of each other is a collision: keep the higher
+    // priority one and hide the other rather than printing an illegible pile.
     const seen = new Set();
-    const uniq = [];
+    const cand = [];
     for (const l of labels) {
-      if (seen.has(l.text)) continue;
+      if (!l || seen.has(l.text)) continue;
       seen.add(l.text);
-      uniq.push(l);
-    }
-    this.levelLabels.innerHTML = uniq.map(l => {
       const y = ps.priceToCoordinate(l.price);
-      if (y == null) return "";
-      return `<div class="levelLabel" style="position:absolute;right:2px;top:${Math.max(0, y - 8)}px;color:${l.color};font-size:10px;white-space:nowrap;">${escapeHtml(l.text)}</div>`;
+      if (y == null) continue;
+      cand.push({ ...l, y });
+    }
+    cand.sort((a, b) => a._prio - b._prio || a.y - b.y);
+    const placed = [];
+    const GAP = 12;
+    for (const l of cand) {
+      if (placed.some(p => Math.abs(p - l.y) < GAP)) continue;
+      placed.push(l.y);
+      l._placed = true;
+    }
+    const h = this.levelLabels.clientHeight || this.chartBox.clientHeight || 0;
+    this.levelLabels.innerHTML = cand.filter(l => l._placed).map(l => {
+      const top = Math.max(0, Math.min(l.y - 8, h - 14));
+      return `<div class="levelLabel" style="position:absolute;right:2px;top:${top}px;color:${l.color};">${escapeHtml(l.text)}</div>`;
     }).join("");
   }
 
@@ -957,6 +977,20 @@ class ChartWindow {
     const ts = this.chart.timeScale();
     const ps = this.candleSeries;
     const rng = this.lastSessionRange();
+    // Visible price span. A zone taller than a third of it is context, not a
+    // tradeable level — filling it (on top of other overlapping zones) washes
+    // the candles out, so those get an outline only.
+    let vr = null;
+    try { vr = ts.getVisibleRange(); } catch {}
+    let visHi = -Infinity, visLo = Infinity;
+    for (const b of this.candles) {
+      const t = sec(b.ts);
+      if (vr && (t < vr.from || t > vr.to)) continue;
+      if (b.h > visHi) visHi = b.h;
+      if (b.l < visLo) visLo = b.l;
+    }
+    const visSpan = (isFinite(visHi) && isFinite(visLo) && visHi > visLo)
+      ? (visHi - visLo) : null;
     for (const z of (this.zones || [])) {
       if (z.top == null || z.bot == null) continue;
       const top = Math.min(z.top, z.bot);
@@ -975,12 +1009,15 @@ class ChartWindow {
       const h = Math.abs(y2 - y1);
       if (w < 1 || h < 1) continue;
       const isSupply = (z.direction || 0) < 0;
-      const color = z.broken ? "rgba(107,114,128,0.15)"
-        : (isSupply ? "rgba(239,83,80,0.18)" : "rgba(38,166,154,0.18)");
-      const stroke = z.broken ? "rgba(107,114,128,0.4)"
-        : (isSupply ? "rgba(239,83,80,0.6)" : "rgba(38,166,154,0.6)");
-      ctx.fillStyle = color;
-      ctx.fillRect(x, y, w, h);
+      const tooTall = visSpan != null && (bot - top) > visSpan * 0.33;
+      const color = z.broken ? "rgba(107,114,128,0.05)"
+        : (isSupply ? "rgba(239,83,80,0.06)" : "rgba(38,166,154,0.06)");
+      const stroke = z.broken ? "rgba(107,114,128,0.35)"
+        : (isSupply ? "rgba(239,83,80,0.45)" : "rgba(38,166,154,0.45)");
+      if (!tooTall) {
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, w, h);
+      }
       ctx.strokeStyle = stroke;
       ctx.lineWidth = 1;
       ctx.strokeRect(x, y, w, h);
@@ -1085,11 +1122,11 @@ class ChartWindow {
   addFillMarker(f) {
     if (!f) return;
     const side = (f.size || 0) > 0;
-    this.fillMarkers.push({ time: sec(f.ts || Date.now() * 1e6),
+    this.fillMarkers.push({ time: this.snapTimeToGrid(sec(f.ts || Date.now() * 1e6)),
       position: side ? "belowBar" : "aboveBar",
       color: side ? "#26a69a" : "#ef5350",
       shape: side ? "arrowUp" : "arrowDown",
-      text: (side ? "B " : "S ") + (f.tag || "") });
+      text: (side ? "B " : "S ") + String(f.tag || "").slice(0, 12) });
     this.applyMarkers();
   }
   async loadFills() {
@@ -1102,7 +1139,7 @@ class ChartWindow {
       for (const f of data.fills) {
         const side = f.side > 0;
         this.fillMarkers.push({
-          time: Math.floor(f.ts / 1e9),
+          time: this.snapTimeToGrid(Math.floor(f.ts / 1e9)),
           position: side ? "belowBar" : "aboveBar",
           color: side ? "#26a69a" : "#ef5350",
           shape: side ? "arrowUp" : "arrowDown",
@@ -1117,25 +1154,67 @@ class ChartWindow {
 
   addSignalMarker(s) {
     if (!s) return;
+    const tag = String(s.tag || "");
+    // Only ENTRY intents become markers. Stop / timeout / scale / reduce tags
+    // are the strategy's bookkeeping (they duplicate the real fill events) and
+    // a chart covered in them is unreadable.
+    if (!/entry/i.test(tag)) return;
     const side = (s.side || 0) > 0;
     const ts = s.ts || Date.now() * 1e6;
     this.signalMarkers.push({
       time: sec(ts),
       position: side ? "belowBar" : "aboveBar",
-      color: side ? "#22c55e" : "#ef5350",
-      shape: side ? "arrowUp" : "arrowDown",
-      text: (s.tag || (side ? "BUY" : "SELL")),
+      // warmup (historical replay) signals are muted so they read as context,
+      // not as something that actually traded.
+      color: s.source === "warmup" ? "#64748b" : (side ? "#22c55e" : "#ef5350"),
+      shape: "circle",             // shape only — never a text wall
+      text: "",
+      _side: side ? 1 : 0,
     });
+    if (this.signalMarkers.length > 2000) {
+      this.signalMarkers = this.signalMarkers.slice(-2000);
+    }
     this.applyMarkers();
   }
 
   applyMarkers() {
-    const markers = this.fillMarkers.slice(-100).concat(this.signalMarkers.slice(-100));
-    if (this.sessionMarkers) markers.push(...this.sessionMarkers);
-    if (this.pivotMarkers) markers.push(...this.pivotMarkers);
-    if (this.gammaMarkers) markers.push(...this.gammaMarkers);
+    if (!this.candleSeries) return;
+    const c = this.candles;
+    if (!c.length) { this.candleSeries.setMarkers([]); return; }
+    const step = this.gridStep() || 300;
+    const g0 = sec(c[0].ts);
+    const lastTs = sec(c[c.length - 1].ts);
+    // Window by TIME (last ~500 bars or 2 sessions), never a flat count: a
+    // signal history spanning days must not be drawn on today's chart.
+    const cutoff = Math.max(g0, lastTs - Math.max(step * 500, 2 * 86400));
+    const keep = (m) => m && m.time >= cutoff;
+
+    // Collapse every entry on the same bar into ONE marker, so eight sleeves
+    // firing on one candle draw one dot, not eight overlapping ones.
+    const buckets = new Map();
+    for (const s of this.signalMarkers) {
+      if (!keep(s)) continue;
+      const t = this.snapTimeToGrid(s.time);
+      const key = t + "|" + (s._side ? 1 : 0);
+      if (buckets.has(key)) continue;
+      buckets.set(key, { time: t, position: s.position, color: s.color,
+                         shape: "circle" });
+    }
+    const markers = this.fillMarkers.filter(keep).concat([...buckets.values()]);
+    if (this.sessionMarkers) markers.push(...this.sessionMarkers.filter(keep));
+    if (this.pivotMarkers) markers.push(...this.pivotMarkers.filter(keep));
+    if (this.gammaMarkers) markers.push(...this.gammaMarkers.filter(keep));
     markers.sort((a, b) => a.time - b.time);
-    this.candleSeries.setMarkers(markers.slice(-200));
+    // LWC wants one marker per timestamp; fills are concatenated first so a
+    // real execution wins over a same-bar signal.
+    const uniq = [];
+    let lastT = null;
+    for (const m of markers) {
+      if (m.time === lastT) continue;
+      uniq.push(m);
+      lastT = m.time;
+    }
+    this.candleSeries.setMarkers(uniq.slice(-1000));
   }
 
   computeSessionMarkers() {
@@ -1470,6 +1549,7 @@ class ChartWindow {
     }
     this.indSeries = {};
     this.fillMarkers = [];
+    this.signalMarkers = [];
     if (this.candleSeries) this.candleSeries.setMarkers([]);
     if (this.vwapSeries) this.vwapSeries.setData([]);
     for (const k in this.bandSeries) if (this.bandSeries[k]) this.bandSeries[k].setData([]);
@@ -1667,21 +1747,50 @@ function renderGammaDrawerFor(w) {
 
 /* ── log drawer + error badge ────────────────────────────────────────── */
 const LOG_MAX = 300;
+const _logLines = new Map();   // normalized message -> its log line
 function appendLog(rec, isError) {
   const host = $("log");
   if (!host || !rec) return;
-  const line = document.createElement("div");
   const d = new Date(rec.ts ? rec.ts / 1e6 : Date.now());
+  const stamp = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  // Collapse repeats that differ only by a number (the lane-stale watchdog
+  // prints "... SILENT for 1896s" every 15s) into ONE line with a counter,
+  // instead of flooding the log and inflating the badge.
+  const normKey = (rec.level || "") + "|" + String(rec.message || "").replace(/\d+/g, "#");
+  const existing = _logLines.get(normKey);
+  if (existing && existing.isConnected) {
+    existing._n = (existing._n || 1) + 1;
+    let cnt = existing.querySelector(".n");
+    if (!cnt) {
+      cnt = document.createElement("span");
+      cnt.className = "n";
+      existing.appendChild(cnt);
+    }
+    cnt.textContent = " ×" + existing._n;
+    const tEl = existing.querySelector(".t");
+    if (tEl) tEl.textContent = stamp;
+    return;
+  }
+  const line = document.createElement("div");
   line.className = "logline " + (rec.level || "").toLowerCase();
-  line.innerHTML = `<span class="t">${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}</span>` +
+  line._key = normKey;
+  line.innerHTML = `<span class="t">${stamp}</span>` +
     `<span class="msg">${escapeHtml(rec.level || "")} ${escapeHtml(rec.message || "")}</span>`;
   host.appendChild(line);
-  while (host.children.length > LOG_MAX) host.removeChild(host.firstChild);
-  if (isError || rec.level === "ERROR" || rec.level === "CRITICAL") {
+  _logLines.set(normKey, line);
+  while (host.children.length > LOG_MAX) {
+    const old = host.firstChild;
+    if (old && old._key) _logLines.delete(old._key);
+    host.removeChild(old);
+  }
+  if (isError || rec.level === "ERROR" || rec.level === "CRITICAL" || rec.level === "WARNING") {
+    // Count DISTINCT warning lines (the map collapses repeats) and make the
+    // badge the way into the log.
+    const n = host.querySelectorAll(".logline.error, .logline.critical, .logline.warning").length;
     const badge = $("errorBadge");
     badge.classList.remove("hidden");
-    badge.textContent = (parseInt(badge.textContent || "0", 10) + 1);
-    setStatus("err", "warnings present");
+    badge.textContent = n;
+    badge.title = "click to open the engine log";
   }
 }
 
@@ -1712,6 +1821,14 @@ $("gammaBtn").addEventListener("click", () => {
 $("indBtn").addEventListener("click", () => {
   toggleDrawer("indDrawer");
   const w = [...windows.values()][0]; if (w) w.renderIndicatorsList();
+});
+$("logBtn").addEventListener("click", () => {
+  toggleDrawer("logDrawer");
+  const host = $("log"); if (host) host.scrollTop = host.scrollHeight;
+});
+$("errorBadge").addEventListener("click", () => {
+  toggleDrawer("logDrawer");
+  const host = $("log"); if (host) host.scrollTop = host.scrollHeight;
 });
 $("laneSel").addEventListener("change", (ev) => {
   const w = [...windows.values()][0];

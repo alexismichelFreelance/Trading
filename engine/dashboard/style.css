@@ -137,6 +137,7 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
 .logline .msg { color: var(--text); }
 .logline.error .msg { color: var(--red); font-weight: 600; }
 .logline.warning .msg { color: var(--orange); }
+.logline .n { color: var(--muted); font-weight: 700; flex: 0 0 auto; }
 
 /* ── strategy roster toggles ──────────────────────────────────────── */
 #roster { flex: 1; overflow-y: auto; padding: 6px 10px; }
@@ -205,11 +206,19 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
   right: 4px !important;
   top: 0 !important;
   bottom: 0 !important;
-  width: 90px !important;
+  width: 140px !important;
   height: 100% !important;
   pointer-events: none !important;
   z-index: 10 !important;
-  overflow: hidden !important;
+  overflow: visible !important;
+}
+.levelLabel {
+  font-size: 10px;
+  white-space: nowrap;
+  line-height: 12px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(11, 14, 20, 0.72);
 }
 .winTitle .regime { margin-left: 8px; }
 .winTitle .vwapPx { color: var(--orange); font-variant-numeric: tabular-nums; font-weight: 600; }

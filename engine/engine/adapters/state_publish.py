@@ -271,7 +271,7 @@ class StatePublisher:
                 continue
             d = self.store.apply_indicator(sym, ind)
             if d is not None:
-                log.info("PUBLISH indicator %s for %s (%d pts)", ind["id"], sym, len(ind.get("points", [])))
+                log.debug("PUBLISH indicator %s for %s (%d pts)", ind["id"], sym, len(ind.get("points", [])))
                 self.broadcast(d)
             else:
                 log.debug("SKIP indicator %s for %s (no new points)", ind["id"], sym)
