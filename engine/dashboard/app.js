@@ -39,6 +39,39 @@ function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g,
     c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+/* ET wall-clock, DST-aware (the engine timestamps are UTC epoch). */
+const ET_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
+const fmtEt = (ms) => {
+  const d = new Date(ms);
+  return isNaN(d) ? "—" : ET_FMT.format(d);
+};
+/* Parse the engine/QuestDB timestamp forms ("2026-10-29 14:31:00+00:00",
+ * ISO, or epoch ms) without trusting a single format. */
+function parseTs(v) {
+  if (v == null) return NaN;
+  if (typeof v === "number") return v;
+  let t = String(v).trim().replace(" ", "T");
+  if (!/[Zz]|[+-]\d\d:?\d\d$/.test(t)) t += "Z";
+  return Date.parse(t);
+}
+/* Order tags carry the strategy's intent. Zone tags are structured
+ * ("fade-entry|d3|b15|t1|15m"); everything else is shown readably. */
+function prettyTag(tag) {
+  const t = String(tag || "");
+  const parts = t.split("|");
+  if (parts.length === 5 && /-entry$/i.test(parts[0])) {
+    const setup = parts[0].replace(/-entry$/i, "").toUpperCase();
+    return `${setup} zone · ${parts[4]} · touch ${parts[3].replace(/^t/i, "")}`;
+  }
+  return t ? t.replace(/[-_]+/g, " ").trim() : "signal";
+}
+const POINT_USD = { ES: 50, NQ: 20, GC: 100, CL: 1000, YM: 5, RTY: 50 };
+function pointUsd(symbol) {
+  return POINT_USD[String(symbol || "").split(".")[0].toUpperCase()] || 50;
+}
 
 /* ══════════════════ ChartWindow — one symbol/tf cell ══════════════════ */
 class ChartWindow {
@@ -59,6 +92,9 @@ class ChartWindow {
     this.positions = [];        // [{sleeve, qty, entry, target, stop}]
     this.fillMarkers = [];
     this.signalMarkers = [];
+    this.markerInfo = new Map();   // snapped bar time -> {signals:[], fills:[]}
+    this._perfCache = null;        // closed trades for the trades drawer
+    this._perfCacheTs = 0;
     this._logCount = 0;
     this._reconnectDelay = 1500;
     this._initialLoadDone = false;
@@ -156,6 +192,10 @@ class ChartWindow {
     this.chart.timeScale().subscribeVisibleTimeRangeChange(() => {
       this.renderLevelLabels();
     });
+    // Hover detail for the dots: LWC markers are canvas-drawn and carry no
+    // native tooltip, so map the crosshair's bar time back to the signal /
+    // fill events that produced that marker.
+    this.chart.subscribeCrosshairMove((param) => this.onCrosshairMove(param));
 
   }
 
@@ -630,12 +670,14 @@ class ChartWindow {
     this.levelLabels.style.setProperty("overflow", "visible", "important");
 
     const withPrio = (arr, prio) => (arr || []).map(l => ({ ...l, _prio: prio }));
+    // Positions win the gutter: they are the user's actual exposure, and a
+    // pivot label is context. Everything else follows in importance order.
     const labels = []
+      .concat(withPrio(this.positionLabels, 0))
       .concat(withPrio(this.gammaLabels, 1))
       .concat(withPrio(this.pivotLabelsDaily, 2))
       .concat(withPrio(this.pivotLabelsMulti, 3))
-      .concat(withPrio(this.strategyLabels, 4))
-      .concat(withPrio(this.positionLabels, 5));
+      .concat(withPrio(this.strategyLabels, 4));
 
     // Dedupe by text, then place greedily by priority. Two labels landing
     // within a line-height of each other is a collision: keep the higher
@@ -1110,23 +1152,47 @@ class ChartWindow {
   setPositions(list) {
     this.positions = list || [];
     this.drawPositions();
+    const d = $("tradeDrawer");
+    if (d && !d.classList.contains("hidden")) renderTradesDrawer(this);
   }
   drawPositions() {
     for (const ser of this.positionLines) { try { this.chart.removeSeries(ser); } catch {} }
     this.positionLines = [];
     this.positionLabels = [];
+    const add = (pr, st, et, color, style, label) => {
+      if (pr == null) return;
+      const ser = this.drawBoundedLevel(pr, st, et, color, style, 1);
+      if (ser) this.positionLines.push(ser);
+      this.positionLabels.push({ price: pr, color, text: label });
+    };
+    // The engine publishes avg_px for most sleeves; `entry` only on strategies
+    // that expose their rail. Without the avg_px fallback those positions were
+    // invisible. Group by price so 19 sleeves at three levels draw three lines,
+    // not nineteen overlapping ones.
+    const byPx = new Map();
+    for (const p of this.positions) {
+      if (!p || (p.qty || 0) === 0) continue;
+      const px = p.entry != null ? p.entry : p.avg_px;
+      if (px == null) continue;
+      const key = Number(px).toFixed(2);
+      let g = byPx.get(key);
+      if (!g) { g = { px: Number(px), qty: 0, n: 0 }; byPx.set(key, g); }
+      g.qty += (p.qty || 0);
+      g.n += 1;
+    }
+    for (const g of byPx.values()) {
+      if (g.qty === 0) continue;
+      const label = `${g.qty > 0 ? "L" : "S"}${Math.abs(g.qty)} @ ${fmtPx(g.px)}` +
+                    (g.n > 1 ? ` · ${g.n} pos` : "");
+      add(g.px, null, null, "#4f9cf9", 0, label);
+    }
+    // Target/stop rails only exist on a few sleeves; draw those individually.
     for (const p of this.positions) {
       const st = p.start_ts != null ? sec(p.start_ts) : null;
       const et = p.end_ts != null ? sec(p.end_ts) : null;
-      const add = (pr, color, style, label) => {
-        if (pr == null) return;
-        const ser = this.drawBoundedLevel(pr, st, et, color, style, 1);
-        if (ser) this.positionLines.push(ser);
-        this.positionLabels.push({ price: pr, color, text: label });
-      };
-      if (p.entry != null) add(p.entry, "#4f9cf9", 0, (p.sleeve || "pos") + " entry");
-      if (p.target != null) add(p.target, "#089981", 2, (p.sleeve || "pos") + " target");
-      if (p.stop != null) add(p.stop, "#f23645", 2, (p.sleeve || "pos") + " stop");
+      const who = p.sleeve || "pos";
+      if (p.target != null) add(p.target, st, et, "#089981", 2, who + " target");
+      if (p.stop != null) add(p.stop, st, et, "#f23645", 2, who + " stop");
     }
     this.renderLevelLabels();
   }
@@ -1134,28 +1200,55 @@ class ChartWindow {
   addFillMarker(f) {
     if (!f) return;
     const side = (f.size || 0) > 0;
-    this.fillMarkers.push({ time: this.snapTimeToGrid(sec(f.ts || Date.now() * 1e6)),
+    const ts = f.ts || Date.now() * 1e6;
+    this.fillMarkers.push({ time: this.snapTimeToGrid(sec(ts)),
       position: side ? "belowBar" : "aboveBar",
       color: side ? "#26a69a" : "#ef5350",
       shape: side ? "arrowUp" : "arrowDown",
-      text: (side ? "B " : "S ") + String(f.tag || "").slice(0, 12) });
+      text: (side ? "B " : "S ") + String(f.tag || "").slice(0, 12),
+      _fill: { ts: sec(ts), side: side ? 1 : -1, qty: Math.abs(f.size || 0),
+               price: f.price, sleeve: f.sleeve || "", tag: f.tag || "",
+               symbol: f.symbol || this.symbol } });
     this.applyMarkers();
   }
   async loadFills() {
+    // A snapshot arrives on every (re)connect. Fetching the ENTIRE fill
+    // history each time ships ~0.5 MB and blocks the engine's event loop;
+    // the chart only draws ~2 sessions, so ask for that window and throttle
+    // repeat fetches of the same symbol.
+    const key = this.symbol;
+    if (this._fillsFor === key && this._fillsLoadedAt &&
+        Date.now() - this._fillsLoadedAt < 60000) return;
+    this._fillsFor = key;
+    this._fillsLoadedAt = Date.now();
     try {
-      const resp = await fetch(`/api/fills?symbol=${encodeURIComponent(this.symbol)}`);
+      // Hour-rounded so the server's 30s TTL cache can actually hit.
+      const from = new Date(
+        Math.floor((Date.now() - 3 * 86400e3) / 3600e3) * 3600e3)
+        .toISOString().replace("Z", "+00:00");
+      const resp = await fetch(`/api/fills?symbol=${encodeURIComponent(key)}` +
+                               `&from=${encodeURIComponent(from)}`);
       const data = await resp.json();
       if (!data.fills) return;
-      // clear old fill markers
-      this.fillMarkers = [];
+      // Merge, never replace: live fills can arrive over the WS while this
+      // fetch is in flight, and clearing would silently drop them.
+      const seen = new Set(this.fillMarkers.map(m =>
+        m.time + "|" + (m._fill?.tag || "") + "|" + (m._fill?.price ?? "")));
       for (const f of data.fills) {
         const side = f.side > 0;
+        const t = Math.floor(f.ts / 1e9);
+        const k = this.snapTimeToGrid(t) + "|" + (f.tag || "") + "|" + (f.price ?? "");
+        if (seen.has(k)) continue;
+        seen.add(k);
         this.fillMarkers.push({
-          time: this.snapTimeToGrid(Math.floor(f.ts / 1e9)),
+          time: this.snapTimeToGrid(t),
           position: side ? "belowBar" : "aboveBar",
           color: side ? "#26a69a" : "#ef5350",
           shape: side ? "arrowUp" : "arrowDown",
           text: (side ? "B " : "S ") + (f.tag || "").slice(0, 12),
+          _fill: { ts: t, side: f.side, qty: Math.abs(f.qty || 0),
+                   price: f.price, sleeve: f.sleeve || "",
+                   tag: f.tag || "", symbol: f.symbol || this.symbol },
         });
       }
       this.applyMarkers();
@@ -1182,6 +1275,9 @@ class ChartWindow {
       shape: "circle",             // shape only — never a text wall
       text: "",
       _side: side ? 1 : 0,
+      _sig: { ts: sec(ts), side: s.side || 0, qty: Math.abs(s.qty || 0),
+              tag, px: s.px != null ? s.px : null,
+              source: s.source || "live", symbol: s.symbol || this.symbol },
     });
     if (this.signalMarkers.length > 2000) {
       this.signalMarkers = this.signalMarkers.slice(-2000);
@@ -1192,7 +1288,7 @@ class ChartWindow {
   applyMarkers() {
     if (!this.candleSeries) return;
     const c = this.candles;
-    if (!c.length) { this.candleSeries.setMarkers([]); return; }
+    if (!c.length) { this.candleSeries.setMarkers([]); this.markerInfo = new Map(); return; }
     const step = this.gridStep() || 300;
     const g0 = sec(c[0].ts);
     const lastTs = sec(c[c.length - 1].ts);
@@ -1200,6 +1296,26 @@ class ChartWindow {
     // signal history spanning days must not be drawn on today's chart.
     const cutoff = Math.max(g0, lastTs - Math.max(step * 500, 2 * 86400));
     const keep = (m) => m && m.time >= cutoff;
+
+    // Hover index: every event that lands on a bar, including events that the
+    // collapsed dot below hides. This is what the crosshair tooltip reads.
+    const info = new Map();
+    const addInfo = (t, kind, obj) => {
+      let e = info.get(t);
+      if (!e) { e = { signals: [], fills: [] }; info.set(t, e); }
+      e[kind].push(obj);
+    };
+    for (const s of this.signalMarkers) {
+      if (!keep(s)) continue;
+      addInfo(this.snapTimeToGrid(s.time), "signals",
+              s._sig || { ts: s.time, side: s._side ? 1 : -1 });
+    }
+    for (const f of this.fillMarkers) {
+      if (!keep(f)) continue;
+      addInfo(f.time, "fills",
+              f._fill || { ts: f.time, side: f.color === "#26a69a" ? 1 : -1 });
+    }
+    this.markerInfo = info;
 
     // Collapse every entry on the same bar into ONE marker, so eight sleeves
     // firing on one candle draw one dot, not eight overlapping ones.
@@ -1227,6 +1343,46 @@ class ChartWindow {
       lastT = m.time;
     }
     this.candleSeries.setMarkers(uniq.slice(-1000));
+  }
+
+  /* Crosshair hover over a marker bar -> show the event(s) that produced it.
+   * This is the only place a dot's story is exposed: strategy tag, side, qty,
+   * decision price and LIVE/warmup source. */
+  onCrosshairMove(param) {
+    const tip = $("markerTip");
+    if (!tip) return;
+    if (!param || param.time == null || !param.point ||
+        typeof param.time !== "number") {
+      tip.classList.add("hidden");
+      return;
+    }
+    const info = this.markerInfo && this.markerInfo.get(param.time);
+    if (!info || (!info.signals.length && !info.fills.length)) {
+      tip.classList.add("hidden");
+      return;
+    }
+    const rows = [];
+    rows.push(`<div class="mtHead">${escapeHtml(fmtEt(param.time * 1000))} ET</div>`);
+    for (const s of info.signals) {
+      const long = (s.side || 0) > 0;
+      const src = s.source === "warmup" ? " · warmup" : " · live";
+      rows.push(`<div class="mtRow"><span class="mtTag ${long ? "up" : "down"}">${long ? "LONG" : "SHORT"}</span> ${Math.abs(s.qty || 0)} @ ${fmtPx(s.px)} <span class="dim">${escapeHtml(prettyTag(s.tag))}${src}</span></div>`);
+    }
+    for (const f of info.fills) {
+      const buy = (f.side || 0) > 0;
+      const who = f.sleeve ? escapeHtml(f.sleeve) : escapeHtml(prettyTag(f.tag));
+      rows.push(`<div class="mtRow"><span class="mtTag ${buy ? "up" : "down"}">${buy ? "BUY" : "SELL"}</span> ${Math.abs(f.qty || 0)} @ ${fmtPx(f.price)} <span class="dim">${who}</span></div>`);
+    }
+    tip.innerHTML = rows.join("");
+    tip.classList.remove("hidden");
+    const box = this.chartBox.getBoundingClientRect();
+    let x = box.left + param.point.x + 16;
+    let y = box.top + param.point.y + 16;
+    const r = tip.getBoundingClientRect();
+    if (x + r.width > window.innerWidth - 8) x = box.left + param.point.x - r.width - 16;
+    if (y + r.height > window.innerHeight - 8) y = box.top + param.point.y - r.height - 16;
+    tip.style.left = Math.max(8, x) + "px";
+    tip.style.top = Math.max(8, y) + "px";
   }
 
   computeSessionMarkers() {
@@ -1560,7 +1716,10 @@ class ChartWindow {
       try { this.chart.removeSeries(this.indSeries[id]); } catch {}
     }
     this.indSeries = {};
-    this.fillMarkers = [];
+    // Fills are not part of the snapshot; keep them across a reconnect of the
+    // SAME symbol (loadFills owns them and is throttled). A symbol change
+    // clears them.
+    if (this._fillsFor !== this.symbol) this.fillMarkers = [];
     this.signalMarkers = [];
     if (this.candleSeries) this.candleSeries.setMarkers([]);
     if (this.vwapSeries) this.vwapSeries.setData([]);
@@ -1647,6 +1806,8 @@ class ChartWindow {
       if (i >= 0) this.positions[i] = pos; else this.positions.push(pos);
     }
     this.drawPositions();
+    const d = $("tradeDrawer");
+    if (d && !d.classList.contains("hidden")) renderTradesDrawer(this);
   }
 
   updateHeader() {
@@ -1808,6 +1969,121 @@ function appendLog(rec, isError) {
 
 function toggleDrawer(id) { $(id).classList.toggle("hidden"); }
 
+/* ── positions & trades drawer ───────────────────────────────────────── */
+function tradeMode(w, sleeve) {
+  const r = (w.roster || []).find(x => x.label === sleeve);
+  return r ? r.mode : null;
+}
+
+function fmtSigned(n) {
+  if (n == null || isNaN(n)) return "—";
+  return (n >= 0 ? "+" : "") + Math.round(n).toLocaleString("en-US");
+}
+
+async function fetchRecentTrades(w) {
+  const now = Date.now();
+  if (w._perfCache && now - w._perfCacheTs < 60000) return w._perfCache;
+  try {
+    const resp = await fetch(`/api/performance?symbol=${encodeURIComponent(w.symbol)}`);
+    const data = await resp.json();
+    const all = [];
+    for (const s of data.strategies || []) {
+      for (const t of s.trade_log || []) {
+        all.push({ ...t, sleeve: s.sleeve, mode: s.mode });
+      }
+    }
+    all.sort((a, b) => parseTs(b.exit_ts) - parseTs(a.exit_ts));
+    w._perfCache = all.slice(0, 80);
+    w._perfCacheTs = now;
+    return w._perfCache;
+  } catch (e) {
+    console.error("recent trades failed", e);
+    return w._perfCache || [];
+  }
+}
+
+function renderTradesDrawer(w) {
+  const host = $("tradeBody");
+  if (!host || !w) return;
+  const last = w.candles.length ? w.candles[w.candles.length - 1].c : null;
+  const pv = pointUsd(w.symbol);
+  const pos = (w.positions || []).filter(p => (p.qty || 0) !== 0)
+    .sort((a, b) => (b.qty || 0) - (a.qty || 0) ||
+          String(a.sleeve).localeCompare(String(b.sleeve)));
+
+  let html = `<div class="tradeSection"><h4>open positions <span class="dim">${pos.length}</span></h4>`;
+  html += pos.map(p => {
+    const entry = p.avg_px != null ? p.avg_px : p.entry;
+    const qty = p.qty || 0;
+    const upnl = (entry != null && last != null) ? (last - entry) * qty * pv : null;
+    const mode = tradeMode(w, p.sleeve);
+    const cls = qty > 0 ? "long" : "short";
+    return `<div class="posRow" title="${escapeHtml(p.sleeve || "")}">
+      <span class="name">${escapeHtml(p.sleeve || "?")}</span>
+      ${mode ? `<span class="modeTag ${mode === "live" ? "live" : "paper"}">${mode === "live" ? "LIVE" : "PAPER"}</span>` : ""}
+      <span class="qty ${cls}">${qty > 0 ? "LONG" : "SHORT"} ${Math.abs(qty)}</span>
+      <span class="px">@ ${fmtPx(entry)}</span>
+      <span class="pnl ${upnl > 0 ? "up" : upnl < 0 ? "down" : ""}">${fmtSigned(upnl)}</span>
+    </div>`;
+  }).join("") || `<div class="dim">none</div>`;
+  html += `</div>`;
+
+  // Recent entry intents (the dots on the chart), newest first.
+  const sigs = (w.signalMarkers || []).slice()
+    .sort((a, b) => b.time - a.time).slice(0, 25);
+  html += `<div class="tradeSection"><h4>recent signals <span class="dim">${sigs.length}</span></h4>`;
+  html += sigs.map(s => {
+    const d = s._sig || { ts: s.time, side: s._side ? 1 : -1, qty: 0,
+                           tag: "", source: "live" };
+    const long = (d.side || 0) > 0;
+    const src = d.source === "warmup" ? "warmup" : "live";
+    return `<div class="tradeRow">
+      <span class="name">${escapeHtml(prettyTag(d.tag))}</span>
+      <span class="side ${long ? "long" : "short"}">${long ? "LONG" : "SHORT"} ${Math.abs(d.qty || 0)}</span>
+      <span class="px">@ ${fmtPx(d.px)}</span>
+      <span class="dim">${escapeHtml(fmtEt(d.ts * 1000))} · ${src}</span>
+    </div>`;
+  }).join("") || `<div class="dim">none</div>`;
+  html += `</div>`;
+
+  // Closed trades render from cache first so a refresh never flashes
+  // "loading" or loses the user's scroll position.
+  html += closedTradesHtml(w._perfCache);
+  const scroll = host.scrollTop;
+  host.innerHTML = html;
+  host.scrollTop = scroll;
+
+  if (!w._perfCache || Date.now() - w._perfCacheTs > 60000) {
+    fetchRecentTrades(w).then(trades => {
+      const sec = $("tradeClosed");
+      if (!sec) return;
+      const s = host.scrollTop;
+      sec.outerHTML = closedTradesHtml(trades);
+      host.scrollTop = s;
+    });
+  }
+}
+
+function closedTradesHtml(trades) {
+  let h = `<div class="tradeSection" id="tradeClosed"><h4>recent closed trades <span class="dim">${trades ? trades.length : "…"}</span></h4>`;
+  h += (trades || []).map(t => {
+    const mode = t.mode
+      ? `<span class="modeTag ${t.mode === "live" ? "live" : "paper"}">${t.mode === "live" ? "LIVE" : "PAPER"}</span>`
+      : "";
+    const long = t.side === "long";
+    return `<div class="tradeRow" title="${escapeHtml(t.sleeve || "")}">
+      <span class="name">${escapeHtml(t.sleeve || "")}</span>
+      ${mode}
+      <span class="side ${long ? "long" : "short"}">${long ? "LONG" : "SHORT"} ${t.qty}</span>
+      <span class="px">${fmtPx(t.entry_px)} → ${fmtPx(t.exit_px)}</span>
+      <span class="pnl ${t.pnl > 0 ? "up" : t.pnl < 0 ? "down" : ""}">${fmtSigned(t.pnl)}</span>
+      <span class="dim">${escapeHtml(fmtEt(parseTs(t.exit_ts)))}</span>
+    </div>`;
+  }).join("") || `<div class="dim">${trades ? "none" : "loading…"}</div>`;
+  h += `</div>`;
+  return h;
+}
+
 /* ── topbar button wiring ────────────────────────────────────────────── */
 $("plusBtn").addEventListener("click", () => {
   const sym = LANES[0], tf = ([...windows.values()][0]?.tf) || "5m";
@@ -1837,6 +2113,11 @@ $("indBtn").addEventListener("click", () => {
 $("logBtn").addEventListener("click", () => {
   toggleDrawer("logDrawer");
   const host = $("log"); if (host) host.scrollTop = host.scrollHeight;
+});
+$("tradeBtn").addEventListener("click", () => {
+  toggleDrawer("tradeDrawer");
+  const w = [...windows.values()][0];
+  if (w) renderTradesDrawer(w);
 });
 $("errorBadge").addEventListener("click", () => {
   toggleDrawer("logDrawer");

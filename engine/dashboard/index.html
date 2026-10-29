@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>es-engine dashboard</title>
-<link rel="stylesheet" href="/style.css?v=97">
+<link rel="stylesheet" href="/style.css?v=98">
 </head>
 <body>
 <header id="topbar">
@@ -28,6 +28,7 @@
   <button id="latestBtn" title="jump to latest candle and re-enable auto-scroll">latest</button>
   <button id="indBtn" title="toggle indicator list">indicators</button>
   <button id="logBtn" title="engine log">log</button>
+  <button id="tradeBtn" title="open positions, recent signals and closed trades">trades</button>
 </header>
 
 <main id="grid"></main>
@@ -49,11 +50,16 @@
   <header class="drawerHead">indicators <span class="hint">show / hide</span></header>
   <div id="indicators"></div>
 </section>
+<section id="tradeDrawer" class="drawer hidden">
+  <header class="drawerHead">positions &amp; trades <span class="hint">live + paper</span></header>
+  <div id="tradeBody"></div>
+</section>
 
+<div id="markerTip" class="markerTip hidden"></div>
 <div id="overlay" class="hidden"></div>
 
 <script src="/vendor/lightweight-charts.standalone.production.js"></script>
-<script src="/app.js?v=99"></script>
+<script src="/app.js?v=105"></script>
 
 </body>
 </html>

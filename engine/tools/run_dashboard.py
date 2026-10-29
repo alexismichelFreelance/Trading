@@ -477,8 +477,24 @@ class Dashboard:
         self.port = port
         self.static = dashboard_dir
         self._clients: set = set()      # writer tasks keyed by asyncio.Task
+        # The fills/performance endpoints run synchronous QuestDB + pandas
+        # work inside the engine's event loop. Without a short TTL cache a
+        # browser refresh (or a reconnect loop) starves the live engine.
+        self._cache: dict = {}          # key -> (monotonic_ts, payload)
         self.app = web.Application()
         self._add_routes()
+
+    def _cache_get(self, key, ttl: float):
+        hit = self._cache.get(key)
+        if hit is not None and (time.monotonic() - hit[0]) < ttl:
+            return hit[1]
+        return None
+
+    def _cache_put(self, key, payload) -> None:
+        # Bound the cache: these are a handful of keys per symbol.
+        if len(self._cache) > 32:
+            self._cache.clear()
+        self._cache[key] = (time.monotonic(), payload)
 
     def _add_routes(self):
         self.app.router.add_get("/", self._index)
@@ -845,12 +861,18 @@ class Dashboard:
                 return web.json_response({"error": "invalid symbol"}, status=400)
             from_str = params.get("from")
             to_str = params.get("to")
+            cache_key = ("fills", symbol, from_str or "", to_str or "")
+            hit = self._cache_get(cache_key, 30.0)
+            if hit is not None:
+                return web.json_response(hit)
             import pandas as pd
             qdb = QuestDB()
             sql = "SELECT ts, sleeve, side, qty, price, tag FROM claude_paper_fills WHERE symbol = '%s' ORDER BY ts" % symbol
             df = qdb.df(sql)
             if df.empty:
-                return web.json_response({"fills": []})
+                payload = {"fills": []}
+                self._cache_put(cache_key, payload)
+                return web.json_response(payload)
             df["ts"] = pd.to_datetime(df["ts"], utc=True)
             if from_str:
                 df = df[df["ts"] >= pd.Timestamp(from_str, tz="UTC")]
@@ -866,7 +888,9 @@ class Dashboard:
                     "price": float(r["price"]),
                     "tag": str(r["tag"]),
                 })
-            return web.json_response({"fills": fills})
+            payload = {"fills": fills}
+            self._cache_put(cache_key, payload)
+            return web.json_response(payload)
         except Exception as e:
             log.exception("fills endpoint error")
             return web.json_response({"error": str(e)}, status=500)
@@ -885,6 +909,10 @@ class Dashboard:
                 return web.json_response({"error": "invalid symbol"}, status=400)
             from_str = params.get("from")
             to_str = params.get("to")
+            cache_key = ("perf", symbol, from_str or "", to_str or "")
+            hit = self._cache_get(cache_key, 30.0)
+            if hit is not None:
+                return web.json_response(hit)
             # point_usd lookup
             point_usd = {"ES": 50.0, "NQ": 20.0, "GC": 100.0}.get(symbol, 50.0)
             import pandas as pd
@@ -892,8 +920,9 @@ class Dashboard:
             sql = f"SELECT ts, sleeve, side, qty, price, tag FROM claude_paper_fills WHERE symbol = '{symbol}' ORDER BY ts"
             df = qdb.df(sql)
             if df.empty:
-                return web.json_response({"symbol": symbol, "strategies": [],
-                                          "aggregate": {}})
+                payload = {"symbol": symbol, "strategies": [], "aggregate": {}}
+                self._cache_put(cache_key, payload)
+                return web.json_response(payload)
             df["ts"] = pd.to_datetime(df["ts"], utc=True)
             if from_str:
                 df = df[df["ts"] >= pd.Timestamp(from_str, tz="UTC")]
@@ -1028,8 +1057,10 @@ class Dashboard:
                 "max_drawdown": round(agg_dd, 2),
                 "equity": agg_points,
             }
-            return web.json_response({"symbol": symbol, "strategies": strategies,
-                                      "aggregate": aggregate})
+            payload = {"symbol": symbol, "strategies": strategies,
+                       "aggregate": aggregate}
+            self._cache_put(cache_key, payload)
+            return web.json_response(payload)
         except Exception as e:
             log.exception("performance endpoint error")
             return web.json_response({"error": str(e)}, status=500)
