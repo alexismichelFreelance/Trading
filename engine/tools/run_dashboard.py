@@ -496,7 +496,11 @@ class Dashboard:
 
     def _static_file(self, name: str):
         async def handler(request):
-            return web.FileResponse(self.static / name)
+            resp = web.FileResponse(self.static / name)
+            # The dashboard must pick up new JS/CSS on a NORMAL reload, never
+            # a hard refresh: revalidate every time.
+            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+            return resp
         return handler
 
     async def _vendor(self, request):
@@ -506,15 +510,19 @@ class Dashboard:
             p.relative_to(self.static.resolve())
         except (ValueError, OSError):
             raise web.HTTPForbidden()
-        return web.FileResponse(p)
+        resp = web.FileResponse(p)
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
 
     async def _index(self, request):
         html = (self.static / "index.html").read_text(encoding="utf-8")
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-cache, must-revalidate"})
 
     async def _performance_page(self, request):
         html = (self.static / "performance.html").read_text(encoding="utf-8")
-        return web.Response(text=html, content_type="text/html")
+        return web.Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-cache, must-revalidate"})
 
     @staticmethod
     def _lane_payload(snap, symbol: str, tf: str) -> dict:

@@ -275,6 +275,7 @@ class ChartWindow {
     this.chart.resize(cw, ch);
     this.drawZoneRects();
     this.drawSessionShading();
+    this.renderLevelLabels();
   }
 
   /* ── data ──────────────────────────────────────────────────────────── */
@@ -621,7 +622,12 @@ class ChartWindow {
     // pixels, so sit labels just to its left instead of on top of its ticks.
     let axisW = 0;
     try { axisW = this.chart.priceScale("right").width() || 0; } catch {}
+    // setProperty(..., "important") beats the stylesheet's !important rules,
+    // and the label styling is inline so a stale/cached style.css can never
+    // make labels wrap, overlap, or sit on the price axis again.
     this.levelLabels.style.setProperty("right", (axisW + 6) + "px", "important");
+    this.levelLabels.style.setProperty("width", "150px", "important");
+    this.levelLabels.style.setProperty("overflow", "visible", "important");
 
     const withPrio = (arr, prio) => (arr || []).map(l => ({ ...l, _prio: prio }));
     const labels = []
@@ -634,27 +640,33 @@ class ChartWindow {
     // Dedupe by text, then place greedily by priority. Two labels landing
     // within a line-height of each other is a collision: keep the higher
     // priority one and hide the other rather than printing an illegible pile.
+    const h = this.chartBox.getBoundingClientRect().height
+      || this.levelLabels.clientHeight || 0;
     const seen = new Set();
     const cand = [];
     for (const l of labels) {
       if (!l || seen.has(l.text)) continue;
       seen.add(l.text);
       const y = ps.priceToCoordinate(l.price);
-      if (y == null) continue;
+      if (y == null || !isFinite(y)) continue;
+      // A level outside the visible price range has no place on screen;
+      // clamping it to the top/bottom edge just piles labels up there.
+      if (h && (y < 2 || y > h - 2)) continue;
       cand.push({ ...l, y });
     }
     cand.sort((a, b) => a._prio - b._prio || a.y - b.y);
     const placed = [];
-    const GAP = 12;
+    const GAP = 13;
     for (const l of cand) {
       if (placed.some(p => Math.abs(p - l.y) < GAP)) continue;
       placed.push(l.y);
       l._placed = true;
     }
-    const h = this.levelLabels.clientHeight || this.chartBox.clientHeight || 0;
+    const LABEL_STYLE = "position:absolute;right:2px;font-size:10px;line-height:12px;" +
+      "white-space:nowrap;padding:0 3px;border-radius:3px;background:rgba(11,14,20,0.72);";
     this.levelLabels.innerHTML = cand.filter(l => l._placed).map(l => {
       const top = Math.max(0, Math.min(l.y - 8, h - 14));
-      return `<div class="levelLabel" style="position:absolute;right:2px;top:${top}px;color:${l.color};">${escapeHtml(l.text)}</div>`;
+      return `<div class="levelLabel" style="${LABEL_STYLE}top:${top}px;color:${l.color};">${escapeHtml(l.text)}</div>`;
     }).join("");
   }
 
