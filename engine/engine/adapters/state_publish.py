@@ -256,11 +256,25 @@ class StatePublisher:
         # last week's chart -- and where the seeded history and the replay
         # cover the same minute, two different values at one timestamp, which
         # is exactly what the chart library rejects (blank series).
-        if bar_ts >= self.store.indicator_floor(sym):
-            for ind in indicators_from_levelbook(src.levelbook, bar_ts):
-                d = self.store.apply_indicator(sym, ind)
-                if d is not None:
-                    self.broadcast(d)
+        floor = self.store.indicator_floor(sym)
+        for ind in indicators_from_levelbook(src.levelbook, bar_ts):
+            # Static level series (pivots, gamma walls) are stamped at the
+            # SESSION ts, not at bar_ts. The replay guard (which checks
+            # bar_ts against the floor) must not gate them, otherwise a
+            # replayed bar older than the floor suppresses the session's
+            # pivot/gamma publication forever and the chart loses them.
+            is_static = ("pivot" in (ind.get("producer") or "")
+                         or "gamma_levels" in (ind.get("producer") or ""))
+            if (not is_static) and bar_ts < floor:
+                log.debug("REPLAY GUARD: bar_ts=%d < floor=%d for %s, skipping %s",
+                          bar_ts, floor, sym, ind["id"])
+                continue
+            d = self.store.apply_indicator(sym, ind)
+            if d is not None:
+                log.info("PUBLISH indicator %s for %s (%d pts)", ind["id"], sym, len(ind.get("points", [])))
+                self.broadcast(d)
+            else:
+                log.debug("SKIP indicator %s for %s (no new points)", ind["id"], sym)
         price = bar["c"]
         gm = gamma_map_from(src.gamma_curve, src.levelbook, price)
         d = self.store.apply_gamma(sym, gm)

@@ -487,6 +487,7 @@ class Dashboard:
         self.app.router.add_get("/history", self._history)
         self.app.router.add_get("/api/performance", self._performance)
         self.app.router.add_get("/api/fills", self._fills)
+        self.app.router.add_get("/api/debug/store", self._debug_store)
         # serve the vendored lib + app + styles verbatim
         for name in ("app.js", "performance.js", "style.css",
                      "vendor/lightweight-charts.standalone.production.js"):
@@ -1024,6 +1025,21 @@ class Dashboard:
         except Exception as e:
             log.exception("performance endpoint error")
             return web.json_response({"error": str(e)}, status=500)
+
+    async def _debug_store(self, request):
+        """Debug: show what the store currently holds."""
+        snap = self.pub.snapshot()
+        lanes = {}
+        for sym, l in snap.get("lanes", {}).items():
+            lanes[sym] = {
+                "indicators": [{"id": i["id"], "n_points": len(i.get("points", [])),
+                                "producer": i.get("producer")} for i in l.get("indicators", [])],
+                "gamma": l.get("gamma"),
+                "n_zones": len(l.get("zones", [])),
+                "n_positions": len(l.get("positions", [])),
+                "n_bars": len(l.get("bars_raw", [])),
+            }
+        return web.json_response({"lanes": lanes, "seq": snap.get("seq", 0)})
 
     async def run(self):
         runner = web.AppRunner(self.app)
