@@ -239,8 +239,8 @@ body.grid2up main#grid { grid-template-columns: 1fr 1fr; }
 .markerTip .mtRow { white-space: nowrap; }
 .markerTip .mtRow + .mtRow { margin-top: 1px; }
 .markerTip .mtTag { font-weight: 700; }
-.markerTip .mtTag.up { color: var(--green); }
-.markerTip .mtTag.down { color: var(--red); }
+.markerTip .mtTag.up, .markerTip .up { color: var(--green); }
+.markerTip .mtTag.down, .markerTip .down { color: var(--red); }
 .markerTip .dim { color: var(--muted); }
 
 /* ── positions & trades drawer ────────────────────────────────────── */

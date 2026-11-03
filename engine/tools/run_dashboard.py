@@ -66,6 +66,7 @@ import asyncio
 import json
 import logging
 import math
+import mimetypes
 import random
 import sys
 import time
@@ -85,11 +86,36 @@ from engine.features.level_book import LevelBook                     # noqa: E40
 from engine.painters import ZoneView                                 # noqa: E402
 
 from engine.adapters.questdb import QuestDB  # noqa: E402
+from engine.core.config import load_instruments, root_symbol  # noqa: E402
 from engine.features.bars import BarAggregator  # noqa: E402
 from engine.adapters.state_sources import indicators_from_levelbook  # noqa: E402
 
 log = logging.getLogger("engine.dashboard")
 NS = 1_000_000_000
+
+# Contract multipliers for the fill P&L shown on hover. Read from the same
+# instruments.yaml the engine uses; root_symbol handles contract-month
+# symbols such as ESH6 -> ES.
+try:
+    _INSTRUMENTS = load_instruments(ROOT / "config" / "instruments.yaml")
+except Exception:                                     # noqa: BLE001
+    _INSTRUMENTS = {}
+
+
+def _point_usd(symbol: str) -> float:
+    root = root_symbol(symbol or "", known=_INSTRUMENTS)
+    spec = _INSTRUMENTS.get(root)
+    return float(spec.point_usd) if spec is not None else 50.0
+
+# Every UI asset is served with these headers. FileResponse sets ETag and
+# Last-Modified lazily in prepare(), AFTER the handler body runs, so deleting
+# them there never worked -- the browser kept revalidating and getting 304s.
+# Returning a plain Response means neither header exists at all.
+_NO_CACHE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 # The engine aggregates a broad set so ANY window can pick; we never hardcode
 # the client to 1m. Order matters for the picker.
@@ -503,20 +529,17 @@ class Dashboard:
         self.app.router.add_get("/history", self._history)
         self.app.router.add_get("/api/performance", self._performance)
         self.app.router.add_get("/api/fills", self._fills)
-        self.app.router.add_get("/api/debug/store", self._debug_store)
         # serve the vendored lib + app + styles verbatim
-        for name in ("app.js", "performance.js", "style.css",
-                     "vendor/lightweight-charts.standalone.production.js"):
+        for name in ("app.js", "performance.js", "style.css"):
             self.app.router.add_get(f"/{name}", self._static_file(name))
         self.app.router.add_get("/vendor/{f}", self._vendor)
 
     def _static_file(self, name: str):
         async def handler(request):
-            resp = web.FileResponse(self.static / name)
-            # The dashboard must pick up new JS/CSS on a NORMAL reload, never
-            # a hard refresh: revalidate every time.
-            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
-            return resp
+            body = (self.static / name).read_bytes()
+            ctype, _ = mimetypes.guess_type(name)
+            return web.Response(body=body, content_type=ctype or "application/octet-stream",
+                                headers=_NO_CACHE)
         return handler
 
     async def _vendor(self, request):
@@ -526,19 +549,26 @@ class Dashboard:
             p.relative_to(self.static.resolve())
         except (ValueError, OSError):
             raise web.HTTPForbidden()
-        resp = web.FileResponse(p)
-        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
-        return resp
+        body = p.read_bytes()
+        ctype, _ = mimetypes.guess_type(p.name)
+        return web.Response(body=body,
+                            content_type=ctype or "application/octet-stream",
+                            headers=_NO_CACHE)
 
     async def _index(self, request):
         html = (self.static / "index.html").read_text(encoding="utf-8")
+        # The ?v= value changes whenever app.js/style.css change, so even a
+        # proxy that ignores no-store cannot hand back an old bundle.
+        ver = int(max((self.static / "app.js").stat().st_mtime,
+                      (self.static / "style.css").stat().st_mtime))
+        html = html.replace("__ASSET_VERSION__", str(ver))
         return web.Response(text=html, content_type="text/html",
-                            headers={"Cache-Control": "no-cache, must-revalidate"})
+                            headers=_NO_CACHE)
 
     async def _performance_page(self, request):
         html = (self.static / "performance.html").read_text(encoding="utf-8")
         return web.Response(text=html, content_type="text/html",
-                            headers={"Cache-Control": "no-cache, must-revalidate"})
+                            headers=_NO_CACHE)
 
     @staticmethod
     def _lane_payload(snap, symbol: str, tf: str) -> dict:
@@ -577,7 +607,13 @@ class Dashboard:
 
     async def _ws(self, request):
         ws = web.WebSocketResponse(heartbeat=30)
-        await ws.prepare(request)
+        # A tab can be closed/reloaded while the upgrade is still in flight.
+        # aiohttp then raises ClientConnectionResetError from prepare(); that is
+        # a normal disconnect, not a server error, so don't dump a traceback.
+        try:
+            await ws.prepare(request)
+        except (ConnectionResetError, asyncio.CancelledError):
+            return ws
         symbol = request.query.get("symbol", "")
         tf = request.query.get("tf", "5m")
         sym_ok = symbol in self.lanes
@@ -742,8 +778,8 @@ class Dashboard:
 
     async def _history(self, request):
         """Return historical bars/indicators for a symbol/timeframe.
-        Query params: symbol (required), tf (required, e.g., '5m'), start (epoch ms, optional),
-        end (epoch ms, optional), limit (int, optional, default 5000).
+        Query params: symbol (required), tf (required, e.g., '5m'), start (epoch seconds, optional),
+        end (epoch seconds, optional), limit (int, optional, default 1200).
         If start/end omitted, returns the most recent `limit` bars.
         Returns JSON: {bars:{tf:[...]}, indicators:[...], zones:[], positions:[]}
         """
@@ -765,22 +801,42 @@ class Dashboard:
             if not _re.fullmatch(r'[A-Z]{1,6}(\.[A-Z]{1,3})?', symbol):
                 raise ValueError("Invalid symbol")
             limit = min(limit, 5000)
-            # DB ts is epoch MICROSECONDS; start/end arrive as epoch seconds.
-            NS = 1_000_000
+            # QuestDB compares a TIMESTAMP column against an integer literal
+            # WITHOUT raising: the predicate is silently dropped and the query
+            # degenerates into a full-table sort (which then read-times-out).
+            # Always pass the boundary as an ISO timestamp string instead.
+            from datetime import datetime, timezone
+
+            def _iso(epoch_s: int) -> str:
+                return datetime.fromtimestamp(
+                    int(epoch_s), tz=timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
             _reverse = True
+            # QuestDB only uses a partition/interval scan when BOTH ends of the
+            # timestamp range are bounded. A bare `ORDER BY ts DESC LIMIT n`
+            # (or a one-sided bound) degenerates into a full scan+sort of the
+            # whole table -- measured >30 s against claude_bars_live, which
+            # timed out every chart request. 400 days comfortably covers the
+            # newest N bars even across long recorder gaps.
+            lookback_s = 400 * 86_400
             if start is not None and end is not None:
-                sql = (f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
-                       f"WHERE symbol = '{symbol}' AND ts >= {int(start)} * {NS} "
-                       f"AND ts <= {int(end)} * {NS} ORDER BY ts")
+                lo, hi = _iso(start), _iso(end)
                 _reverse = False
             elif end is not None:
-                # scroll-back: bars OLDER than `end`
-                sql = (f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
-                       f"WHERE symbol = '{symbol}' AND ts < {int(end)} * {NS} "
-                       f"ORDER BY ts DESC LIMIT {limit}")
+                lo, hi = _iso(int(end) - lookback_s), _iso(end)
             else:
-                sql = f"SELECT ts, o, h, l, c, vol FROM claude_bars_live WHERE symbol = '{symbol}' ORDER BY ts DESC LIMIT {limit}"
-            df = qdb.df(sql)
+                _now = int(datetime.now(timezone.utc).timestamp())
+                lo, hi = _iso(_now - lookback_s), _iso(_now)
+            if _reverse:
+                sql = (f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
+                       f"WHERE symbol = '{symbol}' AND ts >= '{lo}' "
+                       f"AND ts <= '{hi}' ORDER BY ts DESC LIMIT {limit}")
+            else:
+                sql = (f"SELECT ts, o, h, l, c, vol FROM claude_bars_live "
+                       f"WHERE symbol = '{symbol}' AND ts >= '{lo}' "
+                       f"AND ts <= '{hi}' ORDER BY ts")
+            df = await asyncio.to_thread(qdb.df, sql)
             if df.empty:
                 return web.json_response({"bars": {tf: []}, "indicators": [], "zones": [], "positions": []})
             # a range window can reach the 2026-09-29..10-02 block where the
@@ -801,16 +857,24 @@ class Dashboard:
                 "v": float(r.vol),
             } for r in (df.iloc[::-1].itertuples() if _reverse else df.itertuples())]
 
-            # compute VWAP indicator series using the engine's AnchoredVWAP,
-            # reset per Globex session (matches the live lane's VWAP).
-            from engine.features.level_book import LevelBook
-            lb = LevelBook()
+            # compute VWAP indicator series using the SAME per-Globex-session
+            # anchoring as the live lane, but with AnchoredVWAP directly
+            # instead of a whole LevelBook. LevelBook.on_bar also runs the
+            # pivot trackers, the 30m aggregator, the zone detector and the
+            # zone book, which cost ~2.2 s for 2000 bars here and were only
+            # needed for their side effects, not for VWAP.
+            from engine.features.avwap import AnchoredVWAP
+            from engine.core.timeutil import et_globex_session_date
+            vwap = AnchoredVWAP()
+            _vsess = None
             vwap_points = []
             for b in bars_raw:
-                bar = Bar(b["ts"], "1m", b["o"], b["h"], b["l"], b["c"],
-                          int(b["v"]), symbol)
-                lb.on_bar(bar)
-                v = lb.vwap.value
+                gkey = et_globex_session_date(b["ts"])
+                if gkey != _vsess:
+                    vwap.reset(b["ts"])
+                    _vsess = gkey
+                vwap.add(b["c"], b["v"])
+                v = vwap.value
                 if v == v:                      # not NaN
                     vwap_points.append({"ts": b["ts"], "v": round(float(v), 4)})
             indicators = [{
@@ -868,26 +932,71 @@ class Dashboard:
             import pandas as pd
             qdb = QuestDB()
             sql = "SELECT ts, sleeve, side, qty, price, tag FROM claude_paper_fills WHERE symbol = '%s' ORDER BY ts" % symbol
-            df = qdb.df(sql)
+            df = await asyncio.to_thread(qdb.df, sql)
             if df.empty:
                 payload = {"fills": []}
                 self._cache_put(cache_key, payload)
                 return web.json_response(payload)
             df["ts"] = pd.to_datetime(df["ts"], utc=True)
+            # P&L must be computed over the FULL per-sleeve history, then the
+            # requested window is cut out of the annotated rows. Computing it
+            # after the window would treat the first fill in the window as a
+            # fresh entry and report the wrong realized number.
+            point_usd = _point_usd(symbol)
+            mode_map = {}
+            try:
+                for _lsym, src in getattr(self.pub, "lanes", {}).items():
+                    for s in getattr(src, "strategies", []) or []:
+                        lbl = getattr(s, "label", "") or type(s).__name__
+                        mode_map[lbl] = getattr(s, "mode", "paper")
+            except Exception:                         # noqa: BLE001
+                pass
+            annotated = []
+            for sleeve, g in df.groupby("sleeve"):
+                g = g.sort_values("ts")
+                pos = 0
+                avg = 0.0
+                for _, r in g.iterrows():
+                    side = int(r["side"])
+                    qty = int(r["qty"])
+                    price = float(r["price"])
+                    realized = 0.0
+                    if pos == 0:
+                        pos = side * qty
+                        avg = price
+                    elif (pos > 0 and side > 0) or (pos < 0 and side < 0):
+                        new_pos = pos + side * qty
+                        avg = (avg * abs(pos) + price * qty) / abs(new_pos)
+                        pos = new_pos
+                    else:
+                        close_qty = min(qty, abs(pos))
+                        realized = ((price - avg) if pos > 0 else (avg - price)) \
+                            * close_qty * point_usd
+                        pos += side * qty
+                        if pos == 0:
+                            avg = 0.0
+                        elif (pos > 0 and side > 0) or (pos < 0 and side < 0):
+                            avg = price          # flipped: remainder opens here
+                    annotated.append({
+                        "ts": int(pd.Timestamp(r["ts"]).timestamp() * 1e9),
+                        "sleeve": str(sleeve),
+                        "side": side,
+                        "qty": qty,
+                        "price": price,
+                        "tag": str(r["tag"]),
+                        "pnl": round(realized, 2),
+                        "pos_after": int(pos),
+                        "mode": mode_map.get(str(sleeve), "paper"),
+                    })
+            fills = annotated
             if from_str:
-                df = df[df["ts"] >= pd.Timestamp(from_str, tz="UTC")]
+                cutoff = pd.Timestamp(from_str, tz="UTC").timestamp() * 1e9
+                fills = [f for f in fills if f["ts"] >= cutoff]
             if to_str:
-                df = df[df["ts"] <= pd.Timestamp(to_str, tz="UTC") + pd.Timedelta(days=1)]
-            fills = []
-            for _, r in df.iterrows():
-                fills.append({
-                    "ts": int(pd.Timestamp(r["ts"]).timestamp() * 1e9),
-                    "sleeve": str(r["sleeve"]),
-                    "side": int(r["side"]),
-                    "qty": int(r["qty"]),
-                    "price": float(r["price"]),
-                    "tag": str(r["tag"]),
-                })
+                cutoff = (pd.Timestamp(to_str, tz="UTC")
+                          + pd.Timedelta(days=1)).timestamp() * 1e9
+                fills = [f for f in fills if f["ts"] <= cutoff]
+            fills.sort(key=lambda f: f["ts"])
             payload = {"fills": fills}
             self._cache_put(cache_key, payload)
             return web.json_response(payload)
@@ -918,7 +1027,7 @@ class Dashboard:
             import pandas as pd
             qdb = QuestDB()
             sql = f"SELECT ts, sleeve, side, qty, price, tag FROM claude_paper_fills WHERE symbol = '{symbol}' ORDER BY ts"
-            df = qdb.df(sql)
+            df = await asyncio.to_thread(qdb.df, sql)
             if df.empty:
                 payload = {"symbol": symbol, "strategies": [], "aggregate": {}}
                 self._cache_put(cache_key, payload)
@@ -1064,21 +1173,6 @@ class Dashboard:
         except Exception as e:
             log.exception("performance endpoint error")
             return web.json_response({"error": str(e)}, status=500)
-
-    async def _debug_store(self, request):
-        """Debug: show what the store currently holds."""
-        snap = self.pub.snapshot()
-        lanes = {}
-        for sym, l in snap.get("lanes", {}).items():
-            lanes[sym] = {
-                "indicators": [{"id": i["id"], "n_points": len(i.get("points", [])),
-                                "producer": i.get("producer")} for i in l.get("indicators", [])],
-                "gamma": l.get("gamma"),
-                "n_zones": len(l.get("zones", [])),
-                "n_positions": len(l.get("positions", [])),
-                "n_bars": len(l.get("bars_raw", [])),
-            }
-        return web.json_response({"lanes": lanes, "seq": snap.get("seq", 0)})
 
     async def run(self):
         runner = web.AppRunner(self.app)

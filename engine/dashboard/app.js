@@ -179,6 +179,8 @@ class ChartWindow {
       crosshair: { mode: 0 },
       timeScale: { visible: true, timeVisible: true, secondsVisible: false,
                    borderColor: "#232c3b", rightOffset: 3 },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+      handleScale: { mouseWheel: true, pinch: true },
       rightPriceScale: { borderColor: "#232c3b" },
       autoSize: false,
       width: 0, height: 0,
@@ -353,6 +355,8 @@ class ChartWindow {
     this.volSeries.setData(vd);
     this.computeSessionMarkers();
     this.applyMarkers();
+    const cc = document.getElementById("candleCount");
+    if (cc) cc.textContent = "candles: " + this.candles.length;
   }
 
   updateBar(b) {
@@ -1208,7 +1212,9 @@ class ChartWindow {
       text: (side ? "B " : "S ") + String(f.tag || "").slice(0, 12),
       _fill: { ts: sec(ts), side: side ? 1 : -1, qty: Math.abs(f.size || 0),
                price: f.price, sleeve: f.sleeve || "", tag: f.tag || "",
-               symbol: f.symbol || this.symbol } });
+               symbol: f.symbol || this.symbol,
+               mode: f.mode || "", pnl: f.pnl ?? null,
+               pos_after: f.pos_after ?? null } });
     this.applyMarkers();
   }
   async loadFills() {
@@ -1224,7 +1230,7 @@ class ChartWindow {
     try {
       // Hour-rounded so the server's 30s TTL cache can actually hit.
       const from = new Date(
-        Math.floor((Date.now() - 3 * 86400e3) / 3600e3) * 3600e3)
+        Math.floor((Date.now() - 30 * 86400e3) / 3600e3) * 3600e3)
         .toISOString().replace("Z", "+00:00");
       const resp = await fetch(`/api/fills?symbol=${encodeURIComponent(key)}` +
                                `&from=${encodeURIComponent(from)}`);
@@ -1245,10 +1251,13 @@ class ChartWindow {
           position: side ? "belowBar" : "aboveBar",
           color: side ? "#26a69a" : "#ef5350",
           shape: side ? "arrowUp" : "arrowDown",
-          text: (side ? "B " : "S ") + (f.tag || "").slice(0, 12),
+          size: 2,
+          text: (side ? "BUY " : "SELL ") + Math.abs(f.qty || 0),
           _fill: { ts: t, side: f.side, qty: Math.abs(f.qty || 0),
                    price: f.price, sleeve: f.sleeve || "",
-                   tag: f.tag || "", symbol: f.symbol || this.symbol },
+                   tag: f.tag || "", symbol: f.symbol || this.symbol,
+                   mode: f.mode || "", pnl: f.pnl ?? null,
+                   pos_after: f.pos_after ?? null },
         });
       }
       this.applyMarkers();
@@ -1294,7 +1303,7 @@ class ChartWindow {
     const lastTs = sec(c[c.length - 1].ts);
     // Window by TIME (last ~500 bars or 2 sessions), never a flat count: a
     // signal history spanning days must not be drawn on today's chart.
-    const cutoff = Math.max(g0, lastTs - Math.max(step * 500, 2 * 86400));
+    const cutoff = g0;
     const keep = (m) => m && m.time >= cutoff;
 
     // Hover index: every event that lands on a bar, including events that the
@@ -1371,7 +1380,13 @@ class ChartWindow {
     for (const f of info.fills) {
       const buy = (f.side || 0) > 0;
       const who = f.sleeve ? escapeHtml(f.sleeve) : escapeHtml(prettyTag(f.tag));
-      rows.push(`<div class="mtRow"><span class="mtTag ${buy ? "up" : "down"}">${buy ? "BUY" : "SELL"}</span> ${Math.abs(f.qty || 0)} @ ${fmtPx(f.price)} <span class="dim">${who}</span></div>`);
+      const meta = [];
+      if (f.mode) meta.push(escapeHtml(f.mode));
+      if (f.pnl != null && Math.abs(f.pnl) >= 0.005) {
+        meta.push(`PnL <span class="${f.pnl > 0 ? "up" : "down"}">${f.pnl > 0 ? "+" : ""}$${fmtPx(f.pnl)}</span>`);
+      }
+      if (f.pos_after != null) meta.push(`pos ${f.pos_after > 0 ? "+" : ""}${f.pos_after}`);
+      rows.push(`<div class="mtRow"><span class="mtTag ${buy ? "up" : "down"}">${buy ? "BUY" : "SELL"}</span> ${Math.abs(f.qty || 0)} @ ${fmtPx(f.price)} <span class="dim">${who}${meta.length ? " · " + meta.join(" · ") : ""}</span></div>`);
     }
     tip.innerHTML = rows.join("");
     tip.classList.remove("hidden");
@@ -1610,7 +1625,7 @@ class ChartWindow {
     const url = `/history?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(tf)}&end=${endSec}&limit=2000`;
     try {
       const resp = await fetch(url);
-      if (!resp.ok) { this._loadingHistory = false; return; }
+      if (!resp.ok) { console.error("loadOlder: not ok", resp.status); this._loadingHistory = false; return; }
       const data = await resp.json();
       const newBars = (data.bars && (data.bars[tf] || data.bars)) || [];
       if (!Array.isArray(newBars) || !newBars.length) { this._noMoreHistory = true; this._loadingHistory = false; return; }
@@ -1626,6 +1641,12 @@ class ChartWindow {
       this.candleSeries.setData(cd);
       const vd = this.candles.map(b => ({ time: sec(b.ts), value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0, color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)" }));
       this.volSeries.setData(vd);
+      // scroll to show the newly loaded bars, offset a few bars past the
+      // left edge so this range change does not immediately trigger another
+      // auto-load (maybeLoadOlder fires within 2 bar-spans of the first bar).
+      const _step = this.gridStep() || 300;
+      const _from = sec(this.candles[0].ts) + 3 * _step;
+      this.chart.timeScale().setVisibleRange({ from: _from, to: _from + 50 * _step });
       // merge VWAP points from history (snap to candle grid)
       const newInds = data.indicators || [];
       for (const ind of newInds) {
@@ -1737,8 +1758,25 @@ class ChartWindow {
 
   applySnapshot(msg) {
     const p = msg.payload || {};
+    // Preserve older bars loaded via scroll-back. The snapshot only carries
+    // the seeded window; overwriting would discard everything loadOlder
+    // fetched and make scrolling appear to do nothing.
+    const _prevCandles = this.candles.slice();
     this.resetForSnapshot();
     this.setCandles(p.bars || []);
+    if (_prevCandles.length > this.candles.length) {
+      const seen = new Set(this.candles.map(c => c.ts));
+      const older = _prevCandles.filter(c => !seen.has(c.ts));
+      if (older.length) {
+        older.sort((a, b) => a.ts - b.ts);
+        this.candles = older.concat(this.candles);
+        const cd = this.candles.map(b => ({ time: sec(b.ts), open: b.o, high: b.h, low: b.l, close: b.c }));
+        this.candleSeries.setData(cd);
+        const vd = this.candles.map(b => ({ time: sec(b.ts), value: (typeof b.v === 'number' && !isNaN(b.v)) ? b.v : 0, color: b.o <= b.c ? "rgba(38,166,154,0.55)" : "rgba(239,83,80,0.55)" }));
+        this.volSeries.setData(vd);
+        this.applyMarkers();
+      }
+    }
     for (const ind of p.indicators || []) { try { this.upsertIndicatorSnapshot(ind); } catch (e) { console.error("upsertIndicator failed", ind.id, e); } }
     try { this.renderGamma(p.gamma); } catch (e) { console.error("renderGamma failed", e); }
     try { this.setRoster(p.strategies_roster || []); } catch (e) { console.error("setRoster failed", e); }
@@ -1761,7 +1799,7 @@ class ChartWindow {
       try {
         const cd = this.candles.map(b => ({ time: sec(b.ts) }));
         const dataLen = cd.length;
-        const viewSize = 300;
+        const viewSize = 50;
         if (dataLen > viewSize) {
           const step = this.gridStep();
           const lastT = cd[cd.length - 1].time;
@@ -1857,7 +1895,6 @@ function addWindow(symbol, tf) {
   const container = $("grid");
   const w = new ChartWindow("w" + (++windowCounter), symbol, tf, container);
   windows.set(w.id, w);
-  window.__chartWin = w;   // debug/testing hook
   w.connect();
   updateGrid();
   return w;
@@ -2118,6 +2155,21 @@ $("tradeBtn").addEventListener("click", () => {
   toggleDrawer("tradeDrawer");
   const w = [...windows.values()][0];
   if (w) renderTradesDrawer(w);
+});
+$("scrollLeftBtn").addEventListener("click", function() {
+  var w = [...windows.values()][0];
+  var cc = document.getElementById("candleCount");
+  if (!w) { if (cc) cc.textContent = "no window"; return; }
+  if (cc) cc.textContent = "loading...";
+  var timeout = setTimeout(function() { if (cc) cc.textContent = "TIMEOUT"; }, 10000);
+  w.loadOlder().then(function() {
+    clearTimeout(timeout);
+    if (cc) cc.textContent = "candles: " + w.candles.length;
+  }).catch(function(e) { clearTimeout(timeout); if (cc) cc.textContent = "error: " + e; });
+});
+$("scrollRightBtn").addEventListener("click", () => {
+  const w = [...windows.values()][0];
+  if (w) { w.goToLatest(); w.renderLevelLabels(); }
 });
 $("errorBadge").addEventListener("click", () => {
   toggleDrawer("logDrawer");

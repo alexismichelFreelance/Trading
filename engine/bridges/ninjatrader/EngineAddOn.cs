@@ -115,8 +115,9 @@ namespace NinjaTrader.NinjaScript
                 // or resolves to a live master that OWNS no 1m bar history
                 // (ES -> works, but the date-anchored BarsRequest returns 0).
                 // In both cases the real minute history lives on the FRONT
-                // contract, the object `{symbol} 12-26` names (measured:
-                // NQ 12-26 backfilled 13800 1m bars while bare ES returned 0).
+                // contract, resolved dynamically from the nearest future
+                // expiry (measured: NQ front month backfilled 13800 1m bars
+                // while bare ES returned 0).
                 // Request the bars from that contract while keeping the lane on
                 // the bare `symbol`: FindSub routes live trades through
                 // MasterInstrument.Name, so the bare-name lane still receives
@@ -126,14 +127,27 @@ namespace NinjaTrader.NinjaScript
                 Instrument reqInst = inst;
                 if (inst == null || bareMaster)
                 {
-                    string contractSymbol = symbol + " 12-26";
-                    Instrument front = Instrument.GetInstrument(contractSymbol);
-                    if (front != null)
+                    // Resolve the FRONT contract dynamically -- never hardcode a
+                    // month/year. Try contract months starting from the current
+                    // month going forward; the first one NT8 can resolve with an
+                    // expiry in the future is the front month. Works for every
+                    // instrument and every roll without editing this file.
+                    Instrument front = null;
+                    DateTime now = DateTime.Now;
+                    for (int off = 0; off < 13 && front == null; off++)
                     {
-                        reqInst = front;
-                        RLog("Resolved contract: " + contractSymbol +
-                             (bareMaster ? " (master->front for history)" : ""));
+                        DateTime cand = now.AddMonths(off);
+                        string contractSymbol = symbol + " " + cand.Month.ToString("00") + "-" + (cand.Year % 100).ToString("00");
+                        Instrument c = Instrument.GetInstrument(contractSymbol);
+                        if (c != null && (c.Expiry == DateTime.MinValue || c.Expiry >= now.Date))
+                        {
+                            front = c;
+                            RLog("Resolved contract: " + contractSymbol +
+                                 (bareMaster ? " (master->front for history)" : ""));
+                        }
                     }
+                    if (front != null)
+                        reqInst = front;
                 }
                 if (reqInst == null) { RLog("subscribe: NO INSTRUMENT for '" + symbol + "'"); return; }
                 lock (subsLock)

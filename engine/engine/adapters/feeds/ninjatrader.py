@@ -61,8 +61,6 @@ class NinjaTraderFeed:
                  symbol: str = "ES", symbols: list[str] | None = None,
                  emit_depth: bool = False) -> None:
         self.host, self.port = host, port
-        print(f"NinjaTraderFeed.__init__: host={host} port={port}", flush=True)
-        logging.warning(f"NinjaTraderFeed.__init__: host={host} port={port}")
         self.symbol = symbol
         self.symbols = list(symbols) if symbols else []
         self.emit_depth = emit_depth
@@ -93,7 +91,6 @@ class NinjaTraderFeed:
                 line = raw.decode().strip()
                 if not line:
                     continue
-                print(f"NinjaTraderFeed got line: {line[:100]}", flush=True)
                 try:
                     ev = decode_market(json.loads(line), self._default_sym)
                 except (json.JSONDecodeError, KeyError, ValueError) as ex:
@@ -102,6 +99,16 @@ class NinjaTraderFeed:
                 if ev is None:
                     continue
                 sym = ev.symbol
+                # PER-LANE FILTER. The chartless EngineAddOn broadcasts EVERY
+                # subscribed symbol to EVERY connected market client (one
+                # RelayChannel, all clients). Per-lane mode opens one socket per
+                # lane on the same port, so without this each lane would ingest
+                # BOTH symbols: duplicate bars, double-counted BookFlow, and two
+                # copies of every strategy decision. Demux mode (`symbols=[...]`)
+                # is the one feed that legitimately owns several symbols, so the
+                # filter is disabled there.
+                if self.symbol and not self.symbols and sym and sym != self.symbol:
+                    continue
                 agg = aggs.get(sym)
                 if agg is None:                      # auto-register this lane
                     agg = aggs[sym] = BookFlowAggregator()

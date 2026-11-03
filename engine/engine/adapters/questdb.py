@@ -9,7 +9,7 @@ from __future__ import annotations
 import httpx
 import pandas as pd
 
-DEFAULT_URL = "http://localhost:9000"
+DEFAULT_URL = "http://127.0.0.1:9000"
 
 
 def _to_df(payload: dict) -> pd.DataFrame:

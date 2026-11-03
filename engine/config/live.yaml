@@ -155,3 +155,16 @@ instruments:
     # dipbuy dropped: it is not in ALL_LABELS and produced no fills in the replay.
     paper: "zones,zones_15m,zones_gap,pivot,opendrive_2p24,trendjoin,trendjoin_gex,trendjoin_narrow,trendjoin_pb8,trendjoin_scale100,ibs,rsi2,dip3"
     live: "zones,zones_15m,zones_gap,opendrive_2p24,trendjoin_gex"
+  GC:
+    market_port: 37301
+    broker_port: 37302
+    draw_port: 36024
+    capture_depth: false
+    # RECORDING-FIRST. GC has no calibrated trend_join / HMM / gex config in
+    # instruments.yaml (only point_usd + tick), so the ES-scaled sleeves do
+    # not belong here. The zones family is the one that is price-relative
+    # (range vs its own 20-bar average) and already replicates across ES/NQ.
+    # live is empty: this lane RECORDS and paper-trades, it never routes an
+    # order to the broker. Promote a sleeve only after its own replay.
+    paper: "zones,zones_15m,zones_gap"
+    live: ""

@@ -1,36 +1,27 @@
-"""Pivot periods are the ET CALENDAR DAY, matched to the user's NT8 indicator.
+"""Pivot periods are the GLOBEX FUTURES SESSION, matched to the user's NT8
+Pivots indicator.
 
-Settled empirically on 2026-08-11 rather than by reading a docstring. The user's
-chart showed PP 7779.44; candidates built from the recorded traded contract:
+A session opens at 18:00 ET and runs to 17:00 ET the next day, so the D key is
+the date the session OPENED: a bar at 02:00 or 10:00 ET belongs to the prior
+evening's session, and a bar at 18:00 ET or later starts a new one. Weekly and
+monthly keys stay calendar-based.
 
-    00:00 -> 24:00 ET   H 7798.00  L 7764.50  C 7775.75  ->  7779.42   MATCH
-    18:00 -> 17:00 ET (Globex)                           ->  7778.92
-    09:30 -> 16:00 ET (RTH)                              ->  7778.83
-    prior week                                           ->  7715.42
-    July                                                 ->  7503.50
+HISTORY, because this cost wrong turns:
 
-The 0.02 is rounding of the thirds. The value that discriminates is the LOW --
-7764.50, not the 7763.00 overnight print, which falls outside a
-midnight-to-midnight day. Weekly and monthly are ruled out by 64 and 276 points.
+  * The class once used et_session_date -- ET midnight -- and this file pinned
+    that boundary after a 2026-08-10 sample matched the chart at
+    midnight-to-midnight. It is the wrong key for an NT8 Pivots indicator on a
+    Globex template: NT8 rolls at 18:00 ET while the engine rolled at midnight,
+    so from midnight until the next 18:00 the engine's "prior" session already
+    contained the evening/overnight prints NT8 still counted in the live one.
+  * An RTH-only boundary was also tried; it moved the grid a median 7.42
+    points off and is kept only as an opt-in.
+  * What was genuinely broken in that episode was the SEED: the grid was
+    primed from Yahoo ES=F, a continuous 24-hour series, i.e. the wrong
+    instrument. That fix stands.
 
-Their NT8 settings: Standard pivots, D+W+M ranges, calculation mode "intraday
-data" -- so NT8 aggregates the chart's own bars over the session its Trading
-Hours template defines, and that template is producing calendar days.
-
-HISTORY, because this cost two wrong turns:
-
-  * The class docstring says "prior RTH session" and SessionLevels.update_bar
-    does filter to RTH, so on 2026-08-10 I filtered MultiPivots to match. That
-    moved the grid a MEDIAN 7.42 POINTS off the chart (max 24.42) across 39
-    sessions. The docstring was wrong; et_session_date -- which rolls at ET
-    midnight -- was right all along.
-  * I then inferred a Globex (18:00 ET) boundary from the fact that the user's
-    chart displays pre-open bars. Also wrong, by 0.52.
-
-What was genuinely broken was never the boundary: it was the SEED. The grid was
-primed from Yahoo ES=F -- a continuous series in 24-hour bars, i.e. the wrong
-instrument. That fix stands; this file pins the boundary so neither wrong turn
-can be taken again.
+The anchor below still reproduces the 2026-08-10 RTH H/L/C, because the 18:00
+roll leaves the prior session's RTH window intact.
 """
 from __future__ import annotations
 
@@ -49,46 +40,54 @@ def _ns(s):
     return int(pd.Timestamp(s, tz="America/New_York").value)
 
 
-def test_the_period_is_the_et_calendar_day():
-    """THE ANCHOR. Reproduces the 2026-08-10 session that was matched against the
-    chart: the 23:00 ET print is part of that calendar day and must be included;
-    a print after midnight belongs to the next day."""
+def test_the_anchor_matches_the_nt8_grid():
+    """THE ANCHOR. The 2026-08-10 RTH session that was matched against the
+    chart is the Aug-9 Globex session (it opened 18:00 ET the evening before).
+    Its H/L/C must survive the 18:00 ET roll on Aug 10 and still produce the
+    chart's PP."""
     mp = MultiPivots()
     mp.update(_ns("2026-08-10 09:35"), 7798.00, 7770.00, 7790.00)
     mp.update(_ns("2026-08-10 15:59"), 7780.00, 7764.50, 7775.75)
-    mp.update(_ns("2026-08-10 23:00"), 7779.00, 7770.00, 7775.75)   # same ET day
-    mp.update(_ns("2026-08-11 02:00"), 7760.00, 7700.00, 7710.00)   # NEXT day: rolls
+    mp.update(_ns("2026-08-10 23:00"), 7779.00, 7770.00, 7775.75)   # opens Aug-10 session
     h, l, c = mp.prior["D"]
-    assert (h, l) == (7798.00, 7764.50), f"prior D is H{h} L{l}, not the calendar day"
+    assert (h, l) == (7798.00, 7764.50), f"prior D is H{h} L{l}, not the Aug-9 session"
     pp = daily_pivots(h, l, c)["PP"]
     assert abs(pp - 7779.42) < 0.01, f"PP {pp:.2f}; the chart shows 7779.44"
 
 
-def test_overnight_before_midnight_counts_toward_that_day():
-    """An 18:00-23:59 ET print is part of the SAME calendar day. Excluding it (a
-    Globex 18:00 boundary) put PP 0.52 off; excluding all overnight (RTH) put it
-    a median 7.42 off."""
+def test_evening_print_belongs_to_the_next_session():
+    """An 18:00 ET print opens the next Globex session, so it must roll the
+    prior period immediately; a 10:00 ET print the following morning is still
+    part of that same session, and the evening high only becomes "prior" when
+    the next 18:00 rolls it."""
     mp = MultiPivots()
-    mp.update(_ns("2026-08-10 10:00"), 7790.00, 7770.00, 7780.00)
-    mp.update(_ns("2026-08-10 20:00"), 7805.00, 7769.00, 7800.00)   # evening: same day
-    mp.update(_ns("2026-08-11 10:00"), 7700.00, 7690.00, 7695.00)
+    mp.update(_ns("2026-08-10 10:00"), 7790.00, 7770.00, 7780.00)   # Aug-9 session
+    mp.update(_ns("2026-08-10 20:00"), 7805.00, 7769.00, 7800.00)   # rolls -> Aug-10 session
     h, l, _ = mp.prior["D"]
+    assert (h, l) == (7790.00, 7770.00), f"18:00 ET did not roll the session: H{h} L{l}"
+
+    mp.update(_ns("2026-08-11 10:00"), 7700.00, 7690.00, 7695.00)   # still Aug-10 session
+    h, l, _ = mp.prior["D"]
+    assert (h, l) == (7790.00, 7770.00), f"a pre-18:00 bar rolled the session early: H{h} L{l}"
+
+    mp.update(_ns("2026-08-11 20:00"), 7710.00, 7680.00, 7700.00)   # rolls -> Aug-11 session
+    h, _, _ = mp.prior["D"]
     assert h == 7805.00, f"the 20:00 ET high was dropped (got {h})"
 
 
-def test_after_midnight_belongs_to_the_next_period():
+def test_session_does_not_roll_at_midnight():
+    """Overnight prints after 00:00 ET belong to the session that opened the
+    previous evening; the D period must not roll at midnight."""
     mp = MultiPivots()
-    mp.update(_ns("2026-08-10 10:00"), 7790.00, 7770.00, 7780.00)
-    mp.update(_ns("2026-08-11 01:00"), 7900.00, 7600.00, 7650.00)   # next day
-    mp.update(_ns("2026-08-11 10:00"), 7700.00, 7690.00, 7695.00)
-    h, l, _ = mp.prior["D"]
-    assert (h, l) == (7790.00, 7770.00), (
-        f"a post-midnight print leaked into the prior day: H{h} L{l}")
+    mp.update(_ns("2026-08-10 20:00"), 7805.00, 7769.00, 7800.00)   # opens Aug-10 session
+    mp.update(_ns("2026-08-11 01:00"), 7810.00, 7760.00, 7650.00)   # same session
+    mp.update(_ns("2026-08-11 10:00"), 7700.00, 7690.00, 7695.00)   # same session
+    assert "D" not in mp.prior, "the session rolled at midnight"
 
 
 def test_rth_filtering_is_available_but_off_by_default():
     """Kept as an opt-in for callers that genuinely want an RTH grid -- but it is
-    NOT what the chart uses, so it must never be the default."""
+    NOT what the NT8 Pivots indicator builds, so it must never be the default."""
     mp = MultiPivots()
     mp.update(_ns("2026-08-10 10:00"), 7790.0, 7770.0, 7780.0)
     mp.update(_ns("2026-08-10 20:00"), 7805.0, 7769.0, 7800.0, rth_only=True)

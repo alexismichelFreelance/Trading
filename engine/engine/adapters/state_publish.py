@@ -201,6 +201,20 @@ class StatePublisher:
                 d = self.store.apply_agg_bar(_bar_dict(ab))
                 if d is not None:
                     self.broadcast(d)
+        # The dashboard's ZoneView is a SEPARATE object from the trading
+        # sleeves' detectors. It is seeded once at startup and then has to be
+        # fed the live tape, or the chart's zones freeze at the seed (measured
+        # 2026-10-30: newest zone 2026-10-28 17:00 UTC while bars ran to
+        # 2026-10-30 02:05 UTC). Feed LIVE 1m bars only: the startup seed
+        # already covers history, and re-feeding backfill would duplicate the
+        # 30m/1h/4h aggregation. The RTH gate lives inside ZoneView.update.
+        src = self.lanes.get(sym)
+        if (live and src is not None and src.zoneview is not None
+                and getattr(bar, "tf", "") == "1m"):
+            try:
+                src.zoneview.update(bar)
+            except Exception:                     # noqa: BLE001 - display only
+                log.debug("zoneview update failed for %s", sym, exc_info=True)
         await self._publish_lane(sym, bd)
 
     async def _on_fill(self, f: Fill) -> None:

@@ -1067,7 +1067,6 @@ async def main() -> None:
                     help="override the ES lane's cash->future basis (default: "
                          "instruments.yaml gex.basis, re-measured at each close)")
     a = ap.parse_args()
-    print(f"DEBUG: a.dashboard = {a.dashboard}")
 
     # Console AND a durable file. Until 2026-08-05 this was console-only, so when
     # the engine stopped trading at 11:10 ET the counters, the stack trace and
@@ -1091,29 +1090,19 @@ async def main() -> None:
     # silence per-request HTTP logs (QuestDB recorder calls via httpx) — pure noise
     for noisy in ("httpx", "httpcore", "hpack", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-        print("DEBUG: After logging setup, before instrument lanes")
 
     # ── instrument lanes ──────────────────────────────────────────────────
-    print("DEBUG: Starting instrument lanes")
     # config/live.yaml is the standing config. The BARE command runs every lane
     # defined there (ES + NQ today) — no flags needed. --instruments ES,NQ picks
     # a subset. If live.yaml is absent, fall back to one ES lane from the flat
     # CLI args (ports/paper/live).
     cfg_path = Path(a.live_config)
-    print(f"DEBUG: About to check live.yaml: {cfg_path} exists={cfg_path.exists()}", flush=True)
     if cfg_path.exists():
         try:
-            print("DEBUG: Importing yaml", flush=True)
             import yaml as _yaml
-            print("DEBUG: Imported yaml", flush=True)
-            print("DEBUG: Reading YAML file", flush=True)
             yaml_text = cfg_path.read_text(encoding="utf-8")
-            print(f"DEBUG: YAML text length: {len(yaml_text)}", flush=True)
-            print("DEBUG: Calling safe_load", flush=True)
             data = _yaml.safe_load(yaml_text)
-            print(f"DEBUG: After safe_load, data = {data}", flush=True)
             _all = (data or {}).get("instruments") or {}
-            print(f"DEBUG: _all = {_all}", flush=True)
             if not _all:
                 raise SystemExit(f"no instruments defined in {a.live_config}")
             want = [s.strip() for s in a.instruments.split(",") if s.strip()] or list(_all)
@@ -1124,8 +1113,7 @@ async def main() -> None:
                                      f"(have {sorted(_all)})")
                 lanes_cfg[sym] = _all[sym]
             multi = True                                 # live.yaml labels stay prefixed (ES:zones)
-        except Exception as e:
-            print(f"DEBUG: Error processing live.yaml: {e}", flush=True)
+        except Exception:
             raise
     else:
         lanes_cfg = {SYMBOL: {"market_port": a.market_port, "broker_port": a.broker_port,
@@ -1151,8 +1139,7 @@ async def main() -> None:
     # so in this mode the single socket is fed read-only (read path only).
     demux = [s.strip() for s in a.markets.split(",") if s.strip()]
     if demux:
-        _rec, _raw = a.record, a.raw_capture
-        if _raw or _rec:
+        if a.record or a.raw_capture:
             log.warning("single-socket (--markets) mode ignores --record/--raw-capture: "
                         "not supported on a demux feed; running read-only")
             a.record, a.raw_capture = False, False
@@ -1163,10 +1150,18 @@ async def main() -> None:
         levelbooks = {}
         gammacurves = {}
         sleeves_dict = {}
+
+    # Paper fills are persisted to claude_paper_fills so the dashboard's trades
+    # drawer and fill markers have data. One blotter covers every lane; the
+    # symbol comes from each fill. Without this, paper trades are in-memory only
+    # and never reach QuestDB.
+    paper_blot = None
+    from engine.adapters.paper_blotter import PaperBlotter
+    paper_blot = PaperBlotter(AsyncQuestDB())
+    await paper_blot.start()
+
     for sym, lc in lanes_cfg.items():
-        print(f"DEBUG: Processing lane {sym}", flush=True)
         spec = INSTRUMENTS.get(sym)
-        print(f"DEBUG: After getting spec for {sym}", flush=True)
         if spec is None:
             raise SystemExit(f"lane {sym}: no spec in config/instruments.yaml")
         prefix = f"{sym}:" if multi else ""
@@ -1187,16 +1182,13 @@ async def main() -> None:
                 levelbook = _s.levels
             if gamma_curve is None and hasattr(getattr(_s, "pocket", None), "at"):
                 gamma_curve = _s.pocket
-        print(f"DEBUG: After finding levelbook/gamma_curve for {sym}", flush=True)
         # Seed the ZoneView with historical data
         daily = daily_bars_for(sym)
         if daily:
             zoneview.seed_daily(daily)
         mins = minute_bars_for(sym, sessions=a.zone_seed_sessions)
-        print(f"DEBUG: After getting minute bars for {sym}", flush=True)
         if mins:
             zoneview.seed_intraday(mins)
-        print(f"DEBUG: After seeding intraday for {sym}", flush=True)
         zoneviews[sym] = zoneview
         levelbooks[sym] = levelbook
         gammacurves[sym] = gamma_curve
@@ -1208,14 +1200,13 @@ async def main() -> None:
         # gamma curve it needs no re-attaching at the session rollover -- it
         # rolls itself from the tape.
         attach_day_range([s for _, s in lane_roster], sym)
-        print(f"DEBUG: After attaching day range for {sym}", flush=True)
-        # today's ET session date -- the walls are the PRIOR session's, which
-        # levels_prev resolves from this
-        from engine.core.timeutil import et_session_date
+        # Globex session date -- the walls are the PRIOR session's, which
+        # levels_prev resolves from this. Must match the LevelBook/pivot
+        # rollover key (18:00 ET), not the ET calendar day.
+        from engine.core.timeutil import et_globex_session_date
         import time as _time
         attach_level_books([s for _, s in lane_roster], sym,
-                           et_session_date(int(_time.time() * 1e9)))
-        print(f"DEBUG: After attaching level books for {sym}", flush=True)
+                           et_globex_session_date(int(_time.time() * 1e9)))
         # emit_depth only when raw-capturing (the engine itself needs BookFlow,
         # not raw depth — RawCaptureTee records the depth and drops it onward).
         # Per-lane `capture_depth` (live.yaml) turns the RAW depth tap off for a
@@ -1226,40 +1217,30 @@ async def main() -> None:
         # 15.5M daily rows into a 272M-row table that nothing reads and that
         # took QuestDB down mid-session.
         cap_depth = a.raw_capture and bool(lc.get("capture_depth", True))
-        print(f"DEBUG: After setting cap_depth for {sym}", flush=True)
-        if demux:
-            # single-socket mode: the demux feed above carries this lane;
-            # per-lane broker just arms the shared socket for this symbol.
-            brokers[sym] = NinjaTraderBroker("127.0.0.1", a.broker_port,
-                                             symbol=sym)
-            print(f"DEBUG: After setting broker (demux) for {sym}", flush=True)
-        else:
+        if not demux:
             feed = NinjaTraderFeed("127.0.0.1", int(lc.get("market_port", 36001)),
                                    symbol=sym, emit_depth=cap_depth)
             if a.raw_capture:                            # innermost: sees raw depth first
                 from engine.adapters.feeds.raw_capture import RawCaptureTee
                 feed = RawCaptureTee(feed, symbol=sym, capture_depth=cap_depth)
-            print(f"DEBUG: After creating RawCaptureTee for {sym}", flush=True)
-            rawcaps.append(feed)
-            log.info("raw capture [%s]: trades ON, depth %s", sym,
-                     "ON" if cap_depth else "OFF (live.yaml capture_depth)")
+                rawcaps.append(feed)
+                log.info("raw capture [%s]: trades ON, depth %s", sym,
+                         "ON" if cap_depth else "OFF (live.yaml capture_depth)")
             if a.record:
-                rec = RecorderTee(feed, AsyncQuestDB(), symbol=sym)
-            print(f"DEBUG: After creating RecorderTee for {sym}", flush=True)
-            recorders.append(rec)
-            feed = rec
+                feed = RecorderTee(feed, AsyncQuestDB(), symbol=sym)
+                recorders.append(feed)
             feeds.append(feed)
-        print(f"DEBUG: After appending feed for {sym}", flush=True)
-        brokers[sym] = NinjaTraderBroker("127.0.0.1", int(lc.get("broker_port", 36002)),
-                                         symbol=sym)
-        print(f"DEBUG: After setting broker for {sym}", flush=True)
+        # In demux mode the shared socket above carries this lane; the per-lane
+        # broker arms it for this symbol.
+        brokers[sym] = NinjaTraderBroker(
+            "127.0.0.1",
+            a.broker_port if demux else int(lc.get("broker_port", 36002)),
+            symbol=sym)
         if blot is None:
             blot = Blotter(sym, spec.point_usd, verbose=True)
         else:
             blot.add_instrument(sym, spec.point_usd)
-        print(f"DEBUG: After adding instrument to blotter for {sym}", flush=True)
         roster += lane_roster
-        print(f"DEBUG: After adding to roster for {sym}", flush=True)
         lane_meta[sym] = {"draw_port": int(lc.get("draw_port", 36004)),
                           "roster": lane_roster, "lc": lc}
     strategies = [s for sym in sleeves_dict for s in sleeves_dict[sym]]
@@ -1312,7 +1293,6 @@ async def main() -> None:
     print(f"roster ({len(roster)}): LIVE->NT8 {live_lbls or '(none)'}  |  "
           f"PAPER {paper_lbls}")
 
-    print("DEBUG: After engine configuration")
     # resume open paper positions carried across a restart (e.g. IBS held
     # overnight) so they get managed/exited instead of orphaned. Rebuilt from
     # claude_paper_fills; applied at each lane's warmup->live flip.
@@ -1471,6 +1451,15 @@ async def main() -> None:
                 if ok and lv3 and lv3[0]:
                     lv, und, _basis = lv3
                     lane_pc.set_gamma_levels(lv)
+                    # The STRATEGY books were attached once at startup and
+                    # never refreshed (`attach_level_books` is not re-called),
+                    # so a multi-day run kept trading the walls from the day
+                    # it started. Give them the same prior-session levels the
+                    # painter just received.
+                    for _s in (sleeves_dict.get(sym) or []):
+                        _lb = getattr(_s, "levels", None)
+                        if hasattr(_lb, "set_gamma"):
+                            _lb.set_gamma(lv)
                     # the curve is a PRIOR-session snapshot, so it has to be
                     # re-attached every rollover; otherwise a multi-day run
                     # gates forever on the book from the day it started.
@@ -1492,13 +1481,9 @@ async def main() -> None:
     # events. The Dashboard is run_dashboard.py's own server, embedded here so
     # a single live process serves the chart (read path only; no account/order
     # changes).
-    print("DEBUG: Before dashboard initialization", flush=True)
     dashboard = None
     dashboard_task = None
-    print("DEBUG: About to check a.dashboard", flush=True)
-    print(f"DEBUG: a.dashboard = {a.dashboard}", flush=True)
     if a.dashboard:
-        print("DEBUG: Entering dashboard block", flush=True)
         try:
             from engine.adapters.state_publish import StatePublisher, LaneSource
             import importlib.util
@@ -1579,6 +1564,15 @@ async def main() -> None:
             # reads the indicators out of it.
             _seed_end = {s: r[-1].ts for s, r in seed_rows.items()}
 
+            # Seed the zone set into the store too (apply_zones is normally
+            # called only on live bars, which never flow without NT8). Without
+            # this the dashboard's zone rectangles stay empty on a cold start.
+            from engine.adapters.state_sources import zones_from_view as _zfv
+            for _sym, _rows in seed_rows.items():
+                _zv = zoneviews.get(_sym)
+                if _zv is not None and _rows:
+                    pub.store.apply_zones(_sym, _zfv(_zv, _rows[-1].ts))
+
             async def _feed_dashboard_book(bar, live, backfill):
                 _sym = getattr(bar, "symbol", "") or ""
                 _lb = dash_books.get(_sym)
@@ -1603,7 +1597,7 @@ async def main() -> None:
                 from engine.adapters.state_publish import _combine
                 eng.on_bar_hook = _combine(eng.on_bar_hook, _feed_dashboard_book)
 
-            pub.attach(eng)                       # chains the painter's sinks
+            pub.attach(eng)                   # chains the painter's sinks
             print(f"  StatePublisher attached lanes={list(pub.lanes.keys())}")
             for sym, src in pub.lanes.items():
                 print(f"    {sym}: zoneview={src.zoneview is not None} levelbook={src.levelbook is not None} gamma={src.gamma_curve is not None} strategies={len(src.strategies)}")

@@ -12,7 +12,7 @@ import math
 
 import numpy as np
 
-from ..core.timeutil import et, et_session_date, is_rth
+from ..core.timeutil import et, et_globex_session_date, is_rth
 
 
 def daily_pivots(prior_high: float, prior_low: float, prior_close: float) -> dict[str, float]:
@@ -64,7 +64,7 @@ class SessionLevels:
     def update_bar(self, bar) -> None:
         if not is_rth(bar.ts):
             return
-        day = et_session_date(bar.ts)
+        day = et_globex_session_date(bar.ts)
         if day != self._day:
             if self._h is not None:
                 self._prior = (self._h, self._l, self._c)
@@ -112,7 +112,7 @@ class MultiPivots:
     @staticmethod
     def _key(tf: str, ts: int) -> str:
         if tf == "D":
-            return et_session_date(ts)
+            return et_globex_session_date(ts)
         t = et(ts)
         if tf == "W":
             iso = t.isocalendar()
@@ -121,24 +121,11 @@ class MultiPivots:
 
     def update(self, ts: int, h: float, l: float, c: float,
                rth_only: bool = False) -> None:
-        # SESSION = THE ET CALENDAR DAY, which is what et_session_date already
-        # keys on -- and what NT8's Pivots indicator uses with "Calculation mode:
-        # intraday data" on the user's chart. Verified against it on 2026-08-11:
-        #
-        #   chart PP                     7779.44
-        #   00:00->24:00 ET  H 7798.00 L 7764.50 C 7775.75 -> 7779.42   MATCH
-        #   18:00->17:00 ET (Globex)     -> 7778.92
-        #   09:30->16:00 ET (RTH)        -> 7778.83
-        #
-        # The 0.02 is rounding of the thirds. The distinguishing value is the
-        # LOW: 7764.50, not the 7763.00 overnight low, because that print falls
-        # outside a midnight-to-midnight day.
-        #
-        # I briefly filtered this to RTH on 2026-08-10 -- the class docstring
-        # says "prior RTH session" and SessionLevels does filter -- which moved
-        # the grid a median 7.42 points off the chart (max 24.42) across 39
-        # sessions. The docstring was wrong, not the code. rth_only stays as an
-        # opt-in for callers that genuinely want an RTH grid.
+        # SESSION = THE GLOBEX FUTURES SESSION (18:00 ET -> 17:00 ET the
+        # next day), which is what et_globex_session_date keys on -- and what
+        # the user's NT8 Pivots indicator resets on (Globex session, not the
+        # ET calendar day). rth_only stays as an opt-in for callers that
+        # genuinely want an RTH-only grid.
         if rth_only and not is_rth(ts):
             return
         for tf in self._TFS:

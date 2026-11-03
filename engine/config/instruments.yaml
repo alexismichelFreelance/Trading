@@ -35,3 +35,9 @@ instruments:
     point_usd: 100.0
     tick: 0.10
     asset_class: future
+    # Yahoo continuous for the 1d zone seed + D/W/M pivot grid. Without it
+    # daily_bars_for() returns [] and the daily detectors start cold.
+    yahoo: GC=F
+    # Gold's psychological round-number grid is $50, not ES's 50 POINTS
+    # (GC trades near $4,000, so 50 is ~1.2% and still meaningful).
+    round_step: 50.0
