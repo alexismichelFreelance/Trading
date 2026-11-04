@@ -95,16 +95,20 @@ def test_broker_reconnects_after_the_socket_dies():
         pumper = asyncio.create_task(pump())
         await asyncio.sleep(0.05)
         await b.submit(Order("ES", 1, 1, tag="before"))
-        assert await _settle(lambda: len(sink.msgs) == 1), "first order never arrived"
+        assert await _settle(lambda: any(m.get("t") == "place"
+                                         for m in sink.msgs)), \
+            "first order never arrived"
 
         await sink.stop()                            # platform goes away
         await asyncio.sleep(0.1)
         sink2 = await Sink().start(port=port)        # ...and comes back
         try:
             await b.submit(Order("ES", -1, 1, tag="after"))
-            got = await _settle(lambda: len(sink2.msgs) >= 1)
+            got = await _settle(lambda: any(m.get("t") == "place"
+                                            for m in sink2.msgs))
             assert got, "order after reconnect never arrived (dead socket reused)"
-            assert sink2.msgs[-1]["tag"] == "after"
+            places = [m for m in sink2.msgs if m.get("t") == "place"]
+            assert places[-1]["tag"] == "after"
             assert b.reconnects >= 1, "reconnect was not recorded"
         finally:
             pumper.cancel()

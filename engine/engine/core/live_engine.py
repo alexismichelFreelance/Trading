@@ -21,7 +21,7 @@ import time
 from .blotter import Blotter
 from .clock import WallClock
 from .dispatch import _wants, dispatch_broker, dispatch_market
-from .events import Bar, Fill, PositionUpdate, Signal, Trade
+from .events import AccountUpdate, Bar, Fill, PositionUpdate, Signal, Trade
 from .orders import Order, OrderType
 from .risk import RiskSupervisor
 from .timeutil import et_session_date
@@ -150,6 +150,17 @@ class LiveEngine:
         self._order_tag: dict[str, str] = {}        # order_id -> the order's tag
         self._spos: dict[int, int] = {}              # id(strategy) -> signed qty
         self._savg: dict[int, float] = {}            # id(strategy) -> avg px
+        # IDEMPOTENT BROKER EVENTS (2026-11-03). The NT8 AddOn publishes every
+        # account execution to EVERY connected broker client, and run_live opens
+        # one client per lane on the same port. Without this guard one NQ
+        # execution was applied three times: a 6-lot flatten became
+        # -6 -> +12 -> -24 -> +48 -> -96 -> +192, and NT8 refused `SELL 192`
+        # every 20s for hours. Accept the first copy from ANY socket (so a
+        # briefly disconnected lane still gets its fill) and ignore later ones.
+        # Key: NT8's execution ts (ns), order id, signed size and price. Copies
+        # are byte-identical; distinct executions differ in at least one field.
+        self._seen_broker_events: set[tuple] = set()
+        self._dup_broker_events = 0
         # paper positions carried across a restart (e.g. IBS held overnight),
         # rebuilt from claude_paper_fills by the runner. id(strategy)->(pos,avg);
         # applied at that lane's warmup->live flip so overnight sleeves resume
@@ -704,6 +715,37 @@ class LiveEngine:
         if self.on_paper_fill is not None:
             self._emit_sink(self.on_paper_fill, f)
 
+    @staticmethod
+    def _broker_event_key(ev) -> tuple | None:
+        """Identity of a broker event, for duplicate suppression.
+
+        Fills carry NT8's execution timestamp (ns), order id, symbol, signed
+        size and price. Position/account snapshots carry their own values.
+        Copies fanned out to multiple sockets are identical in every field.
+        """
+        if isinstance(ev, Fill):
+            return ("fill", ev.order_id, ev.ts, ev.symbol, ev.size, ev.price)
+        if isinstance(ev, PositionUpdate):
+            return ("pos", ev.symbol, ev.ts, ev.qty, ev.avg_px)
+        if isinstance(ev, AccountUpdate):
+            return ("acct", ev.ts, ev.equity, ev.realized, ev.unrealized)
+        return None
+
+    def _is_duplicate_broker_event(self, ev) -> bool:
+        key = self._broker_event_key(ev)
+        if key is None:
+            return False
+        if key in self._seen_broker_events:
+            self._dup_broker_events += 1
+            return True
+        # Copies arrive within milliseconds of one another, so a replay after
+        # this many intervening events cannot be a late copy. Clearing bounds
+        # memory on a multi-day process.
+        if len(self._seen_broker_events) >= 50_000:
+            self._seen_broker_events.clear()
+        self._seen_broker_events.add(key)
+        return False
+
     def _attribute_fill(self, f: Fill) -> None:
         s = self._owner.get(f.order_id)
         if s is None:
@@ -1038,6 +1080,8 @@ class LiveEngine:
                                         self._bf_bars.get(sym, 0))
                     self.blotter.on_market_event(ev)
                 else:  # broker event
+                    if self._is_duplicate_broker_event(ev):
+                        continue                  # same execution on another socket
                     self.blotter.on_broker_event(ev)
                     if isinstance(ev, Fill):
                         attributed = ev.order_id in self._owner
