@@ -1205,7 +1205,10 @@ class ChartWindow {
     if (!f) return;
     const side = (f.size || 0) > 0;
     const ts = f.ts || Date.now() * 1e6;
-    this.fillMarkers.push({ time: this.snapTimeToGrid(sec(ts)),
+    // Keep the RAW event time here. applyMarkers() snaps it to the visible
+    // grid at draw time; snapping at ingest clamps every pre-window fill to
+    // the first bar and collapses days of fills into one dot.
+    this.fillMarkers.push({ time: sec(ts),
       position: side ? "belowBar" : "aboveBar",
       color: side ? "#26a69a" : "#ef5350",
       shape: side ? "arrowUp" : "arrowDown",
@@ -1243,11 +1246,11 @@ class ChartWindow {
       for (const f of data.fills) {
         const side = f.side > 0;
         const t = Math.floor(f.ts / 1e9);
-        const k = this.snapTimeToGrid(t) + "|" + (f.tag || "") + "|" + (f.price ?? "");
+        const k = t + "|" + (f.tag || "") + "|" + (f.price ?? "");
         if (seen.has(k)) continue;
         seen.add(k);
         this.fillMarkers.push({
-          time: this.snapTimeToGrid(t),
+          time: t,
           position: side ? "belowBar" : "aboveBar",
           color: side ? "#26a69a" : "#ef5350",
           shape: side ? "arrowUp" : "arrowDown",
@@ -1304,7 +1307,20 @@ class ChartWindow {
     // Window by TIME (last ~500 bars or 2 sessions), never a flat count: a
     // signal history spanning days must not be drawn on today's chart.
     const cutoff = g0;
-    const keep = (m) => m && m.time >= cutoff;
+    // Filter on the event's REAL time, not the snapped marker time.
+    // snapTimeToGrid() clamps anything older than the first candle to g0, so
+    // filtering after snapping kept every old fill/signal and stacked them on
+    // the first bar (63 fills -> one 63-row tooltip).
+    const rawTs = (m) => {
+      if (m && m._fill && m._fill.ts != null) return m._fill.ts;
+      if (m && m._sig && m._sig.ts != null) return m._sig.ts;
+      return m ? m.time : null;
+    };
+    const keep = (m) => m && m.time >= cutoff;           // non-event overlays
+    const keepRaw = (m) => {
+      const t = rawTs(m);
+      return t != null && t >= cutoff;
+    };
 
     // Hover index: every event that lands on a bar, including events that the
     // collapsed dot below hides. This is what the crosshair tooltip reads.
@@ -1315,13 +1331,13 @@ class ChartWindow {
       e[kind].push(obj);
     };
     for (const s of this.signalMarkers) {
-      if (!keep(s)) continue;
-      addInfo(this.snapTimeToGrid(s.time), "signals",
+      if (!keepRaw(s)) continue;
+      addInfo(this.snapTimeToGrid(rawTs(s)), "signals",
               s._sig || { ts: s.time, side: s._side ? 1 : -1 });
     }
     for (const f of this.fillMarkers) {
-      if (!keep(f)) continue;
-      addInfo(f.time, "fills",
+      if (!keepRaw(f)) continue;
+      addInfo(this.snapTimeToGrid(rawTs(f)), "fills",
               f._fill || { ts: f.time, side: f.color === "#26a69a" ? 1 : -1 });
     }
     this.markerInfo = info;
@@ -1330,14 +1346,19 @@ class ChartWindow {
     // firing on one candle draw one dot, not eight overlapping ones.
     const buckets = new Map();
     for (const s of this.signalMarkers) {
-      if (!keep(s)) continue;
-      const t = this.snapTimeToGrid(s.time);
+      if (!keepRaw(s)) continue;
+      const t = this.snapTimeToGrid(rawTs(s));
       const key = t + "|" + (s._side ? 1 : 0);
       if (buckets.has(key)) continue;
       buckets.set(key, { time: t, position: s.position, color: s.color,
                          shape: "circle" });
     }
-    const markers = this.fillMarkers.filter(keep).concat([...buckets.values()]);
+    // Fills are stored with their real time; snap them to the candle grid
+    // only now, so anything outside the loaded window is simply dropped.
+    const fillDots = this.fillMarkers.filter(keepRaw).map(f => ({
+      ...f, time: this.snapTimeToGrid(rawTs(f)),
+    }));
+    const markers = fillDots.concat([...buckets.values()]);
     if (this.sessionMarkers) markers.push(...this.sessionMarkers.filter(keep));
     if (this.pivotMarkers) markers.push(...this.pivotMarkers.filter(keep));
     if (this.gammaMarkers) markers.push(...this.gammaMarkers.filter(keep));
@@ -1388,7 +1409,15 @@ class ChartWindow {
       if (f.pos_after != null) meta.push(`pos ${f.pos_after > 0 ? "+" : ""}${f.pos_after}`);
       rows.push(`<div class="mtRow"><span class="mtTag ${buy ? "up" : "down"}">${buy ? "BUY" : "SELL"}</span> ${Math.abs(f.qty || 0)} @ ${fmtPx(f.price)} <span class="dim">${who}${meta.length ? " · " + meta.join(" · ") : ""}</span></div>`);
     }
-    tip.innerHTML = rows.join("");
+    // A bar with many sleeves can produce a long list; cap it so the tooltip
+    // never runs off the screen. The count keeps the hidden rows discoverable.
+    const MAX_ROWS = 16;
+    const head = rows.shift();
+    const shown = rows.slice(0, MAX_ROWS);
+    if (rows.length > shown.length) {
+      shown.push(`<div class="mtRow dim">… +${rows.length - shown.length} more on this bar</div>`);
+    }
+    tip.innerHTML = head + shown.join("");
     tip.classList.remove("hidden");
     const box = this.chartBox.getBoundingClientRect();
     let x = box.left + param.point.x + 16;
