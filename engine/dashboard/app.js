@@ -1469,10 +1469,9 @@ class ChartWindow {
     };
     this.ws.onerror = () => {
       setStatus("err", "ws error");
-      if (!self.closed) {
-        setTimeout(() => self.connect(), self._reconnectDelay);
-        self._reconnectDelay = Math.min(self._reconnectDelay * 2, 30000);
-      }
+      // `close` always follows `error`; scheduling a reconnect here as well
+      // opened a second socket for every failure (a reconnect storm while the
+      // server was restarting). `onclose` owns the retry.
     };
   }
 
