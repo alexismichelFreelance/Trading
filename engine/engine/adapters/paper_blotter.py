@@ -38,6 +38,7 @@ class PaperBlotter:
         # None = not probed. False = the table takes writes and stores nothing,
         # so this session's entire position record is going nowhere.
         self.ingest_ok: bool | None = None
+        self._warned_not_ready = False
 
     async def start(self) -> None:
         try:
@@ -69,9 +70,17 @@ class PaperBlotter:
                       "this session will be missing from the record and NOTHING "
                       "will resume after a restart. Fix the table before "
                       "trusting anything this session produces.", self.table)
+        else:
+            log.info("paper blotter ready: %s (startup probe landed)", self.table)
 
     async def record(self, f, sleeve: str) -> None:
         if not self._ready:
+            # Never drop a fill silently: an unready blotter used to be
+            # indistinguishable from a fill that never happened.
+            if not self._warned_not_ready:
+                self._warned_not_ready = True
+                log.error("paper blotter NOT READY: fill %s (%s) NOT persisted "
+                          "to %s", f.order_id, f.symbol, self.table)
             return
         side = 1 if f.size > 0 else -1
         tag = (f.tag or "").replace("'", "")

@@ -71,13 +71,21 @@ def _combine(prev, own):
     if prev is None:
         return own
 
+    fails = 0
+
     async def _both(*args, **kwargs):
+        nonlocal fails
         try:
             r = prev(*args, **kwargs)
             if asyncio.iscoroutine(r):
                 await r
-        except Exception:                             # noqa: BLE001
-            pass
+        except Exception as ex:                       # noqa: BLE001
+            # Fail-open, but never SILENT: a NameError in a chained sink once
+            # swallowed every paper fill for weeks with no log line at all.
+            fails += 1
+            if fails in (1, 10) or fails % 1000 == 0:
+                log.warning("chained sink failed (%d so far): %s: %s",
+                            fails, type(ex).__name__, ex)
         await own(*args, **kwargs)
 
     return _both

@@ -808,6 +808,47 @@ def load_open_paper_positions(qdb, symbols) -> dict:
     return out
 
 
+def wire_fill_persistence(eng, paper_blot, label_by_id, *,
+                          paint_live=None, paint_paper=None):
+    """Record EVERY fill the engine books -- paper or real -- in one place.
+
+    The dashboard's trades drawer (/api/fills) and its per-sleeve performance
+    panel read claude_paper_fills and label each row live/paper from the
+    roster. A live NT8 execution that never lands there is a trade the
+    dashboard cannot show, which is exactly what happened before this: the
+    live hook fed only the chart painter and the fills existed in the engine
+    log and nowhere else.
+
+    Paper and live fills arrive on separate engine hooks; both must reach the
+    same blotter, tagged with the owning sleeve's label. Persist BEFORE
+    painting: painting is cosmetic, and a painter that raises must never cost
+    the record. `paint_*` are the sinks the runner already wired (None when no
+    chart is attached) and are preserved, not replaced.
+    """
+    async def _record(f):
+        if paper_blot is None:
+            return
+        await paper_blot.record(
+            f, label_by_id.get(id(eng._owner.get(f.order_id)), "?"))
+
+    async def _paper(f):
+        await _record(f)
+        if paint_paper is not None:
+            await paint_paper(f)
+
+    async def _live(f):
+        if paint_live is not None:
+            try:
+                await paint_live(f)
+            except Exception as ex:              # noqa: BLE001 - the record survives
+                log.warning("live fill paint failed: %s: %s",
+                            type(ex).__name__, ex)
+        await _record(f)
+
+    eng.on_paper_fill = _paper
+    eng.on_live_fill = _live
+
+
 def attach_day_range(sleeves, symbol: str, shared=None):
     """Give every sleeve that wants it the SAME DayRange for this lane.
 
@@ -1253,6 +1294,13 @@ async def main() -> None:
         for _lb, _s in _meta["roster"]:
             if _lb.split(":")[-1] in _live_labels:
                 live_owners.add(id(_s))
+    # id(strategy) -> roster label. Every persisted fill carries this so the
+    # dashboard can tell a live sleeve from a paper one (the mode comes from the
+    # roster, not the table). This assignment was dropped in 2ae6ea1
+    # (2026-10-17) while both of its readers stayed: every paper fill then
+    # raised NameError inside a chained sink that swallowed it, and nothing was
+    # recorded for a month without a single log line.
+    label_by_id = {id(s): lb for lb, s in roster}
     point_usd = {sym: INSTRUMENTS[sym].point_usd for sym in lanes_cfg}
     if a.no_risk:
         risk = RiskSupervisor(RiskConfig(point_usd=point_usd))
@@ -1408,15 +1456,17 @@ async def main() -> None:
             eng.on_bar_hook = _bar_hook
             eng.on_warmup_signal = _ghost        # paint ghosts as backfill replays
 
-    # paper fills: paint (muted cyan, if painting) AND persist to claude_paper_fills
-    # (if recording), tagged with the owning sleeve label.
-    async def _paper_sink(f):
+    # Fills: BOTH paper fills and real NT8 executions go to claude_paper_fills,
+    # tagged with the owning sleeve label. It is the one table /api/fills and
+    # /api/performance read, so a live fill missing from it is invisible in the
+    # dashboard no matter what the broker did.
+    async def _paint_paper(f):
         p = pcs.get(f.symbol) or pc
         if p is not None and a.paper_paint:      # painting paper fills is opt-in (chart load)
             await p.paper_fill(f)
-        if paper_blot is not None:
-            await paper_blot.record(f, label_by_id.get(id(eng._owner.get(f.order_id)), "?"))
-    eng.on_paper_fill = _paper_sink
+    wire_fill_persistence(eng, paper_blot, label_by_id,
+                          paint_live=eng.on_live_fill,
+                          paint_paper=_paint_paper)
 
     # ET session rollover: refresh the day-keyed snapshots so a multi-day run
     # stays correct without a restart. (1) reload the shared GammaRegime in

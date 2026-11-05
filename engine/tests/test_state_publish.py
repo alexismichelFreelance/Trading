@@ -539,3 +539,27 @@ def test_agg_5m_bar_emitted_when_bucket_closes():
             assert d is not None and d["type"] == "bar"
     snap = store.snapshot()["lanes"]["ES"]["bars"]["5m"]
     assert any(b["c"] == 7000 + 4 for b in snap)    # first 5m candle closed
+
+
+def test_chained_sink_failure_is_logged_not_swallowed(caplog):
+    """A failing predecessor must not stop publication AND must not vanish.
+
+    The paper-fill sink was chained in front of the publisher. It raised
+    NameError on every fill after `label_by_id` was deleted (2ae6ea1), the
+    wrapper swallowed it with a bare `pass`, and a month of fills went
+    unrecorded with no line in any log."""
+    from engine.adapters.state_publish import _combine
+    seen = []
+
+    async def prev(_f):
+        raise NameError("name 'label_by_id' is not defined")
+
+    async def own(f):
+        seen.append(f)
+
+    both = _combine(prev, own)
+    with caplog.at_level(logging.WARNING, logger="engine.state_publish"):
+        asyncio.run(both("fill"))
+    assert seen == ["fill"]                          # publication survived
+    assert any("chained sink failed" in r.getMessage()
+               for r in caplog.records)
