@@ -119,6 +119,16 @@ class StateStore:
         self.seq += 1
         return {"seq": self.seq, "type": kind, "lane": lane, "payload": payload}
 
+    def open_sleeves(self, sym: str) -> list[str]:
+        """Sleeves currently stored as OPEN positions on this lane.
+
+        Publishers reconcile against this so a sleeve that goes flat is
+        REMOVED, not merely skipped by the next upsert pass -- otherwise the
+        snapshot keeps a position that closed hours ago (a phantom on the
+        chart and in the trades drawer)."""
+        lane = self._lanes.get(sym)
+        return list(lane["positions"]) if lane else []
+
     # ── apply: the only way state changes ────────────────────────────────
     def apply_bar(self, b: dict) -> dict:
         """Record one closed bar (raw 1m canonical). `b` is a BarDict dict."""
@@ -270,11 +280,20 @@ class StateStore:
         return self._next("zone", lane, payload)
 
     def apply_position(self, position: dict) -> dict | None:
-        """Upsert one open position; None clears it. Returns a 'position' delta
-        only when the position actually changed."""
+        """Upsert one open position. A qty of 0 CLEARS the sleeve: the delta
+        still goes out (with qty 0) so every connected client drops its copy.
+        Returns a 'position' delta only when the position actually changed."""
         lane = self._lane(position["symbol"])
         key = position["sleeve"]
         old = lane["positions"].get(key)
+        if not position.get("qty"):
+            if old is None:
+                return None
+            del lane["positions"][key]
+            cleared = dict(position)
+            cleared["qty"] = 0
+            return self._next("position", position["symbol"],
+                              {"position": cleared})
         if old == position:
             return None
         lane["positions"][key] = position

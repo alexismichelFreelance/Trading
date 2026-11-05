@@ -306,8 +306,21 @@ class StatePublisher:
         if src is None:
             return
         blotter = getattr(self._engine, "blotter", None) if self._engine else None
-        for pos in positions_from_strategies(src.strategies, sym, blotter, bar_ts):
+        open_now = positions_from_strategies(src.strategies, sym, blotter, bar_ts)
+        seen = set()
+        for pos in open_now:
+            seen.add(pos["sleeve"])
             d = self.store.apply_position(pos)
+            if d is not None:
+                self.broadcast(d)
+        # A sleeve that went flat is simply absent from positions_from_strategies,
+        # so the store would keep its last open row forever. Clear it explicitly
+        # -- a position that no longer exists must not keep drawing on the chart.
+        for sleeve in self.store.open_sleeves(sym):
+            if sleeve in seen:
+                continue
+            d = self.store.apply_position({"sleeve": sleeve, "symbol": sym,
+                                           "qty": 0})
             if d is not None:
                 self.broadcast(d)
 

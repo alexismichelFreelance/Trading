@@ -271,6 +271,50 @@ def test_store_positions_upsert_and_dedupe():
     assert store.snapshot()["lanes"]["ES"]["positions"][0]["qty"] == 2
 
 
+def test_store_position_clears_when_qty_goes_zero():
+    """A sleeve that goes flat must LEAVE the snapshot, and the clear must be
+    delivered as a qty-0 delta so connected clients drop their copy too. Before
+    this, the publisher skipped flat sleeves and the last open row stayed on the
+    chart and in the trades drawer forever (a phantom position)."""
+    store = StateStore()
+    p = {"sleeve": "ES:pivot", "symbol": "ES", "qty": 1, "avg_px": 7000.0,
+         "entry": 7000.0, "target": 7100.0, "stop": 6980.0}
+    store.apply_position(p)
+    assert store.open_sleeves("ES") == ["ES:pivot"]
+    d = store.apply_position({"sleeve": "ES:pivot", "symbol": "ES", "qty": 0})
+    assert d["type"] == "position"
+    assert d["payload"]["position"]["qty"] == 0
+    assert store.snapshot()["lanes"]["ES"]["positions"] == []
+    assert store.open_sleeves("ES") == []
+    # already gone -> no duplicate clear delta
+    assert store.apply_position({"sleeve": "ES:pivot", "symbol": "ES",
+                                 "qty": 0}) is None
+
+
+def test_publish_positions_clears_sleeve_that_went_flat():
+    """The publisher reconciles: a sleeve absent from the current open list is
+    cleared from the store, so the dashboard never shows a phantom position."""
+    class Sleeve:
+        symbol = "ES"
+        label = "ES:pivot"
+        pos = 1
+
+        def chart_marks(self):
+            return {"entry": 7000.0, "target": 7100.0, "stop": 6980.0}
+
+    async def go():
+        sleeve = Sleeve()
+        pub = StatePublisher([LaneSource("ES", strategies=[sleeve])])
+        await pub._publish_positions("ES")
+        assert [p["sleeve"] for p in pub.snapshot()["lanes"]["ES"]["positions"]] \
+            == ["ES:pivot"]
+        sleeve.pos = 0
+        await pub._publish_positions("ES")
+        assert pub.snapshot()["lanes"]["ES"]["positions"] == []
+
+    asyncio.run(go())
+
+
 def test_store_log_error_partition():
     store = StateStore()
     store.apply_log({"ts": 1, "level": "INFO", "message": "warmed", "logger": "engine"})
